@@ -235,6 +235,54 @@ assert.match(
   output.hookSpecificOutput.additionalContext,
   /PONYTAIL MODE ACTIVE — level: full/,
 );
+// #597: subagents get the condensed ruleset, not the full SKILL.md — the
+// operational sections survive, the intensity table and worked examples
+// (~half the payload, useless to a single-task subagent) do not.
+assert.match(output.hookSpecificOutput.additionalContext, /## The ladder/);
+assert.match(output.hookSpecificOutput.additionalContext, /## When NOT to be lazy/);
+assert.ok(
+  !output.hookSpecificOutput.additionalContext.includes('## Intensity'),
+  'subagents must get the condensed ruleset, not the full SKILL.md (#597)',
+);
+// The explicit-request boundary must survive condensing: a subagent handed a
+// task the user insisted on in full must not argue it back down.
+assert.match(
+  output.hookSpecificOutput.additionalContext,
+  /anything explicitly requested — user insists on the full version, build it, no re-arguing/,
+);
+
+// The condensed payload must still define what the active level means — a
+// lite subagent must not silently enforce full's ladder.
+fs.writeFileSync(subFlag, 'lite');
+result = run('ponytail-subagent.js', subEnv);
+assert.equal(result.status, 0, result.stderr);
+output = JSON.parse(result.stdout);
+assert.match(
+  output.hookSpecificOutput.additionalContext,
+  /name the lazier alternative in one line/,
+  'a lite subagent must receive lite\'s definition, not just the label',
+);
+fs.writeFileSync(subFlag, 'ultra');
+result = run('ponytail-subagent.js', subEnv);
+assert.equal(result.status, 0, result.stderr);
+output = JSON.parse(result.stdout);
+assert.match(
+  output.hookSpecificOutput.additionalContext,
+  /YAGNI extremist/,
+  'an ultra subagent must receive ultra\'s definition, not just the label',
+);
+
+// review is an independent mode: subagents get the pointer line, not a
+// lazy-dev ruleset mislabeled "review".
+fs.writeFileSync(subFlag, 'review');
+result = run('ponytail-subagent.js', subEnv);
+assert.equal(result.status, 0, result.stderr);
+output = JSON.parse(result.stdout);
+assert.match(
+  output.hookSpecificOutput.additionalContext,
+  /Behavior defined by \/ponytail-review skill/,
+);
+fs.writeFileSync(subFlag, 'full');
 
 // No flag → ponytail off → inject nothing (empty stdout, no failure).
 fs.unlinkSync(subFlag);
@@ -458,5 +506,46 @@ try {
   if (prevXdgRev === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = prevXdgRev;
   if (prevEnvModeRev === undefined) delete process.env.PONYTAIL_DEFAULT_MODE; else process.env.PONYTAIL_DEFAULT_MODE = prevEnvModeRev;
 }
+
+// #584: Claude Code dispatches /ponytail as a skill, so the hook's prompt is
+// the whole SKILL.md body wrapped in <command-name>/<command-args> tags, not
+// the typed command. The tracker must read the tags — with the raw body the
+// [/@$]ponytail anchor never matches and the mode flag is never written.
+const skillHome = path.join(temp, 'skill-dispatch-home');
+const skillFlag = path.join(skillHome, '.claude', '.ponytail-active');
+fs.mkdirSync(skillHome, { recursive: true });
+const skillEnv = { HOME: skillHome, USERPROFILE: skillHome };
+const skillBody = fs.readFileSync(path.join(root, 'skills', 'ponytail', 'SKILL.md'), 'utf8');
+const skillDispatch = (args) =>
+  '<command-message>ponytail is running…</command-message>\n' +
+  '<command-name>/ponytail:ponytail</command-name>\n' +
+  '<command-args>' + args + '</command-args>\n' + skillBody;
+
+result = run('ponytail-mode-tracker.js', skillEnv, JSON.stringify({ prompt: skillDispatch('ultra') }));
+assert.equal(result.status, 0, result.stderr);
+assert.equal(fs.readFileSync(skillFlag, 'utf8'), 'ultra', 'skill-dispatched /ponytail ultra must set the mode (#584)');
+
+// Bare /ponytail via skill dispatch is report-only: level survives untouched.
+result = run('ponytail-mode-tracker.js', skillEnv, JSON.stringify({ prompt: skillDispatch('') }));
+assert.equal(result.status, 0, result.stderr);
+assert.equal(fs.readFileSync(skillFlag, 'utf8'), 'ultra', 'report-only skill dispatch must not reset the mode');
+
+// The skill body alone (no tags) mentions "stop ponytail" in prose — that must
+// neither activate nor deactivate anything (#161's trap, activation side).
+result = run('ponytail-mode-tracker.js', skillEnv, JSON.stringify({ prompt: skillBody }));
+assert.equal(result.status, 0, result.stderr);
+assert.equal(fs.readFileSync(skillFlag, 'utf8'), 'ultra', 'a tagless skill body must not touch the mode');
+
+// Tags pasted mid-prompt are data, not a command: only a prompt that starts
+// with the platform's dispatch envelope may switch or clear the mode.
+result = run('ponytail-mode-tracker.js', skillEnv, JSON.stringify({
+  prompt: 'why does <command-name>/ponytail:ponytail</command-name> <command-args>off</command-args> not work in my hook?',
+}));
+assert.equal(result.status, 0, result.stderr);
+assert.equal(fs.readFileSync(skillFlag, 'utf8'), 'ultra', 'quoted command tags mid-prompt must not touch the mode');
+
+result = run('ponytail-mode-tracker.js', skillEnv, JSON.stringify({ prompt: skillDispatch('off') }));
+assert.equal(result.status, 0, result.stderr);
+assert.equal(fs.existsSync(skillFlag), false, 'skill-dispatched /ponytail off must clear the mode');
 
 console.log('hook compatibility checks passed');

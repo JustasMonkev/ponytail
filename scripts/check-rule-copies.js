@@ -55,6 +55,8 @@ const INVARIANTS = [
   'security',
   'accessibility',
   'Lazy code without its check is unfinished', // one-check promoted to headline
+  'No self-reference',                     // no banner-echo / instruction-leak rule (#595)
+  'coverage is the deliverable',           // test-writing tasks keep their case list (#602)
 ];
 
 const skill = read('skills/ponytail/SKILL.md');
