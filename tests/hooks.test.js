@@ -245,6 +245,27 @@ assert.ok(
   'subagents must get the condensed ruleset, not the full SKILL.md (#597)',
 );
 
+// The condensed payload must still define what the active level means — a
+// lite subagent must not silently enforce full's ladder.
+fs.writeFileSync(subFlag, 'lite');
+result = run('ponytail-subagent.js', subEnv);
+assert.equal(result.status, 0, result.stderr);
+output = JSON.parse(result.stdout);
+assert.match(
+  output.hookSpecificOutput.additionalContext,
+  /name the lazier alternative in one line/,
+  'a lite subagent must receive lite\'s definition, not just the label',
+);
+fs.writeFileSync(subFlag, 'ultra');
+result = run('ponytail-subagent.js', subEnv);
+assert.equal(result.status, 0, result.stderr);
+output = JSON.parse(result.stdout);
+assert.match(
+  output.hookSpecificOutput.additionalContext,
+  /YAGNI extremist/,
+  'an ultra subagent must receive ultra\'s definition, not just the label',
+);
+
 // review is an independent mode: subagents get the pointer line, not a
 // lazy-dev ruleset mislabeled "review".
 fs.writeFileSync(subFlag, 'review');
@@ -508,6 +529,14 @@ assert.equal(fs.readFileSync(skillFlag, 'utf8'), 'ultra', 'report-only skill dis
 result = run('ponytail-mode-tracker.js', skillEnv, JSON.stringify({ prompt: skillBody }));
 assert.equal(result.status, 0, result.stderr);
 assert.equal(fs.readFileSync(skillFlag, 'utf8'), 'ultra', 'a tagless skill body must not touch the mode');
+
+// Tags pasted mid-prompt are data, not a command: only a prompt that starts
+// with the platform's dispatch envelope may switch or clear the mode.
+result = run('ponytail-mode-tracker.js', skillEnv, JSON.stringify({
+  prompt: 'why does <command-name>/ponytail:ponytail</command-name> <command-args>off</command-args> not work in my hook?',
+}));
+assert.equal(result.status, 0, result.stderr);
+assert.equal(fs.readFileSync(skillFlag, 'utf8'), 'ultra', 'quoted command tags mid-prompt must not touch the mode');
 
 result = run('ponytail-mode-tracker.js', skillEnv, JSON.stringify({ prompt: skillDispatch('off') }));
 assert.equal(result.status, 0, result.stderr);

@@ -40,12 +40,21 @@ function filterSkillBodyForMode(body, mode) {
     .join('\n');
 }
 
+// One line per intensity, from SKILL.md's table — the condensed payload must
+// still say what the active level *means*, or a lite subagent enforces full
+// and an ultra subagent never hears it should be the extremist.
+const INTENSITY = {
+  lite: "Build what's asked, but name the lazier alternative in one line. User picks.",
+  full: 'The ladder enforced. Stdlib and native first. Shortest diff, shortest explanation.',
+  ultra: 'YAGNI extremist. Deletion before addition. Ship the one-liner and challenge the rest of the requirement in the same breath.',
+};
+
 function getFallbackInstructions(mode) {
   return 'PONYTAIL MODE ACTIVE — level: ' + mode + '\n\n' +
     'You are a lazy senior developer. Lazy means efficient, not careless. The best code is the code never written.\n\n' +
     '## Persistence\n\n' +
     'ACTIVE EVERY RESPONSE. No drift back to over-building. Still active if unsure. Off only: "stop ponytail" / "normal mode".\n\n' +
-    'Current level: **' + mode + '**. Switch: `/ponytail lite|full|ultra`.\n\n' +
+    'Current level: **' + mode + '** — ' + (INTENSITY[mode] || INTENSITY.full) + ' Switch: `/ponytail lite|full|ultra`.\n\n' +
     '## The ladder\n\n' +
     'Before any code, stop at the first rung that holds (the ladder runs after you understand the problem, not instead of it — read the code it touches and trace the real flow first):\n' +
     '1. Does this need to be built at all? (YAGNI)\n' +

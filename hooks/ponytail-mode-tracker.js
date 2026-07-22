@@ -20,9 +20,11 @@ function finish() {
     // Claude Code dispatches /ponytail as a skill: data.prompt then carries
     // the whole skill body wrapped in XML tags, never the typed command, so
     // the [/@$]ponytail anchor below can't match and the mode flag was never
-    // written (#584). Prefer the <command-name>/<command-args> tags when
-    // present and rebuild the command string; raw prose falls through as-is.
-    const nameTag = prompt.match(/<command-name>\s*\/?([^<\n]*?)\s*<\/command-name>/);
+    // written (#584). Rebuild the command string from the tags — but only
+    // when the prompt *starts* with the platform's dispatch envelope. The
+    // prompt is untrusted text; tags merely pasted or discussed mid-message
+    // must stay inert, same reason the anchors below exist at all.
+    const nameTag = prompt.match(/^(?:<command-message>[^<]*<\/command-message>\s*)?<command-name>\s*\/?([^<\n]*?)\s*<\/command-name>/);
     if (nameTag && nameTag[1]) {
       const argsTag = prompt.match(/<command-args>\s*([^<\n]*?)\s*<\/command-args>/);
       prompt = ('/' + nameTag[1] + ' ' + (argsTag ? argsTag[1] : '')).trim();
