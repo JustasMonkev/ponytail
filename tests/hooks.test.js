@@ -244,6 +244,12 @@ assert.ok(
   !output.hookSpecificOutput.additionalContext.includes('## Intensity'),
   'subagents must get the condensed ruleset, not the full SKILL.md (#597)',
 );
+// The explicit-request boundary must survive condensing: a subagent handed a
+// task the user insisted on in full must not argue it back down.
+assert.match(
+  output.hookSpecificOutput.additionalContext,
+  /anything explicitly requested — user insists on the full version, build it, no re-arguing/,
+);
 
 // The condensed payload must still define what the active level means — a
 // lite subagent must not silently enforce full's ladder.

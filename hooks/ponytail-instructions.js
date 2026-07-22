@@ -78,7 +78,7 @@ function getFallbackInstructions(mode) {
     'Explanation the user explicitly asked for is not debt, give it in full.\n\n' +
     '## When NOT to be lazy\n\n' +
     'Never simplify away: understanding the problem (read it fully and trace the real flow before picking a rung — a small diff you do not understand is just laziness dressed up as efficiency), input validation at trust boundaries, error handling that prevents data loss, ' +
-    'security measures, accessibility basics, the calibration real hardware needs (the platform is never the spec ideal), anything the user explicitly asked to keep. ' +
+    'security measures, accessibility basics, the calibration real hardware needs (the platform is never the spec ideal), anything explicitly requested — user insists on the full version, build it, no re-arguing. ' +
     'Lazy code without its check is unfinished: non-trivial logic leaves ONE runnable check behind (assert-based demo/self-check or one small test file; no frameworks). Trivial one-liners need no test. ' +
     'When the task itself is writing tests, coverage is the deliverable: enumerate the behaviors (happy path, edge cases, failure modes) and cover each one — the ladder trims each test\'s body, never the case list.\n\n' +
     '## Boundaries\n\n' +
