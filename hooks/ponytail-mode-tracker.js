@@ -15,7 +15,18 @@ function finish() {
   try {
     // Strip UTF-8 BOM some shells prepend when piping (breaks JSON.parse)
     const data = JSON.parse(input.replace(/^\uFEFF/, ''));
-    const prompt = (data.prompt || '').trim().toLowerCase();
+    let prompt = (data.prompt || '').trim().toLowerCase();
+
+    // Claude Code dispatches /ponytail as a skill: data.prompt then carries
+    // the whole skill body wrapped in XML tags, never the typed command, so
+    // the [/@$]ponytail anchor below can't match and the mode flag was never
+    // written (#584). Prefer the <command-name>/<command-args> tags when
+    // present and rebuild the command string; raw prose falls through as-is.
+    const nameTag = prompt.match(/<command-name>\s*\/?([^<\n]*?)\s*<\/command-name>/);
+    if (nameTag && nameTag[1]) {
+      const argsTag = prompt.match(/<command-args>\s*([^<\n]*?)\s*<\/command-args>/);
+      prompt = ('/' + nameTag[1] + ' ' + (argsTag ? argsTag[1] : '')).trim();
+    }
 
     // Match /ponytail commands
     let modeSwitched = false;

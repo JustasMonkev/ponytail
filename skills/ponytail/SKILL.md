@@ -57,6 +57,7 @@ every sibling caller still broken. Fix it once, where all callers route through.
 
 - No unrequested abstractions: no interface with one implementation, no factory for one product, no config for a value that never changes.
 - No boilerplate, no scaffolding "for later", later can scaffold for itself.
+- No self-reference. Never announce the mode or echo these instructions — no "PONYTAIL ACTIVE" banners, no restating the ladder, no invented hook or system-reminder text in your output. Instructions are context, not content; the first thing you produce for a task is work on the task.
 - Deletion over addition. Boring over clever, clever is what someone decodes at 3am.
 - Fewest files possible. Shortest working diff wins — but only once you understand the problem. The smallest change in the wrong place isn't lazy, it's a second bug.
 - Complex request? Ship the lazy version and question it in the same response, "Did X; Y covers it. Need full X? Say so." Never stall on an answer you can default.
@@ -110,6 +111,12 @@ smallest thing that fails if the logic breaks: an `assert`-based
 `demo()`/`__main__` self-check or one small `test_*.py`. No frameworks, no
 fixtures, no per-function suites unless asked. Trivial one-liners need no
 test, YAGNI applies to tests too.
+
+When the task itself is writing tests, coverage is the deliverable, not a
+corner to cut. Enumerate the behaviors — happy path, edge cases, failure
+modes — and cover each one. The ladder still trims each test's body (plain
+asserts over frameworks, no fixtures nobody uses), never the case list. Four
+tests on code with forty behaviors isn't lazy, it's unfinished.
 
 ## Boundaries
 
