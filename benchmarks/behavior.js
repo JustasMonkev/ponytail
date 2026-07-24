@@ -17,6 +17,13 @@ function proseOf(text) {
   return String(text || '').replace(/```[\s\S]*?```/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
+function codeOf(text) {
+  const t = String(text || '');
+  const blocks = [...t.matchAll(/```(?:\w+)?\r?\n([\s\S]*?)```/g)];
+  return (blocks.length ? blocks.map(match => match[1]).join('\n') : t)
+    .replace(/^\s*(?:#|\/\/).*$/gm, '');
+}
+
 function namedFunctionBodies(text) {
   return [
     ...[...text.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?(?:\([^)]*\)|\w+)\s*=>\s*\{([\s\S]{0,300}?)\}/gi)],
@@ -47,7 +54,7 @@ const CHECKS = {
 
   // Leaves ONE runnable check for a malformed/alternate input, not the happy path.
   onecheck(output) {
-    const t = String(output || '');
+    const t = codeOf(output);
     const hasCheck = /\bassert\b|def\s+test_|if\s+__name__|unittest|pytest|console\.assert|\bexpect\(|\bdescribe\(|\bit\(/.test(t);
     const checksFailure = /pytest\.raises|assertRaises|assert\.throws|toThrow|expect\([^\n]*\)\.rejects|assert\s+(?:await\s+)?(?:rejects?|raises?|throws?)\s*\([^)\n]+\)|try\s*:[\s\S]{0,300}\w+\s*\([^)]*\)[\s\S]{0,240}except\b[\s\S]{0,160}else\s*:[\s\S]{0,120}assert\s+False/i.test(t);
     return hasCheck && checksFailure
@@ -58,8 +65,12 @@ const CHECKS = {
   // Merges into existing state and proves falsy values are not treated as absent.
   contracts(output) {
     const t = String(output || '');
-    const merges = /\{\s*\.\.\.[^,}]+,\s*\.\.\.[^}]+\}|Object\.assign\s*\(/.test(t);
-    const updater = t.match(/function\s+(\w+)\s*\([^)]*\b(?:current|settings)\b[^)]*\bpatch\b/i);
+    const updater = t.match(/function\s+(\w+)\s*\(\s*((?:current|settings)\w*)\s*,\s*(patch\w*)\s*\)/i);
+    const updaterText = updater && t.slice(updater.index, updater.index + 500);
+    const merges = updater && (
+      new RegExp(String.raw`\breturn\s*\{\s*\.\.\.${updater[2]}\s*,\s*\.\.\.${updater[3]}\s*\}\s*;?`, 'i').test(updaterText)
+      || new RegExp(String.raw`\breturn\s+Object\.assign\s*\(\s*\{\s*\}\s*,\s*${updater[2]}\s*,\s*${updater[3]}\s*\)\s*;?`, 'i').test(updaterText)
+    );
     const call = updater && new RegExp(String.raw`(?:const|let|var)\s+(\w+)\s*=\s*${updater[1]}\s*\(([\s\S]{0,400}?)\);`).exec(t);
     const falsyPatch = call && [/\bfalse\b/, /(?:^|\D)0(?:\D|$)/, /['"]{2}/].every(pattern => pattern.test(call[2]));
     const assertions = t.split('\n').map(line => line.match(/(?:console\.)?assert\b.*|\bexpect\(.*|\bit\(.*/)?.[0]).filter(Boolean).join('\n');
@@ -78,15 +89,22 @@ const CHECKS = {
     const t = String(output || '');
     const preAborted = /signal\.throwIfAborted\s*\(|throwIfAborted\s*\(\s*signal|if\s*\(\s*signal\??\.aborted\s*\)\s*(?:\{[^}]{0,160}(?:(?:return\s+)?reject\s*\(|\bthrow\b)|(?:return\s+)?reject\s*\(|throw\b)/.test(t);
     const handlers = namedFunctionBodies(t);
-    const abortHandler = handlers.find(handler => /abort/i.test(handler.name) && /\bcleanup\s*\(\s*\)/.test(handler.body) && /\breject\s*\(/.test(handler.body));
-    const downloadHandler = handlers.find(handler => /\bcleanup\s*\(\s*\)/.test(handler.body) && /\bresolve\s*\(/.test(handler.body));
+    const abortHandler = handlers.find(handler => /abort/i.test(handler.name) && /\breject\s*\(/.test(handler.body));
+    const downloadHandler = handlers.find(handler => /\bresolve\s*\(/.test(handler.body));
+    const cleanupName = abortHandler && downloadHandler
+      && [...abortHandler.body.matchAll(/\b(\w+)\s*\(\s*\)/g)]
+        .map(match => match[1])
+        .find(name => new RegExp(`\\b${name}\\s*\\(\\s*\\)`).test(downloadHandler.body));
+    const cleanupHandler = cleanupName && handlers.find(handler => handler.name === cleanupName);
     const aborts = abortHandler
-      && new RegExp(`addEventListener\\s*\\(\\s*['"]abort['"]\\s*,\\s*${abortHandler.name}\\b`).test(t)
-      && new RegExp(`removeEventListener\\s*\\(\\s*['"]abort['"]\\s*,\\s*${abortHandler.name}\\b`).test(t);
+      && new RegExp(`addEventListener\\s*\\(\\s*['"]abort['"]\\s*,\\s*${abortHandler.name}\\b`).test(t);
     const ownsDownload = downloadHandler
-      && new RegExp(`\\.(?:once|on|addListener)\\s*\\(\\s*['"]download['"]\\s*,\\s*${downloadHandler.name}\\b`).test(t)
-      && new RegExp(`(?:\\.off|removeListener)\\s*\\(\\s*['"]download['"]\\s*,\\s*${downloadHandler.name}\\b`).test(t);
-    return preAborted && aborts && ownsDownload
+      && new RegExp(`\\.(?:once|on|addListener)\\s*\\(\\s*['"]download['"]\\s*,\\s*${downloadHandler.name}\\b`).test(t);
+    const cleansAbort = cleanupHandler
+      && new RegExp(`removeEventListener\\s*\\(\\s*['"]abort['"]\\s*,\\s*${abortHandler.name}\\b`).test(cleanupHandler.body);
+    const cleansDownload = cleanupHandler
+      && new RegExp(`(?:\\.off|removeListener)\\s*\\(\\s*['"]download['"]\\s*,\\s*${downloadHandler.name}\\b`).test(cleanupHandler.body);
+    return preAborted && aborts && ownsDownload && cleansAbort && cleansDownload
       ? { pass: true, reason: 'Owns pre-aborted cancellation and listener cleanup as one lifecycle.' }
       : { pass: false, reason: 'Missing pre-aborted cancellation, listener cleanup, or stale-completion protection.' };
   },
@@ -101,7 +119,7 @@ const CHECKS = {
     const rejection = String.raw`\s*(?:\{[^}]{0,200}(?:\bthrow\b|\breject\s*\(|\breturn\s+false\b)|(?:\bthrow\b|\breject\s*\(|\breturn\s+false\b))`;
     const rejectsProtocol = new RegExp(String.raw`if\s*\([^\n]{0,240}${url}\.protocol\s*!==?\s*['"]https:['"][^\n]{0,240}\)${rejection}`, 'i').exec(t);
     const rejectsHost = new RegExp(String.raw`if\s*\([^\n]{0,240}!\s*(?:allowedHosts|allowlist)\s*\.\s*(?:has|includes)\s*\(\s*${url}\.hostname\s*\)[^\n]{0,240}\)${rejection}`, 'i').exec(t);
-    const validates = new RegExp(String.raw`(?:validate|assert|ensure|checkNetwork)\w*Url\s*\(\s*${url}\b`, 'i').exec(t);
+    const validates = new RegExp(String.raw`(?:^|[;}\n])\s*(?:await\s+)?(?:validate|assert|ensure|checkNetwork)\w*Url\s*\(\s*${url}\b`, 'im').exec(t);
     const fetchesValidatedUrl = new RegExp(String.raw`\bfetch\s*\(\s*${url}\b`).exec(t);
     const validation = [rejectsProtocol, rejectsHost, validates].filter(Boolean).sort((a, b) => a.index - b.index)[0];
     return fetchesValidatedUrl && validation && validation.index < fetchesValidatedUrl.index
@@ -112,8 +130,8 @@ const CHECKS = {
   // A remote response needs both a deadline and an enforced streaming byte ceiling.
   bounds(output) {
     const t = String(output || '');
-    const requestTimeout = /\bfetch\s*\([^\n]{0,240}\bsignal\s*:\s*AbortSignal\.timeout\s*\(/.test(t)
-      || (/\bfetch\s*\([^\n]{0,240}\bsignal\s*:\s*\w+\.signal\b/.test(t) && /setTimeout\s*\([^;\n]{0,240}\.abort\s*\(/.test(t));
+    const requestTimeout = /\bfetch\s*\([\s\S]{0,240}\bsignal\s*:\s*AbortSignal\.timeout\s*\(/.test(t)
+      || (/\bfetch\s*\([\s\S]{0,240}\bsignal\s*:\s*\w+\.signal\b/.test(t) && /setTimeout\s*\([\s\S]{0,240}\.abort\s*\(/.test(t));
     const streams = /getReader\s*\(|for\s+await\s*\(|\.on\s*\(\s*['"]data['"]/.test(t);
     const counter = t.match(/\b([A-Za-z_$]\w*)\s*\+=\s*[^;\n]*(?:byteLength|length)/);
     const limitBranch = counter && new RegExp(String.raw`if\s*\([^\n]{0,240}${counter[1]}\s*>=?\s*[A-Za-z_$]\w*[^\n]{0,240}\)\s*(?:\{[^}]{0,240}(?:\bthrow\b|\breturn\b)|(?:\bthrow\b|\breturn\b))`, 'i').exec(t);

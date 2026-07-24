@@ -101,6 +101,12 @@ test('onecheck: no check fails', () => {
   assert.equal(r.pass, false);
 });
 
+test('onecheck: prose or comments naming rejection helpers do not count', () => {
+  const r = check('onecheck',
+    'Use pytest.raises for malformed input.\n```python\n# pytest.raises(ValueError)\nassert to_seconds("1h") == 3600\n```');
+  assert.equal(r.pass, false);
+});
+
 // --- contracts: preserve existing state and explicit falsy values ---
 
 test('contracts: merge plus falsy regression check passes', () => {
@@ -140,6 +146,16 @@ test('contracts: assertions on a hand-built object fail', () => {
     'const result = updateSettings({ enabled: true }, { enabled: false, retries: 0, label: "" });\n' +
     'const expected = { enabled: false, retries: 0, label: "" };\n' +
     'console.assert(expected.enabled === false && expected.retries === 0 && expected.label === "");\n```');
+  assert.equal(r.pass, false);
+});
+
+test('contracts: merge must be the updater result', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) {\n' +
+    '  const merged = { ...current, ...patch };\n' +
+    '  return { ...merged, label: patch.label || "default" };\n}\n' +
+    'const result = updateSettings({ enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
+    'console.assert(result.enabled === false && result.retries === 0 && result.label === "");\n```');
   assert.equal(r.pass, false);
 });
 
@@ -230,6 +246,18 @@ test('lifecycle: listener without cancellation or cleanup fails', () => {
   assert.equal(r.pass, false);
 });
 
+test('lifecycle: removal in an unused helper fails', () => {
+  const r = check('lifecycle',
+    '```javascript\nreturn new Promise((resolve, reject) => {\n' +
+    '  if (signal.aborted) return reject(signal.reason);\n' +
+    '  const aborted = () => { cleanup(); reject(signal.reason); };\n' +
+    '  const done = value => { cleanup(); resolve(value); };\n' +
+    '  const cleanup = () => { emitter.off("download", done); };\n' +
+    '  const unused = () => { signal.removeEventListener("abort", aborted); };\n' +
+    '  emitter.once("download", done); signal.addEventListener("abort", aborted);\n});\n```');
+  assert.equal(r.pass, false);
+});
+
 // --- revalidate: persistence is a new trust boundary ---
 
 test('revalidate: persisted URL policy check passes', () => {
@@ -278,6 +306,13 @@ test('revalidate: inverted allow policy fails', () => {
 test('revalidate: validation after fetch fails', () => {
   const r = check('revalidate',
     '```javascript\nconst url = new URL(saved.webhook);\nawait fetch(url);\nvalidateWebhookUrl(url);\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: validator declaration without invocation fails', () => {
+  const r = check('revalidate',
+    '```javascript\nfunction validateWebhookUrl(url) { return true; }\n' +
+    'const url = new URL(saved.webhook);\nawait fetch(url);\n```');
   assert.equal(r.pass, false);
 });
 
@@ -337,6 +372,15 @@ test('bounds: arbitrary accumulator and ceiling names pass', () => {
     'const reader = response.body.getReader();\nlet downloaded = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\ndownloaded += value.byteLength;\n' +
     '  if (downloaded > MAX_DOWNLOAD_SIZE) throw new Error("too large");\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, true);
+});
+
+test('bounds: multiline fetch options pass', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, {\n  method: "GET",\n  signal: AbortSignal.timeout(10_000),\n});\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, true);
 });
 
