@@ -48,10 +48,22 @@ take the higher one and move on. The first lazy solution that works is the
 right one — once you actually know what the change has to touch.
 
 **Bug fix = root cause, not symptom.** A report names a symptom. Before you
-edit, grep every caller of the function you're about to touch. The lazy fix IS
-the root-cause fix: one guard in the shared function is a smaller diff than a
-guard in every caller — and patching only the path the ticket names leaves
-every sibling caller still broken. Fix it once, where all callers route through.
+edit, grep every caller and non-call entry path of the function you're about
+to touch: callbacks, retries, reload/restore, attach, redirects, persisted
+state, and concurrent calls. The lazy fix IS the root-cause fix: one guard in
+the shared function is a smaller diff than a guard in every caller — and
+patching only the path the ticket names leaves every sibling caller still
+broken. Fix it once, where all paths route through.
+
+## Before shipping
+
+Run this risk gate against the changed behavior, not just its happy path:
+
+- **Preserve contracts.** Keep existing defaults, explicit false/zero/empty values, user state and intent, history, metadata, error semantics, generated files, lockfiles, and platform behavior unless the task changes them.
+- **Own lifecycles.** For timers, listeners, tasks, and awaits that can outlive their caller or wait on external state, define timeout/cancellation when applicable, cleanup after success, failure, and partial setup, and protection from stale completion or double claim.
+- **Revalidate transformed input.** Parsing, persistence, deserialization, redirects, replay, normalization, and privilege changes create new trust boundaries; earlier validation does not survive them.
+- **Bound external work.** Cap time, bytes, items, retries, memory, path lengths, and name collisions. Refetches must preserve required request semantics while reapplying security policy.
+- **Exercise the skipped path.** Make the one runnable check target the riskiest alternate path or invariant, not merely repeat the happy path.
 
 ## Rules
 
@@ -106,11 +118,13 @@ reads off, a PCA9685 runs a few percent fast. Leave the calibration knob, not
 just less code, the physical world needs tuning a minimal model can't see.
 
 Lazy code without its check is unfinished. Non-trivial logic (a branch, a
-loop, a parser, a money/security path) leaves ONE runnable check behind, the
-smallest thing that fails if the logic breaks: an `assert`-based
+loop, a parser, a money/security path) leaves ONE risk-targeted runnable check
+behind, the smallest thing that fails if the riskiest alternate path or
+invariant breaks: boundary, cancellation, partial failure, replay/round-trip,
+or explicit false/zero/empty state. Use an `assert`-based
 `demo()`/`__main__` self-check or one small `test_*.py`. No frameworks, no
-fixtures, no per-function suites unless asked. Trivial one-liners need no
-test, YAGNI applies to tests too.
+fixtures, no per-function suites unless asked. Trivial one-liners need no test,
+YAGNI applies to tests too.
 
 When the task itself is writing tests, coverage is the deliverable, not a
 corner to cut. Enumerate the behaviors — happy path, edge cases, failure

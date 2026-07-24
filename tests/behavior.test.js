@@ -71,6 +71,75 @@ test('onecheck: no check fails', () => {
   assert.equal(r.pass, false);
 });
 
+// --- contracts: preserve existing state and explicit falsy values ---
+
+test('contracts: merge plus falsy regression check passes', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) {\n' +
+    '  return { ...current, ...patch };\n}\n' +
+    'const result = updateSettings({ enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
+    'console.assert(result.enabled === false && result.retries === 0 && result.label === "");\n```');
+  assert.equal(r.pass, true);
+});
+
+test('contracts: replacement without falsy check fails', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) { return { theme: patch.theme || "light" }; }\n```');
+  assert.equal(r.pass, false);
+});
+
+// --- lifecycle: cancellation owns listener cleanup ---
+
+test('lifecycle: abort and listener cleanup pass', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, signal) {\n' +
+    '  return new Promise((resolve, reject) => {\n' +
+    '    const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+    '    const done = value => { cleanup(); resolve(value); };\n' +
+    '    const aborted = () => { cleanup(); reject(signal.reason); };\n' +
+    '    emitter.once("download", done); signal.addEventListener("abort", aborted, { once: true });\n' +
+    '  });\n}\n```');
+  assert.equal(r.pass, true);
+});
+
+test('lifecycle: listener without cancellation or cleanup fails', () => {
+  const r = check('lifecycle',
+    '```javascript\nconst waitForDownload = emitter => new Promise(resolve => emitter.on("download", resolve));\n```');
+  assert.equal(r.pass, false);
+});
+
+// --- revalidate: persistence is a new trust boundary ---
+
+test('revalidate: persisted URL policy check passes', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("invalid webhook");\n' +
+    'await fetch(url, { method: "POST", body });\n```');
+  assert.equal(r.pass, true);
+});
+
+test('revalidate: direct use of persisted URL fails', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nawait fetch(saved.webhook, { method: "POST", body });\n```');
+  assert.equal(r.pass, false);
+});
+
+// --- bounds: remote work needs time and byte ceilings ---
+
+test('bounds: timeout and byte ceiling pass', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'const maxBytes = 10 * 1024 * 1024;\n' +
+    'if (Number(response.headers.get("content-length")) > maxBytes) throw new Error("too large");\n```');
+  assert.equal(r.pass, true);
+});
+
+test('bounds: unbounded fetch fails', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url);\nawait writeFile(destination, await response.arrayBuffer());\n```');
+  assert.equal(r.pass, false);
+});
+
 // --- unknown probe is skipped, not failed ---
 
 test('unknown probe is skipped', () => {

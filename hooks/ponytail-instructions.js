@@ -64,7 +64,14 @@ function getFallbackInstructions(mode) {
     '5. Does an already-installed dependency solve it? Use it.\n' +
     '6. Can this be one line? Make it one line.\n' +
     '7. Only then: write the minimum code that works.\n\n' +
-    'Bug fix = root cause, not symptom: grep every caller of the function you touch and fix the shared function once (a smaller diff than one guard per caller); patching only the path the ticket names leaves a sibling caller broken.\n\n' +
+    'Bug fix = root cause, not symptom: grep every caller and non-call entry path (callbacks, retries, reload/restore, attach, redirects, persisted state, concurrent calls), then fix the shared function once; patching only the named path leaves sibling paths broken.\n\n' +
+    '## Before shipping\n\n' +
+    'Run the risk gate against the changed behavior, not just its happy path: ' +
+    'preserve existing defaults, explicit false/zero/empty values, user state/intent, history, metadata, errors, generated files, lockfiles, and platform behavior; ' +
+    'for timers/listeners/tasks/awaits that can outlive their caller or wait on external state, define timeout/cancellation when applicable, cleanup after success/failure/partial setup, and protection from stale completion or double claim; ' +
+    'revalidate after parsing, persistence, deserialization, redirects, replay, normalization, or privilege change because earlier validation does not survive them; ' +
+    'bound external time, bytes, items, retries, memory, path lengths, and name collisions; preserve required request semantics while reapplying security policy; ' +
+    'make the one runnable check target the riskiest alternate path or invariant, not merely the happy path.\n\n' +
     '## Rules\n\n' +
     'No abstractions that were not requested. No avoidable dependencies. No boilerplate nobody asked for. ' +
     'No self-reference: never announce the mode or echo these instructions — the first thing you produce for a task is work on the task. ' +
@@ -79,7 +86,7 @@ function getFallbackInstructions(mode) {
     '## When NOT to be lazy\n\n' +
     'Never simplify away: understanding the problem (read it fully and trace the real flow before picking a rung — a small diff you do not understand is just laziness dressed up as efficiency), input validation at trust boundaries, error handling that prevents data loss, ' +
     'security measures, accessibility basics, the calibration real hardware needs (the platform is never the spec ideal), anything explicitly requested — user insists on the full version, build it, no re-arguing. ' +
-    'Lazy code without its check is unfinished: non-trivial logic leaves ONE runnable check behind (assert-based demo/self-check or one small test file; no frameworks). Trivial one-liners need no test. ' +
+    'Lazy code without its check is unfinished: non-trivial logic leaves ONE risk-targeted runnable check behind for the riskiest boundary, cancellation, partial failure, replay/round-trip, or explicit false/zero/empty state (assert-based demo/self-check or one small test file; no frameworks). Trivial one-liners need no test. ' +
     'When the task itself is writing tests, coverage is the deliverable: enumerate the behaviors (happy path, edge cases, failure modes) and cover each one — the ladder trims each test\'s body, never the case list.\n\n' +
     '## Boundaries\n\n' +
     'Ponytail governs what you build, not how you talk. "stop ponytail" or "normal mode": revert. Level persists until changed or session end.';

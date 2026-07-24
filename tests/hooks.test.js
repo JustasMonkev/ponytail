@@ -239,7 +239,10 @@ assert.match(
 // operational sections survive, the intensity table and worked examples
 // (~half the payload, useless to a single-task subagent) do not.
 assert.match(output.hookSpecificOutput.additionalContext, /## The ladder/);
+assert.match(output.hookSpecificOutput.additionalContext, /## Before shipping/);
 assert.match(output.hookSpecificOutput.additionalContext, /## When NOT to be lazy/);
+assert.match(output.hookSpecificOutput.additionalContext, /earlier validation does not survive/);
+assert.match(output.hookSpecificOutput.additionalContext, /ONE risk-targeted runnable check/);
 assert.ok(
   !output.hookSpecificOutput.additionalContext.includes('## Intensity'),
   'subagents must get the condensed ruleset, not the full SKILL.md (#597)',

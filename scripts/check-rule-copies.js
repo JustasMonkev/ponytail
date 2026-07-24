@@ -44,8 +44,13 @@ for (const [relPath, normalize] of copies) {
 const INVARIANTS = [
   'in this codebase',                      // ladder rung: reuse what already exists (#217)
   'naive heuristic',                       // ceiling-comment rule
-  'ONE runnable check',                    // test reflex
+  'ONE risk-targeted runnable check',      // test the risky skipped path
   'flimsier algorithm',                    // robust-variant rule
+  'non-call entry path',                   // callbacks/retries/re-entry are callers too
+  'Preserve contracts',                    // defaults/state/metadata compatibility
+  'Own lifecycles',                        // cancellation and cleanup ownership
+  'earlier validation does not survive',   // transformed inputs cross boundaries
+  'Bound external work',                   // time/space/collision limits
   // the four "not lazy about" safety carve-outs: pin each so a reword in either
   // file can't silently drop one. Only validation was pinned before. These are the
   // continuous substrings present in both files ("prevents data loss" because the
