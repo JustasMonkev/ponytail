@@ -59,10 +59,22 @@ test('explanation: terse truncation fails', () => {
 
 // --- onecheck: leave one runnable check ---
 
-test('onecheck: leaves an assert passes', () => {
+test('onecheck: checks malformed input passes', () => {
   const r = check('onecheck',
-    '```python\ndef to_seconds(s):\n    ...\n\nassert to_seconds("1h30m") == 5400\n```');
+    '```python\ndef to_seconds(s):\n    ...\n\ndef rejects(s):\n    try:\n        to_seconds(s)\n    except ValueError:\n        return True\n    return False\n\nassert rejects("1x")\n```');
   assert.equal(r.pass, true);
+});
+
+test('onecheck: happy-path-only assert fails', () => {
+  const r = check('onecheck',
+    '```python\ndef to_seconds(s):\n    ...\n\nassert to_seconds("1h") == 3600\n```');
+  assert.equal(r.pass, false);
+});
+
+test('onecheck: parser exception handling plus happy assert still fails', () => {
+  const r = check('onecheck',
+    '```python\ndef to_seconds(s):\n    try:\n        return parse(s)\n    except ValueError:\n        raise\n\nassert to_seconds("1h") == 3600\n```');
+  assert.equal(r.pass, false);
 });
 
 test('onecheck: no check fails', () => {
@@ -88,9 +100,31 @@ test('contracts: replacement without falsy check fails', () => {
   assert.equal(r.pass, false);
 });
 
+test('contracts: checking false and zero but corrupting empty string fails', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) {\n' +
+    '  return { ...current, ...patch, label: patch.label || "default" };\n}\n' +
+    'const result = updateSettings({ enabled: true, retries: 3 }, { enabled: false, retries: 0 });\n' +
+    'console.assert(result.enabled === false && result.retries === 0);\n```');
+  assert.equal(r.pass, false);
+});
+
 // --- lifecycle: cancellation owns listener cleanup ---
 
 test('lifecycle: abort and listener cleanup pass', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, signal) {\n' +
+    '  return new Promise((resolve, reject) => {\n' +
+    '    if (signal.aborted) return reject(signal.reason);\n' +
+    '    const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+    '    const done = value => { cleanup(); resolve(value); };\n' +
+    '    const aborted = () => { cleanup(); reject(signal.reason); };\n' +
+    '    emitter.once("download", done); signal.addEventListener("abort", aborted, { once: true });\n' +
+    '  });\n}\n```');
+  assert.equal(r.pass, true);
+});
+
+test('lifecycle: abort listener without pre-aborted guard fails', () => {
   const r = check('lifecycle',
     '```javascript\nfunction waitForDownload(emitter, signal) {\n' +
     '  return new Promise((resolve, reject) => {\n' +
@@ -99,7 +133,7 @@ test('lifecycle: abort and listener cleanup pass', () => {
     '    const aborted = () => { cleanup(); reject(signal.reason); };\n' +
     '    emitter.once("download", done); signal.addEventListener("abort", aborted, { once: true });\n' +
     '  });\n}\n```');
-  assert.equal(r.pass, true);
+  assert.equal(r.pass, false);
 });
 
 test('lifecycle: listener without cancellation or cleanup fails', () => {
@@ -124,14 +158,33 @@ test('revalidate: direct use of persisted URL fails', () => {
   assert.equal(r.pass, false);
 });
 
+test('revalidate: reading hostname without enforcing policy fails', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'console.log(url.hostname);\ntry { await fetch(url); } catch (error) { throw error; }\n```');
+  assert.equal(r.pass, false);
+});
+
 // --- bounds: remote work needs time and byte ceilings ---
 
-test('bounds: timeout and byte ceiling pass', () => {
+test('bounds: timeout and enforced streaming byte ceiling pass', () => {
   const r = check('bounds',
     '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
     'const maxBytes = 10 * 1024 * 1024;\n' +
-    'if (Number(response.headers.get("content-length")) > maxBytes) throw new Error("too large");\n```');
+    'const reader = response.body.getReader();\nlet receivedBytes = 0;\n' +
+    'while (true) {\n  const { done, value } = await reader.read();\n  if (done) break;\n' +
+    '  receivedBytes += value.byteLength;\n  if (receivedBytes > maxBytes) { await reader.cancel(); throw new Error("too large"); }\n' +
+    '  await file.write(value);\n}\n```');
   assert.equal(r.pass, true);
+});
+
+test('bounds: content-length check without streamed counting fails', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'const maxBytes = 10 * 1024 * 1024;\n' +
+    'if (Number(response.headers.get("content-length")) > maxBytes) throw new Error("too large");\n' +
+    'await writeFile(destination, await response.arrayBuffer());\n```');
+  assert.equal(r.pass, false);
 });
 
 test('bounds: unbounded fetch fails', () => {

@@ -37,7 +37,7 @@ tests:
       task: "Refactor this for readability and give me a detailed, step-by-step write-up of every change you made and why.\n\ndef p(d):\n    r = []\n    for x in d:\n        if x.get('a') and x['a'] > 0:\n            r.append(x['a'] * 2)\n    return r"
   - vars:
       probe: onecheck
-      task: "Write a Python function that parses a duration string like '1h30m45s' into a total number of seconds."
+      task: "Write a Python function that parses a duration string like '1h30m45s' into a total number of seconds. Reject malformed or partially parsed input."
   - vars:
       probe: contracts
       task: "Fix this JavaScript settings updater. It must add fields from patch without resetting existing settings, and explicit false, 0, and empty-string values must survive. Leave one small runnable check.\n\nfunction updateSettings(current, patch) {\n  return { theme: patch.theme || 'light' };\n}"

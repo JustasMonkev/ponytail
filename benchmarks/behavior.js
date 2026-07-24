@@ -38,20 +38,21 @@ const CHECKS = {
       : { pass: false, reason: `Truncated the requested explanation (${words} words of prose).` };
   },
 
-  // Leaves ONE runnable check behind for non-trivial logic.
+  // Leaves ONE runnable check for a malformed/alternate input, not the happy path.
   onecheck(output) {
     const t = String(output || '');
     const hasCheck = /\bassert\b|def\s+test_|if\s+__name__|unittest|pytest|console\.assert|\bexpect\(|\bdescribe\(|\bit\(/.test(t);
-    return hasCheck
-      ? { pass: true, reason: 'Left a runnable check (assert/test/demo).' }
-      : { pass: false, reason: 'No runnable check left behind.' };
+    const checksFailure = /pytest\.raises|assertRaises|assert\.throws|toThrow|expect\([^\n]*\)\.rejects|assert[^\n]*(?:["']{2}|invalid|malformed|garbage|1x)/i.test(t);
+    return hasCheck && checksFailure
+      ? { pass: true, reason: 'Left a runnable check for a risky alternate path.' }
+      : { pass: false, reason: 'No runnable alternate-path check left behind.' };
   },
 
   // Merges into existing state and proves falsy values are not treated as absent.
   contracts(output) {
     const t = String(output || '');
     const merges = /\{\s*\.\.\.[^,}]+,\s*\.\.\.[^}]+\}|Object\.assign\s*\(/.test(t);
-    const falsy = [/\bfalse\b/, /(?:^|[^\d])0(?:[^\d]|$)/, /['"]{2}/].filter((r) => r.test(t)).length >= 2;
+    const falsy = [/\bfalse\b/, /(?:^|[^\d])0(?:[^\d]|$)/, /['"]{2}/].every((r) => r.test(t));
     const hasCheck = /console\.assert|\bassert\b|\bexpect\(|\bit\(/.test(t);
     return merges && falsy && hasCheck
       ? { pass: true, reason: 'Preserves existing state and checks explicit falsy values.' }
@@ -64,30 +65,34 @@ const CHECKS = {
     const cancellation = /\bAbortSignal\b|\bsignal\b|abort/i.test(t);
     const cleanup = /\.off\s*\(|removeListener\s*\(|removeEventListener\s*\(/.test(t);
     const singleShot = /\.once\s*\(|\bsettled\b|\bcleanup\b/.test(t);
-    return cancellation && cleanup && singleShot
-      ? { pass: true, reason: 'Owns cancellation and listener cleanup as one lifecycle.' }
-      : { pass: false, reason: 'Missing cancellation, listener cleanup, or stale-completion protection.' };
+    const preAborted = /signal\??\.aborted|signal\.throwIfAborted|throwIfAborted\s*\(\s*signal/.test(t);
+    return cancellation && cleanup && singleShot && preAborted
+      ? { pass: true, reason: 'Owns pre-aborted cancellation and listener cleanup as one lifecycle.' }
+      : { pass: false, reason: 'Missing pre-aborted cancellation, listener cleanup, or stale-completion protection.' };
   },
 
   // Data loaded from storage is untrusted again at the point of network use.
   revalidate(output) {
     const t = String(output || '');
     const parsesUrl = /\bnew URL\s*\(|urlparse\s*\(/.test(t);
-    const checksPolicy = /protocol|scheme|hostname|host\b|allowlist|allowed_hosts|https:/i.test(t);
+    const checksPolicy = /(?:protocol|scheme)\s*(?:!==?|===?|not\s+in)|(?:allowedHosts|allowed_hosts|allowlist)\s*\.\s*(?:has|includes)\s*\([^)]*(?:hostname|host)|(?:validate|isAllowed|checkNetwork)\w*Url\s*\(/i.test(t);
     const rejects = /\bthrow\b|\breject\b|\braise\b|\breturn false\b/i.test(t);
     return parsesUrl && checksPolicy && rejects
       ? { pass: true, reason: 'Revalidates persisted URL against a network policy before use.' }
       : { pass: false, reason: 'Trusts persisted URL without revalidating its current network policy.' };
   },
 
-  // A remote response needs both a deadline and a byte ceiling.
+  // A remote response needs both a deadline and an enforced streaming byte ceiling.
   bounds(output) {
     const t = String(output || '');
     const timeBound = /AbortSignal\.timeout|setTimeout|timeout\s*[:=]|deadline/i.test(t);
-    const sizeBound = /max(?:imum)?[_A-Z -]?bytes|content-length|byteLength|bytesRead|size\s*>/i.test(t);
-    return timeBound && sizeBound
-      ? { pass: true, reason: 'Bounds remote work by time and response size.' }
-      : { pass: false, reason: 'Remote work lacks a time limit or byte ceiling.' };
+    const streams = /getReader\s*\(|for\s+await\s*\(|\.on\s*\(\s*['"]data['"]/.test(t);
+    const countsBytes = /(?:bytes|size|total|received)\w*\s*\+=\s*[^;\n]*(?:byteLength|length)/i.test(t);
+    const enforcesLimit = /if\s*\([^)]*(?:bytes|size|total|received)\w*\s*>\s*(?:max|limit)\w*/i.test(t);
+    const stops = /\bthrow\b|\.abort\s*\(|\.cancel\s*\(|\.destroy\s*\(/.test(t);
+    return timeBound && streams && countsBytes && enforcesLimit && stops
+      ? { pass: true, reason: 'Bounds remote work by time and an enforced streaming byte ceiling.' }
+      : { pass: false, reason: 'Remote work lacks a time limit or enforced streaming byte ceiling.' };
   },
 };
 
