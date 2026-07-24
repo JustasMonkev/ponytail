@@ -89,6 +89,12 @@ test('onecheck: try/except/else rejection self-check passes', () => {
   assert.equal(r.pass, true);
 });
 
+test('onecheck: arbitrary malformed input in rejection self-check passes', () => {
+  const r = check('onecheck',
+    '```python\ntry:\n    to_seconds("abc")\nexcept ValueError:\n    pass\nelse:\n    assert False\n```');
+  assert.equal(r.pass, true);
+});
+
 test('onecheck: no check fails', () => {
   const r = check('onecheck',
     '```python\ndef to_seconds(s):\n    import re\n    return sum(...)\n```');
@@ -125,6 +131,15 @@ test('contracts: mentioning empty input without asserting it fails', () => {
   const r = check('contracts',
     '```javascript\nconst result = updateSettings(current, { enabled: false, retries: 0, label: "" });\n' +
     'console.assert(result.enabled === false && result.retries === 0);\n```');
+  assert.equal(r.pass, false);
+});
+
+test('contracts: assertions on a hand-built object fail', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) { return { ...current, ...patch, label: patch.label || "default" }; }\n' +
+    'const result = updateSettings({ enabled: true }, { enabled: false, retries: 0, label: "" });\n' +
+    'const expected = { enabled: false, retries: 0, label: "" };\n' +
+    'console.assert(expected.enabled === false && expected.retries === 0 && expected.label === "");\n```');
   assert.equal(r.pass, false);
 });
 
@@ -183,6 +198,17 @@ test('lifecycle: cleanup of unrelated listeners fails', () => {
     '  const aborted = () => { cleanup(); reject(signal.reason); };\n' +
     '  const done = value => resolve(value);\n' +
     '  const cleanup = () => { emitter.off("progress", other); signal.removeEventListener("abort", other); };\n' +
+    '  emitter.once("download", done); signal.addEventListener("abort", aborted);\n});\n```');
+  assert.equal(r.pass, false);
+});
+
+test('lifecycle: successful download without cleanup fails', () => {
+  const r = check('lifecycle',
+    '```javascript\nreturn new Promise((resolve, reject) => {\n' +
+    '  if (signal.aborted) return reject(signal.reason);\n' +
+    '  const aborted = () => { cleanup(); reject(signal.reason); };\n' +
+    '  const done = value => resolve(value);\n' +
+    '  const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
     '  emitter.once("download", done); signal.addEventListener("abort", aborted);\n});\n```');
   assert.equal(r.pass, false);
 });
@@ -249,6 +275,12 @@ test('revalidate: inverted allow policy fails', () => {
   assert.equal(r.pass, false);
 });
 
+test('revalidate: validation after fetch fails', () => {
+  const r = check('revalidate',
+    '```javascript\nconst url = new URL(saved.webhook);\nawait fetch(url);\nvalidateWebhookUrl(url);\n```');
+  assert.equal(r.pass, false);
+});
+
 // --- bounds: remote work needs time and byte ceilings ---
 
 test('bounds: timeout and enforced streaming byte ceiling pass', () => {
@@ -297,6 +329,15 @@ test('bounds: cancelling without stopping before write fails', () => {
     '  const { done, value } = await reader.read(); if (done) break;\nreceivedBytes += value.byteLength;\n' +
     '  if (receivedBytes > maxBytes) { reader.cancel(); }\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, false);
+});
+
+test('bounds: arbitrary accumulator and ceiling names pass', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'const reader = response.body.getReader();\nlet downloaded = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\ndownloaded += value.byteLength;\n' +
+    '  if (downloaded > MAX_DOWNLOAD_SIZE) throw new Error("too large");\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, true);
 });
 
 test('bounds: unbounded fetch fails', () => {
