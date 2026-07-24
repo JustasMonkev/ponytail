@@ -114,10 +114,10 @@ The Claude Code and Codex plugins run two tiny Node.js lifecycle hooks, so `node
 ### Claude Code
 
 ```
-/plugin marketplace add DietrichGebert/ponytail
+/plugin marketplace add JustasMonkev/ponytail
 ```
 ```
-/plugin install ponytail@ponytail
+/plugin install ponytail@ponytail-justas
 ```
 (You have to send two separate prompts for the install to work) 
 
@@ -126,13 +126,24 @@ Same steps in the Claude Code Desktop app's Code tab: type the two `/plugin` com
 ### Codex
 
 ```bash
-codex plugin marketplace add DietrichGebert/ponytail
-codex plugin add ponytail@ponytail
+codex plugin marketplace add JustasMonkev/ponytail --ref main
+codex plugin add ponytail@ponytail-justas
 ```
 
 Run `codex` and open `/hooks`, review and trust its two lifecycle hooks, and start a new thread.
 
 This same install also covers the Codex desktop app: restart the app after installing and it picks up the plugin.
+
+### Cursor
+
+Run this in each project where you want ponytail active:
+
+```bash
+mkdir -p .cursor/rules
+curl -fsSL https://raw.githubusercontent.com/JustasMonkev/ponytail/main/.cursor/rules/ponytail.mdc -o .cursor/rules/ponytail.mdc
+```
+
+Cursor loads the copied rule automatically. This instruction-only install does not add the plugin mode switches or lifecycle hooks available in Claude Code and Codex.
 
 ### GitHub Copilot CLI
 
