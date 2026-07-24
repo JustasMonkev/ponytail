@@ -42,7 +42,7 @@ const CHECKS = {
   onecheck(output) {
     const t = String(output || '');
     const hasCheck = /\bassert\b|def\s+test_|if\s+__name__|unittest|pytest|console\.assert|\bexpect\(|\bdescribe\(|\bit\(/.test(t);
-    const checksFailure = /pytest\.raises|assertRaises|assert\.throws|toThrow|expect\([^\n]*\)\.rejects|assert[^\n]*(?:["']{2}|invalid|malformed|garbage|1x)/i.test(t);
+    const checksFailure = /pytest\.raises|assertRaises|assert\.throws|toThrow|expect\([^\n]*\)\.rejects|assert\s+(?:await\s+)?(?:rejects?|raises?|throws?)\s*\([^)\n]*(?:["']{2}|invalid|malformed|garbage|1x)/i.test(t);
     return hasCheck && checksFailure
       ? { pass: true, reason: 'Left a runnable check for a risky alternate path.' }
       : { pass: false, reason: 'No runnable alternate-path check left behind.' };
@@ -62,11 +62,12 @@ const CHECKS = {
   // Cancellation must remove every listener it installed, not just reject.
   lifecycle(output) {
     const t = String(output || '');
-    const cancellation = /\bAbortSignal\b|\bsignal\b|abort/i.test(t);
     const cleanup = /\.off\s*\(|removeListener\s*\(|removeEventListener\s*\(/.test(t);
     const singleShot = /\.once\s*\(|\bsettled\b|\bcleanup\b/.test(t);
-    const preAborted = /signal\??\.aborted|signal\.throwIfAborted|throwIfAborted\s*\(\s*signal/.test(t);
-    return cancellation && cleanup && singleShot && preAborted
+    const preAborted = /signal\.throwIfAborted\s*\(|throwIfAborted\s*\(\s*signal|if\s*\(\s*signal\??\.aborted\s*\)\s*(?:\{[^}]{0,160}(?:(?:return\s+)?(?:Promise\.)?reject\s*\(|\bthrow\b)|(?:return\s+)?(?:Promise\.)?reject\s*\(|throw\b)/.test(t);
+    const abortHandler = t.match(/(?:const|let|var)\s+(\w*abort\w*)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>\s*\{?[\s\S]{0,180}?\breject\s*\(/i);
+    const listensForAbort = abortHandler && new RegExp(`addEventListener\\s*\\(\\s*['"]abort['"]\\s*,\\s*${abortHandler[1]}\\b`).test(t);
+    return cleanup && singleShot && preAborted && listensForAbort
       ? { pass: true, reason: 'Owns pre-aborted cancellation and listener cleanup as one lifecycle.' }
       : { pass: false, reason: 'Missing pre-aborted cancellation, listener cleanup, or stale-completion protection.' };
   },
@@ -75,9 +76,9 @@ const CHECKS = {
   revalidate(output) {
     const t = String(output || '');
     const parsesUrl = /\bnew URL\s*\(|urlparse\s*\(/.test(t);
-    const checksPolicy = /(?:protocol|scheme)\s*(?:!==?|===?|not\s+in)|(?:allowedHosts|allowed_hosts|allowlist)\s*\.\s*(?:has|includes)\s*\([^)]*(?:hostname|host)|(?:validate|isAllowed|checkNetwork)\w*Url\s*\(/i.test(t);
-    const rejects = /\bthrow\b|\breject\b|\braise\b|\breturn false\b/i.test(t);
-    return parsesUrl && checksPolicy && rejects
+    const rejectsPolicy = /if\s*\([^\n]{0,240}(?:(?:protocol|scheme)\s*(?:!==?|===?|not\s+in)|(?:allowedHosts|allowed_hosts|allowlist)\s*\.\s*(?:has|includes)|(?:isAllowed|allowlisted)\w*Url\s*\()[^\n]{0,240}\)\s*(?:\{[^}]{0,200}(?:\bthrow\b|\breject\s*\(|\breturn\s+false\b)|(?:\bthrow\b|\breject\s*\(|\breturn\s+false\b))/i.test(t);
+    const validates = /(?:validate|assert|ensure|checkNetwork)\w*Url\s*\(\s*(?:url|saved\.\w+)/i.test(t);
+    return parsesUrl && (rejectsPolicy || validates)
       ? { pass: true, reason: 'Revalidates persisted URL against a network policy before use.' }
       : { pass: false, reason: 'Trusts persisted URL without revalidating its current network policy.' };
   },
@@ -88,9 +89,8 @@ const CHECKS = {
     const timeBound = /AbortSignal\.timeout|setTimeout|timeout\s*[:=]|deadline/i.test(t);
     const streams = /getReader\s*\(|for\s+await\s*\(|\.on\s*\(\s*['"]data['"]/.test(t);
     const countsBytes = /(?:bytes|size|total|received)\w*\s*\+=\s*[^;\n]*(?:byteLength|length)/i.test(t);
-    const enforcesLimit = /if\s*\([^)]*(?:bytes|size|total|received)\w*\s*>\s*(?:max|limit)\w*/i.test(t);
-    const stops = /\bthrow\b|\.abort\s*\(|\.cancel\s*\(|\.destroy\s*\(/.test(t);
-    return timeBound && streams && countsBytes && enforcesLimit && stops
+    const stopsAtLimit = /if\s*\([^\n]{0,240}(?:bytes|size|total|received)\w*\s*>=?\s*(?:max|limit)\w*[^\n]{0,240}\)\s*(?:\{[^}]{0,240}(?:\bthrow\b|\.(?:abort|cancel|destroy)\s*\()|(?:\bthrow\b|\.(?:abort|cancel|destroy)\s*\())/i.test(t);
+    return timeBound && streams && countsBytes && stopsAtLimit
       ? { pass: true, reason: 'Bounds remote work by time and an enforced streaming byte ceiling.' }
       : { pass: false, reason: 'Remote work lacks a time limit or enforced streaming byte ceiling.' };
   },

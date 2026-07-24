@@ -77,6 +77,12 @@ test('onecheck: parser exception handling plus happy assert still fails', () => 
   assert.equal(r.pass, false);
 });
 
+test('onecheck: malformed input accepted by an assertion fails', () => {
+  const r = check('onecheck',
+    '```python\ndef to_seconds(s):\n    return 0\n\nassert to_seconds("") == 0\n```');
+  assert.equal(r.pass, false);
+});
+
 test('onecheck: no check fails', () => {
   const r = check('onecheck',
     '```python\ndef to_seconds(s):\n    import re\n    return sum(...)\n```');
@@ -136,6 +142,16 @@ test('lifecycle: abort listener without pre-aborted guard fails', () => {
   assert.equal(r.pass, false);
 });
 
+test('lifecycle: passive aborted read and unused cleanup fail', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, signal) {\n' +
+    '  console.log(signal.aborted);\n' +
+    '  const cleanup = () => emitter.off("download", done);\n' +
+    '  return new Promise(resolve => emitter.once("download", resolve));\n' +
+    '}\n```');
+  assert.equal(r.pass, false);
+});
+
 test('lifecycle: listener without cancellation or cleanup fails', () => {
   const r = check('lifecycle',
     '```javascript\nconst waitForDownload = emitter => new Promise(resolve => emitter.on("download", resolve));\n```');
@@ -165,6 +181,14 @@ test('revalidate: reading hostname without enforcing policy fails', () => {
   assert.equal(r.pass, false);
 });
 
+test('revalidate: policy warning plus unrelated fetch rejection fails', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'if (url.protocol !== "https:") console.log("bad");\n' +
+    'try { await fetch(url); } catch (error) { throw error; }\n```');
+  assert.equal(r.pass, false);
+});
+
 // --- bounds: remote work needs time and byte ceilings ---
 
 test('bounds: timeout and enforced streaming byte ceiling pass', () => {
@@ -184,6 +208,16 @@ test('bounds: content-length check without streamed counting fails', () => {
     'const maxBytes = 10 * 1024 * 1024;\n' +
     'if (Number(response.headers.get("content-length")) > maxBytes) throw new Error("too large");\n' +
     'await writeFile(destination, await response.arrayBuffer());\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: size warning plus unrelated HTTP throw fails', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'const reader = response.body.getReader();\nlet receivedBytes = 0;\n' +
+    'while (true) {\n  const { done, value } = await reader.read();\n  if (done) break;\n' +
+    '  receivedBytes += value.byteLength;\n  if (receivedBytes > maxBytes) { console.warn("too large"); }\n' +
+    '  if (!response.ok) throw new Error("HTTP error");\n}\n```');
   assert.equal(r.pass, false);
 });
 
