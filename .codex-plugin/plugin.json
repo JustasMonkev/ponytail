@@ -6,8 +6,8 @@
     "name": "Dietrich Gebert",
     "url": "https://github.com/DietrichGebert"
   },
-  "homepage": "https://github.com/DietrichGebert/ponytail",
-  "repository": "https://github.com/DietrichGebert/ponytail",
+  "homepage": "https://github.com/JustasMonkev/ponytail",
+  "repository": "https://github.com/JustasMonkev/ponytail",
   "license": "MIT",
   "keywords": ["yagni", "minimalism", "code-review", "productivity"],
   "skills": "./skills/",
@@ -16,10 +16,10 @@
     "displayName": "Ponytail",
     "shortDescription": "Lazy senior developer mode",
     "longDescription": "Prefer YAGNI, the standard library, native platform features, and the smallest correct implementation.",
-    "developerName": "Dietrich Gebert",
+    "developerName": "JustasMonkev",
     "category": "Productivity",
     "capabilities": ["Instructions", "Lifecycle hooks"],
-    "websiteURL": "https://github.com/DietrichGebert/ponytail",
+    "websiteURL": "https://github.com/JustasMonkev/ponytail",
     "defaultPrompt": [
       "Use Ponytail mode for this task.",
       "Review this diff for over-engineering.",
