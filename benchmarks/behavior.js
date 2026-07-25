@@ -142,8 +142,19 @@ const CHECKS = {
     // '1h30m45s' is the task's own valid example: rejecting it is the bug, not
     // the check. The input under test has to be malformed or half-parsed.
     const wellFormed = /^['"]\s*(?:\d+\s*[hms])+\s*['"]$/i;
-    const checksFailure = [...t.matchAll(markers)].some(match => !subject
-      || reaching(`${match[0]}\n${suiteAt(t, match.index)}`).some(arg => !wellFormed.test(arg)));
+    // A check inside `def unused():` is never executed by running or by test
+    // discovery, so it is not a check that was left behind.
+    const runs = index => {
+      const lineStart = t.lastIndexOf('\n', index) + 1;
+      const indent = t.slice(lineStart).search(/\S/);
+      if (indent <= 0) return true;
+      const owner = [...t.slice(0, lineStart).matchAll(/^([ \t]*)def\s+(\w+)\s*\(/gm)]
+        .reverse().find(match => match[1].length < indent);
+      return !owner || /^test_/.test(owner[2]) || owner[2] === 'main'
+        || (t.match(new RegExp(String.raw`\b${owner[2]}\s*\(`, 'g')) || []).length > 1;
+    };
+    const checksFailure = [...t.matchAll(markers)].some(match => runs(match.index)
+      && (!subject || reaching(`${match[0]}\n${suiteAt(t, match.index)}`).some(arg => !wellFormed.test(arg))));
     return hasCheck && checksFailure
       ? { pass: true, reason: 'Left a runnable check for a risky alternate path.' }
       : { pass: false, reason: 'No runnable alternate-path check left behind.' };
@@ -182,7 +193,7 @@ const CHECKS = {
     const runs = index => [...t.matchAll(/(?:function\s*(\w*)\s*\([^)]*\)|=>)\s*\{/g)]
       .map(match => ({
         called: match[1] && (t.match(new RegExp(String.raw`\b${match[1]}\s*\(`, 'g')) || []).length > 1,
-        entry: /\b(?:test|it|describe|main)\s*\($/.test(t.slice(0, match.index + 1).trimEnd()),
+        entry: /\b(?:test|it|describe|main)\s*\([\s\S]{0,120}$/.test(t.slice(0, match.index + 1)),
         open: t.indexOf('{', match.index + match[0].length - 1),
       }))
       .every(block => block.called || block.entry
@@ -237,7 +248,7 @@ const CHECKS = {
     // the real one counts, so resolve the local binding it was imported under,
     // and require it to receive this function's own signal parameter.
     const imported = /(?:const|let|var)\s*\{([^}]{0,160})\}\s*=\s*require\s*\(\s*['"](?:node:)?events['"]|import\s*\{([^}]{0,160})\}\s*from\s*['"](?:node:)?events['"]/.exec(whole);
-    const namespace = /(?:const|let|var)\s+(\w+)\s*=\s*require\s*\(\s*['"](?:node:)?events['"]|import\s+(\w+)\s+from\s+['"](?:node:)?events['"]/.exec(whole);
+    const namespace = /(?:const|let|var)\s+(\w+)\s*=\s*require\s*\(\s*['"](?:node:)?events['"]|import\s+(?:\*\s*as\s+)?(\w+)\s+from\s+['"](?:node:)?events['"]/.exec(whole);
     const alias = imported && (imported[1] || imported[2]).split(',')
       .map(part => part.split(/\s+as\s+|:/).map(word => word.trim()))
       .find(pair => pair[0] === 'once');
@@ -250,8 +261,11 @@ const CHECKS = {
     const signalOption = signalParam === 'signal'
       ? String.raw`\bsignal\s*(?:[,}]|:\s*signal\b)`
       : String.raw`\bsignal\s*:\s*${signalParam}\b`;
-    if (onceName && !shim
-      && new RegExp(String.raw`(?:return|await|=>)\s*${onceName}\s*\(\s*${emitterParam}\s*,\s*['"]download['"]\s*,\s*\{[^}]{0,120}${signalOption}`).test(t))
+    // ...on every path: `if (useNative) return once(...)` leaves the fallback
+    // branch leaking, so the delegation has to be the implementation.
+    const delegates = onceName && !shim
+      && new RegExp(String.raw`(?:return|await|=>)\s*${onceName}\s*\(\s*${emitterParam}\s*,\s*['"]download['"]\s*,\s*\{[^}]{0,120}${signalOption}`).exec(t);
+    if (delegates && dominates(t, delegates.index, t.length))
       return { pass: true, reason: 'Delegates the whole lifecycle to the abort-aware events.once helper.' };
     // An already-aborted signal never fires `abort`, so the guard has to run
     // before any listener is installed or the setup leaks both of them.
@@ -316,7 +330,7 @@ const CHECKS = {
     const rejection = String.raw`\s*(?:\{[^}]{0,200}(?:\bthrow\b|\breject\s*\(|\breturn\s+false\b)|(?:\bthrow\b|\breject\s*\(|\breturn\s+false\b))`;
     // Each policy must reject on its own. An `&&` clause only rejects when every
     // condition fails, so an allowed host still reaches the network over http.
-    const enforcing = (text, name) => [...text.matchAll(new RegExp(String.raw`if\s*\(([^\n]{0,300}?)\)(${rejection})`, 'gi'))]
+    const enforcing = (text, name) => [...text.matchAll(new RegExp(String.raw`if\s*\(([\s\S]{0,300}?)\)(${rejection})`, 'gi'))]
       // A throw the branch catches itself falls through to the request.
       .filter(match => !/\btry\b/.test(match[2]))
       .flatMap(match => match[1].split('||').map(clause => ({ index: match.index, clause })))
@@ -347,7 +361,11 @@ const CHECKS = {
         // variable is not proof, and the next `{` in the file is not this call's.
         options: match[4] ? blockAt(t, match.index + match[0].length - 1) : '',
       }));
-    if (requests.some(request => request.target.startsWith(parsed[2]))) return fail;
+    // Every destination reached has to be one that was parsed and cleared —
+    // including one replayed from a manual redirect's Location header.
+    const approved = new Map([...t.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*new URL\s*\(/g)]
+      .map(match => [match[1], match.index]));
+    if (requests.some(request => !approved.has(request.target))) return fail;
     const urlRequests = requests.filter(request => request.target === url);
     // The task is to POST a payload: a guarded GET never performs the operation
     // whose trust boundary this probe is measuring, and an `x-body` header is
@@ -367,8 +385,19 @@ const CHECKS = {
     const boundsRedirects = urlRequests.length
       && urlRequests.every(request => request.native
         || /redirect\s*:\s*['"](?:manual|error)['"]/.test(request.options));
-    const mutated = new RegExp(String.raw`${url}\.\w+\s*=(?!=)`).test(t);
-    return fetchCall && boundsRedirects && !mutated && validations.some(v => v.index < fetchCall.index)
+    // Normalizing before validation is fine; only a change the policy never saw
+    // — between the last validation and the request — is a new destination.
+    const cleared = fetchCall && validations.filter(v => v.index < fetchCall.index)
+      .sort((a, b) => a.index - b.index).pop();
+    const mutated = cleared && [...t.matchAll(new RegExp(String.raw`${url}\.\w+\s*=(?!=)`, 'g'))]
+      .some(change => change.index > cleared.index && change.index < fetchCall.index);
+    // ...and every other request must clear its own destination the same way.
+    const others = urlRequests.length < requests.length
+      && requests.filter(request => request.target !== url)
+        .every(request => enforcing(t, request.target)
+          .some(guard => dominates(t, guard.index, request.index) && guard.index < request.index));
+    return fetchCall && boundsRedirects && !mutated && cleared
+      && (urlRequests.length === requests.length || others)
       ? { pass: true, reason: 'Revalidates persisted URL against a network policy before use.' }
       : fail;
   },
@@ -385,7 +414,7 @@ const CHECKS = {
     // before the request: a timer set afterwards bounds nothing.
     const reads = consumer && t.slice(Math.max(0, consumer.index - 80), consumer.index)
       + consumer.header + consumer.body;
-    const timed = [...t.matchAll(/(?:(?:const|let|var)\s+(\w+)\s*=\s*)?(?:await\s+)?\b(?:fetch|https?\.(?:get|request))\s*\(/g)]
+    const timed = [...t.matchAll(/(?:(?:const|let|var)\s+(\w+)\s*=\s*)?(?:await\s+)?\b(fetch|https?\.(?:get|request))\s*\(/g)]
       .filter(request => {
         const options = blockAt(t, request.index).slice(0, 400);
         const signalRef = /\bsignal\s*:\s*AbortSignal\.timeout\s*\(/.test(options)
@@ -406,15 +435,26 @@ const CHECKS = {
             || armedBefore(String.raw`setTimeout\s*\([\s\S]{0,240}\b${signalRef}\s*\.\s*abort\s*\(`)));
       });
     let stream = [];
+    let nativeRequest = false;
     const requestTimeout = Boolean(reads && timed.some(request => {
       const names = new Set([request[1]].filter(Boolean));
+      // https.get(url, options, response => ...) hands the response to a
+      // callback rather than binding it, so take the parameter name too.
+      const callback = /,\s*(?:async\s*)?\(?\s*(\w+)\s*\)?\s*=>|,\s*function\s*\(\s*(\w+)/
+        .exec(t.slice(request.index, request.index + 240));
+      if (callback) names.add(callback[1] || callback[2]);
       for (const binding of t.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*([\w.$]+)/g))
         if (names.has(binding[2].split('.')[0])) names.add(binding[1]);
       if (![...names].some(name => new RegExp(String.raw`\b${name}\b`).test(reads))) return false;
       stream = [...names];
+      nativeRequest = request[2] !== 'fetch';
       return true;
     }));
+    // A fetch body is a Web ReadableStream, so `.on('data')`/`.destroy()` on it
+    // throws at runtime; evented consumption only exists on a native response.
     const evented = Boolean(consumer && /['"]data['"]/.test(consumer.header));
+    if (evented && requestTimeout && !nativeRequest)
+      return { pass: false, reason: 'Uses Node stream methods on a Web ReadableStream fetch body.' };
     const chunk = (scope.match(/\{[^}]{0,40}\b(?!done\b)(\w+)\s*\}\s*=\s*await\s+\w+\s*\.\s*read\s*\(/)
       || (consumer && consumer.header.match(/for\s+await\s*\(\s*(?:const|let|var)\s+(\w+)\s+of/))
       || (consumer && consumer.header.match(/['"]data['"]\s*,\s*(?:async\s*)?\(?\s*(\w+)/)) || [])[1];

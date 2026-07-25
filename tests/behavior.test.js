@@ -126,6 +126,13 @@ test('onecheck: an AssertionError sentinel passes', () => {
   assert.equal(r.pass, true);
 });
 
+test('onecheck: a check inside an uncalled helper is never run', () => {
+  const r = check('onecheck',
+    '```python\ndef to_seconds(s):\n    ...\n\ndef unused():\n    try:\n        to_seconds("abc")\n' +
+    '    except ValueError:\n        pass\n    else:\n        assert False\n```');
+  assert.equal(r.pass, false);
+});
+
 test('onecheck: no check fails', () => {
   const r = check('onecheck',
     '```python\ndef to_seconds(s):\n    import re\n    return sum(...)\n```');
@@ -316,6 +323,15 @@ test('contracts: a check parked in an uncalled helper never runs', () => {
     '  const result = updateSettings({ theme: "dark", enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
     '  console.assert(result.theme === "dark" && result.enabled === false && result.retries === 0 && result.label === "");\n}\n```');
   assert.equal(r.pass, false);
+});
+
+test('contracts: a check inside a test() callback passes', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) { return { ...current, ...patch }; }\n' +
+    'test("preserves falsy values", () => {\n' +
+    '  const result = updateSettings({ theme: "dark", enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
+    '  console.assert(result.theme === "dark" && result.enabled === false && result.retries === 0 && result.label === "");\n});\n```');
+  assert.equal(r.pass, true);
 });
 
 // --- lifecycle: cancellation owns listener cleanup ---
@@ -555,6 +571,22 @@ test('lifecycle: conditional cleanup leaves listeners on the other path', () => 
   assert.equal(r.pass, false);
 });
 
+test('lifecycle: a namespace import of events.once passes', () => {
+  const r = check('lifecycle',
+    '```javascript\nimport * as events from "node:events";\n' +
+    'const waitForDownload = (emitter, signal) => events.once(emitter, "download", { signal });\n```');
+  assert.equal(r.pass, true);
+});
+
+test('lifecycle: native delegation behind a branch leaves the other path leaking', () => {
+  const r = check('lifecycle',
+    '```javascript\nconst { once } = require("node:events");\n' +
+    'function waitForDownload(emitter, signal) {\n' +
+    '  if (useNative) { return once(emitter, "download", { signal }); }\n' +
+    '  return new Promise(resolve => emitter.on("download", resolve));\n}\n```');
+  assert.equal(r.pass, false);
+});
+
 test('lifecycle: a local once shim is not the native helper', () => {
   const r = check('lifecycle',
     '```javascript\nfunction once(emitter, event, options) {\n' +
@@ -747,6 +779,31 @@ test('revalidate: a policy trapped in an uncalled nested helper fails', () => {
   assert.equal(r.pass, false);
 });
 
+test('revalidate: a multiline policy condition passes', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'if (\n  url.protocol !== "https:"\n  || !allowedHosts.has(url.hostname)\n) throw new Error("bad");\n' +
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, true);
+});
+
+test('revalidate: normalizing before validating is safe ordering', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\nurl.hash = "";\n' +
+    'if (url.protocol !== "https:") throw new Error("bad");\n' +
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, true);
+});
+
+test('revalidate: replaying a manual redirect unvalidated fails', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'if (url.protocol !== "https:") throw new Error("bad");\n' +
+    'const response = await fetch(url, { method: "POST", body, redirect: "manual" });\n' +
+    'const next = response.headers.get("location");\nawait fetch(next, { method: "POST", body });\n```');
+  assert.equal(r.pass, false);
+});
+
 test('revalidate: direct use of persisted URL fails', () => {
   const r = check('revalidate',
     '```javascript\nconst saved = JSON.parse(text);\nawait fetch(saved.webhook, { method: "POST", body });\n```');
@@ -882,19 +939,19 @@ test('bounds: multiline fetch options pass', () => {
 
 test('bounds: returning from a data callback does not stop the stream', () => {
   const r = check('bounds',
-    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    '```javascript\nconst response = await https.get(url, { signal: AbortSignal.timeout(10_000) });\n' +
     'let received = 0;\nresponse.body.on("data", chunk => {\n  received += chunk.length;\n' +
     '  if (received > MAX_BYTES) return;\n  file.write(chunk);\n});\n```');
   assert.equal(r.pass, false);
 });
 
-test('bounds: destroying the evented stream at the ceiling passes', () => {
+test('bounds: Node stream methods on a fetch body fail at runtime', () => {
   const r = check('bounds',
     '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
     'let received = 0;\nresponse.body.on("data", chunk => {\n  received += chunk.length;\n' +
     '  if (received > MAX_BYTES) { response.body.destroy(new Error("too large")); return; }\n' +
     '  file.write(chunk);\n});\n```');
-  assert.equal(r.pass, true);
+  assert.equal(r.pass, false);
 });
 
 test('bounds: pre-created timeout signal passes', () => {
@@ -1026,7 +1083,7 @@ test('bounds: a commented-out byte guard is not a ceiling', () => {
 
 test('bounds: tearing down an unrelated object does not stop the stream', () => {
   const r = check('bounds',
-    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    '```javascript\nconst response = await https.get(url, { signal: AbortSignal.timeout(10_000) });\n' +
     'let received = 0;\nresponse.on("data", chunk => {\n  received += chunk.length;\n' +
     '  if (received > MAX_BYTES) { otherController.abort(new Error("too large")); return; }\n' +
     '  file.write(chunk);\n});\n```');
@@ -1098,6 +1155,15 @@ test('bounds: a timer cleared before the request bounds nothing', () => {
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
     '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, false);
+});
+
+test('bounds: a callback-style native https download passes', () => {
+  const r = check('bounds',
+    '```javascript\nhttps.get(url, { signal: AbortSignal.timeout(10_000) }, response => {\n' +
+    '  let received = 0;\n  response.on("data", chunk => {\n    received += chunk.length;\n' +
+    '    if (received > MAX_BYTES) { response.destroy(new Error("too large")); return; }\n' +
+    '    file.write(chunk);\n  });\n});\n```');
+  assert.equal(r.pass, true);
 });
 
 test('bounds: unbounded fetch fails', () => {
