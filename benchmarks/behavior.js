@@ -53,6 +53,33 @@ function suiteAt(text, index) {
   return lines.slice(0, end < 0 ? lines.length : end + 1).join('\n');
 }
 
+// The text with every nested function body blanked out, leaving only what runs
+// when the enclosing function itself is called.
+function reachable(text) {
+  const chars = [...text];
+  for (const match of text.matchAll(/(?:function\s*\w*\s*\([^)]*\)|=>)\s*\{/g)) {
+    const open = text.indexOf('{', match.index + match[0].length - 1);
+    const block = blockAt(text, open);
+    for (let i = open; i < open + block.length; i += 1) chars[i] = ' ';
+  }
+  return chars.join('');
+}
+
+// True when `index` sits on a statement that runs unconditionally on the way to
+// `target`: not in a sibling function, and not behind a branch target skips.
+function dominates(text, index, target) {
+  const encloses = [...text.matchAll(/(?:function\s*\w*\s*\([^)]*\)|=>|\bif\s*\([^)]{0,200}\)|\belse\b|\btry\b|\bcatch\s*\([^)]*\)|\bfor\s*\([^)]*\)|\bwhile\s*\([^)]*\))\s*\{/g)]
+    .map(match => text.indexOf('{', match.index + match[0].length - 1))
+    .map(open => ({ open, end: open + blockAt(text, open).length }))
+    .every(range => index < range.open || index > range.end
+      || (target >= range.open && target <= range.end));
+  const statement = text.slice(1 + Math.max(
+    text.lastIndexOf(';', index), text.lastIndexOf('{', index),
+    text.lastIndexOf('}', index), text.lastIndexOf('\n', index),
+  ), index);
+  return encloses && !/\bif\s*\(|\?/.test(statement);
+}
+
 // True when nothing but a function body containing `target` also contains
 // `index` — i.e. the two are on the same execution path, not stranded in an
 // uncalled helper.
@@ -96,12 +123,12 @@ const CHECKS = {
   // Leaves ONE runnable check for a malformed/alternate input, not the happy path.
   onecheck(output) {
     const t = codeOf(output);
-    const hasCheck = /\bassert\b|def\s+test_|if\s+__name__|unittest|pytest|console\.assert|\bexpect\(|\bdescribe\(|\bit\(/.test(t);
+    const hasCheck = /\bassert\b|AssertionError|def\s+test_|if\s+__name__|unittest|pytest|console\.assert|\bexpect\(|\bdescribe\(|\bit\(/.test(t);
     // Both framework-free idioms count: `assert False` after the call inside
     // the try, and the try/except/else layout.
     // The sentinel `assert False` runs inside the try, so a broad `except` would
     // swallow its own AssertionError; only a named exception proves rejection.
-    const markers = /pytest\.raises|assertRaises|assert\.throws|toThrow|expect\([^\n]*\)\.rejects|assert\s+(?:await\s+)?(?:rejects?|raises?|throws?)\s*\([^)\n]+\)|try\s*:[\s\S]{0,200}\w+\s*\([^)\n]*\)[\s\S]{0,120}\bassert\s+False\b[\s\S]{0,160}except\s+(?!Exception\b|BaseException\b)[\w(]|try\s*:[\s\S]{0,300}\w+\s*\([^)]*\)[\s\S]{0,240}except\b[\s\S]{0,160}else\s*:[\s\S]{0,120}assert\s+False/gi;
+    const markers = /pytest\.raises|assertRaises|assert\.throws|toThrow|expect\([^\n]*\)\.rejects|assert\s+(?:await\s+)?(?:rejects?|raises?|throws?)\s*\([^)\n]+\)|try\s*:[\s\S]{0,200}\w+\s*\([^)\n]*\)[\s\S]{0,120}(?:\bassert\s+False\b|raise\s+AssertionError)[\s\S]{0,160}except\s+(?!Exception\b|BaseException\b)[\w(]|try\s*:[\s\S]{0,300}\w+\s*\([^)]*\)[\s\S]{0,240}except\b[\s\S]{0,160}else\s*:[\s\S]{0,120}(?:assert\s+False|raise\s+AssertionError)/gi;
     // Proving that some other call raises says nothing about this parser, so the
     // failure check has to reach the function under test — directly or one hop
     // through a helper it defines.
@@ -137,18 +164,29 @@ const CHECKS = {
       const body = block ? t.slice(match.index, t.indexOf('{', match.index) + block.length) : '';
       const merge = new RegExp(String.raw`(?:\breturn|=>)\s*\(?\s*\{\s*\.\.\.${match[2]}\s*,\s*\.\.\.${match[3]}\s*\}`, 'i').exec(body)
         || new RegExp(String.raw`(?:\breturn|=>)\s*Object\.assign\s*\(\s*\{\s*\}\s*,\s*${match[2]}\s*,\s*${match[3]}\s*\)`, 'i').exec(body);
-      // ...and it has to be the one that runs: a merge after an unconditional
-      // earlier return is dead code behind a reset.
-      return Boolean(merge && ![...body.matchAll(/(?<![.\w])return\b/g)].some(earlier => {
+      // ...and it has to be the one that runs: a merge behind `if (false)` or
+      // after an unconditional earlier return is dead code behind a reset.
+      if (!merge || !dominates(body, merge.index, body.length)) return false;
+      return ![...body.matchAll(/(?<![.\w])return\b/g)].some(earlier => {
         const statement = body.slice(1 + Math.max(
           body.lastIndexOf(';', earlier.index),
           body.lastIndexOf('{', earlier.index),
           body.lastIndexOf('}', earlier.index),
         ), earlier.index);
         return earlier.index < merge.index && !/\bif\s*\(/.test(statement);
-      }));
+      });
     });
     const name = updater && updater[1];
+    // A check parked inside a helper nobody calls never runs. Top level, a test
+    // entry point, or a function the answer actually invokes.
+    const runs = index => [...t.matchAll(/(?:function\s*(\w*)\s*\([^)]*\)|=>)\s*\{/g)]
+      .map(match => ({
+        called: match[1] && (t.match(new RegExp(String.raw`\b${match[1]}\s*\(`, 'g')) || []).length > 1,
+        entry: /\b(?:test|it|describe|main)\s*\($/.test(t.slice(0, match.index + 1).trimEnd()),
+        open: t.indexOf('{', match.index + match[0].length - 1),
+      }))
+      .every(block => block.called || block.entry
+        || index < block.open || index > block.open + blockAt(t, block.open).length);
     const assigned = name && new RegExp(String.raw`(?:const|let|var)\s+(\w+)\s*=\s*${name}\s*\(([\s\S]{0,400}?)\);`).exec(t);
     // One structural assertion proves the same three contracts, whether it runs
     // the updater inline or names the variable the call was assigned to.
@@ -179,6 +217,7 @@ const CHECKS = {
     const checksPreserved = untouched.some(key => new RegExp(String.raw`\b${key}\s*:`).test(expected)
       || new RegExp(String.raw`\.${key}\b`).test(assertions));
     return updater && falsyPatch && checksFalsy && checksPreserved
+      && runs(inlineCall ? structural.index : assigned.index)
       ? { pass: true, reason: 'Preserves existing state and checks explicit falsy values.' }
       : { pass: false, reason: 'Does not prove state and explicit false/zero/empty values survive.' };
   },
@@ -219,8 +258,13 @@ const CHECKS = {
     // ...and the branch has to leave: rejecting without returning still falls
     // through and installs both listeners on an already-aborted signal.
     const guard = new RegExp(String.raw`${signalParam}\.throwIfAborted\s*\(|throwIfAborted\s*\(\s*${signalParam}|if\s*\(\s*${signalParam}\??\.aborted\s*\)\s*(?:\{[^}]{0,160}?(?<![.\w])reject\s*\([^}]{0,80}\breturn\b|\{[^}]{0,160}?\bthrow\b|return\s+(?<![.\w])reject\s*\(|throw\b)`).exec(t);
+    // Returning an already-rejected promise is a valid termination — but only
+    // outside the executor, where the return value is actually the result.
+    const executorAt = t.search(/new\s+Promise\s*\(/);
+    const earlyReject = new RegExp(String.raw`if\s*\(\s*${signalParam}\??\.aborted\s*\)\s*(?:\{\s*)?return\s+Promise\s*\.\s*reject\s*\(`).exec(t);
+    const terminates = guard || (earlyReject && (executorAt < 0 || earlyReject.index < executorAt) ? earlyReject : null);
     const firstListener = /addEventListener\s*\(\s*['"]abort['"]|\.(?:once|on|addListener)\s*\(\s*['"]download['"]/.exec(t);
-    const preAborted = Boolean(guard && firstListener && guard.index < firstListener.index);
+    const preAborted = Boolean(terminates && firstListener && terminates.index < firstListener.index);
     const handlers = namedFunctionBodies(t);
     // Which callback is the abort handler is decided by what was registered for
     // 'abort', not by whether its name happens to say so.
@@ -235,10 +279,14 @@ const CHECKS = {
         && !/\bif\s*\(|\?|&&|\|\|/.test(statement));
     const abortHandler = aborts && handlers.find(handler => handler.name === aborts[2] && settles(handler.body, 'reject'));
     const downloadHandler = ownsDownload && handlers.find(handler => handler.name === ownsDownload[2] && settles(handler.body, 'resolve'));
+    // Cleanup has to run on every settlement path, not behind `if (owned)`.
+    const callsCleanup = (body, cleanup) => body.split(';')
+      .some(statement => new RegExp(String.raw`(?<![.\w])${cleanup}\s*\(\s*\)`).test(statement)
+        && !/\bif\s*\(|\?|&&|\|\|/.test(statement));
     const cleanupName = abortHandler && downloadHandler
       && [...abortHandler.body.matchAll(/\b(\w+)\s*\(\s*\)/g)]
         .map(match => match[1])
-        .find(name => new RegExp(`\\b${name}\\s*\\(\\s*\\)`).test(downloadHandler.body));
+        .find(name => callsCleanup(abortHandler.body, name) && callsCleanup(downloadHandler.body, name));
     const cleanupHandler = cleanupName && handlers.find(handler => handler.name === cleanupName);
     // Removal has to happen on the object the listener was registered on;
     // otherEmitter.off(...) leaves the real listener installed.
@@ -283,19 +331,21 @@ const CHECKS = {
     // Only the invoked validator's own body counts — not whatever follows it.
     // And a validator that returns false is ignorable, as these callers do
     // ignore it; requiring it to throw is what actually stops the request.
-    const validatorBody = definition ? blockAt(t, definition.index) : '';
+    const validatorBody = definition ? reachable(blockAt(t, definition.index)) : '';
     const enforcingValidator = Boolean(definition
       && /\bthrow\b|\breject\s*\(/.test(validatorBody)
       && enforcing(validatorBody, definition[1] || definition[2]).length > 0);
     // Every request to the persisted destination has to be guarded, not just the
     // first one: a safe HEAD probe followed by an unguarded POST is a bypass.
-    const requests = [...t.matchAll(/(?:(?:const|let|var)\s+(\w+)\s*=\s*)?(?:await\s+)?\b(fetch|https?\.(?:request|get))\s*\(\s*([^,)]{0,80}?)\s*[,)]/g)]
+    const requests = [...t.matchAll(/(?:(?:const|let|var)\s+(\w+)\s*=\s*)?(?:await\s+)?\b(fetch|https?\.(?:request|get))\s*\(\s*([^,)]{0,80}?)\s*(?:(,\s*\{)|[,)])/g)]
       .map(match => ({
         index: match.index,
         handle: match[1],
         native: match[2] !== 'fetch',
         target: match[3],
-        options: blockAt(t, match.index).slice(0, 400),
+        // Only an object literal written at the call site: a named options
+        // variable is not proof, and the next `{` in the file is not this call's.
+        options: match[4] ? blockAt(t, match.index + match[0].length - 1) : '',
       }));
     if (requests.some(request => request.target.startsWith(parsed[2]))) return fail;
     const urlRequests = requests.filter(request => request.target === url);
@@ -308,8 +358,8 @@ const CHECKS = {
     // An inline guard only protects the request if it runs on the way to it: a
     // guard sitting in a helper the answer never calls protects nothing.
     const validations = [
-      ...enforcing(t, url).filter(guard => fetchCall && sameScope(t, guard.index, fetchCall.index)),
-      ...(enforcingValidator && fetchCall && sameScope(t, validates.index, fetchCall.index) ? [validates] : []),
+      ...enforcing(t, url).filter(guard => fetchCall && dominates(t, guard.index, fetchCall.index)),
+      ...(enforcingValidator && fetchCall && dominates(t, validates.index, fetchCall.index) ? [validates] : []),
     ];
     // A followed redirect re-enters the network with a destination the policy
     // never saw, so each request has to refuse or hand back the 3xx itself.
@@ -333,7 +383,8 @@ const CHECKS = {
     // The deadline has to belong to the request whose response that loop reads,
     // not to some earlier bounded preliminary call, and it has to be armed
     // before the request: a timer set afterwards bounds nothing.
-    const reads = consumer && t.slice(Math.max(0, consumer.index - 80), consumer.index) + consumer.body;
+    const reads = consumer && t.slice(Math.max(0, consumer.index - 80), consumer.index)
+      + consumer.header + consumer.body;
     const timed = [...t.matchAll(/(?:(?:const|let|var)\s+(\w+)\s*=\s*)?(?:await\s+)?\b(?:fetch|https?\.(?:get|request))\s*\(/g)]
       .filter(request => {
         const options = blockAt(t, request.index).slice(0, 400);
@@ -347,7 +398,8 @@ const CHECKS = {
         const armedBefore = pattern => {
           const match = new RegExp(pattern).exec(t);
           return Boolean(match && match.index < request.index
-            && sameScope(t, match.index, request.index));
+            && sameScope(t, match.index, request.index)
+            && !/clearTimeout\s*\(/.test(t.slice(match.index, request.index)));
         };
         return signalRef === 'inline'
           || Boolean(signalRef && (armedBefore(String.raw`\b${signalRef}\s*=\s*AbortSignal\.timeout\s*\(`)
@@ -363,11 +415,18 @@ const CHECKS = {
       return true;
     }));
     const evented = Boolean(consumer && /['"]data['"]/.test(consumer.header));
-    // The accumulator has to add the chunk's actual size: `+= 0 * n` and
-    // `+= -n` count bytes that never reach the ceiling.
-    const counter = scope.match(/\b([A-Za-z_$]\w*)\s*\+=\s*([\w.$]+\.(?:byteLength|length))\s*[;\n]/);
-    const limitBranch = counter && new RegExp(String.raw`if\s*\([^\n]{0,240}${counter[1]}\s*>=?\s*([\w.$]+(?:\s*[*+]\s*[\w.$]+)*)[^\n]{0,240}?\)\s*(\{[^}]{0,240}\}|[^\n]{0,160})`, 'i').exec(scope);
-    const ceiling = limitBranch && limitBranch[1].trim();
+    const chunk = (scope.match(/\{[^}]{0,40}\b(?!done\b)(\w+)\s*\}\s*=\s*await\s+\w+\s*\.\s*read\s*\(/)
+      || (consumer && consumer.header.match(/for\s+await\s*\(\s*(?:const|let|var)\s+(\w+)\s+of/))
+      || (consumer && consumer.header.match(/['"]data['"]\s*,\s*(?:async\s*)?\(?\s*(\w+)/)) || [])[1];
+    // The accumulator has to add THIS chunk's actual size: `+= 0 * n`, `+= -n`
+    // and `+= destination.length` all count bytes that never reach the ceiling.
+    const counter = chunk
+      && scope.match(new RegExp(String.raw`\b([A-Za-z_$]\w*)\s*\+=\s*${chunk}\s*\.\s*(?:byteLength|length)\s*[;\n]`));
+    // `received + value.byteLength > MAX` rejects the chunk before it is counted
+    // or written, which is the same ceiling one statement earlier.
+    const limitBranch = counter && new RegExp(String.raw`if\s*\([^\n]{0,240}${counter[1]}\s*(\+\s*${chunk}\s*\.\s*(?:byteLength|length)\s*)?>=?\s*([\w.$]+(?:\s*[*+]\s*[\w.$]+)*)[^\n]{0,240}?\)\s*(\{[^}]{0,240}\}|[^\n]{0,160})`, 'i').exec(scope);
+    const predictive = Boolean(limitBranch && limitBranch[1]);
+    const ceiling = limitBranch && limitBranch[2].trim();
     const finite = Boolean(ceiling) && !/Infinity/.test(ceiling)
       && !(/^[\w.$]+$/.test(ceiling)
         && new RegExp(String.raw`\b${ceiling}\s*=\s*(?:Infinity|Number\s*\.\s*(?:MAX_VALUE|MAX_SAFE_INTEGER|POSITIVE_INFINITY))`).test(t));
@@ -377,16 +436,13 @@ const CHECKS = {
     // slips through and the stream ends without ever tripping the limit.
     // An oversized response is a failure, not a short file: a bare `return`
     // resolves with a truncated download. Evented streams fail by destroy(err).
-    const stops = limitBranch && finite && counter.index < limitBranch.index
+    const stops = limitBranch && finite && (predictive || counter.index < limitBranch.index)
       && (evented
         ? (stream.length > 0
-          && new RegExp(String.raw`\b(?:${stream.join('|')})[\w.$]*\s*\.\s*(?:destroy|abort|cancel)\s*\(\s*new\s+\w*Error`).test(limitBranch[2]))
-        : /\bthrow\b|(?<![.\w])reject\s*\(/.test(limitBranch[2]));
+          && new RegExp(String.raw`\b(?:${stream.join('|')})[\w.$]*\s*\.\s*(?:destroy|abort|cancel)\s*\(\s*new\s+\w*Error`).test(limitBranch[3]))
+        : /\bthrow\b|(?<![.\w])reject\s*\(/.test(limitBranch[3]));
     // The write has to be of the chunk just counted, and only after the guard:
     // an unrelated log write past the branch is not the destination write.
-    const chunk = (scope.match(/\{[^}]{0,40}\b(?!done\b)(\w+)\s*\}\s*=\s*await\s+\w+\s*\.\s*read\s*\(/)
-      || (consumer && consumer.header.match(/for\s+await\s*\(\s*(?:const|let|var)\s+(\w+)\s+of/))
-      || (consumer && consumer.header.match(/['"]data['"]\s*,\s*(?:async\s*)?\(?\s*(\w+)/)) || [])[1];
     const writesChunk = chunk && new RegExp(String.raw`write\w*\s*\([^)]*\b${chunk}\b`);
     const writeAfterLimit = stops && writesChunk
       && writesChunk.test(scope.slice(limitBranch.index + limitBranch[0].length))
