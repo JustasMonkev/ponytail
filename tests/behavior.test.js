@@ -133,6 +133,13 @@ test('onecheck: a check inside an uncalled helper is never run', () => {
   assert.equal(r.pass, false);
 });
 
+test('onecheck: a check under a dead branch runs nothing', () => {
+  const r = check('onecheck',
+    '```python\ndef to_seconds(s):\n    ...\n\nif False:\n    try:\n        to_seconds("abc")\n' +
+    '    except ValueError:\n        pass\n    else:\n        assert False\n```');
+  assert.equal(r.pass, false);
+});
+
 test('onecheck: no check fails', () => {
   const r = check('onecheck',
     '```python\ndef to_seconds(s):\n    import re\n    return sum(...)\n```');
@@ -334,6 +341,23 @@ test('contracts: a check inside a test() callback passes', () => {
   assert.equal(r.pass, true);
 });
 
+test('contracts: a conditional reset before the merge drops state', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) {\n' +
+    '  if (patch.reset) return { theme: "light" };\n  return { ...current, ...patch };\n}\n' +
+    'const result = updateSettings({ theme: "dark", enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
+    'console.assert(result.theme === "dark" && result.enabled === false && result.retries === 0 && result.label === "");\n```');
+  assert.equal(r.pass, false);
+});
+
+test('contracts: an assertion parked in an uncalled helper never runs', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) { return { ...current, ...patch }; }\n' +
+    'const result = updateSettings({ theme: "dark", enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
+    'function check() { assert.deepStrictEqual(result, { theme: "dark", enabled: false, retries: 0, label: "" }); }\n```');
+  assert.equal(r.pass, false);
+});
+
 // --- lifecycle: cancellation owns listener cleanup ---
 
 test('lifecycle: abort and listener cleanup pass', () => {
@@ -413,6 +437,17 @@ test('lifecycle: an abort handler using Promise.reject fails', () => {
     '  const done = value => { cleanup(); resolve(value); };\n' +
     '  const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
     '  emitter.once("download", done); signal.addEventListener("abort", aborted);\n});\n```');
+  assert.equal(r.pass, false);
+});
+
+test('lifecycle: an abort registration behind a dead branch never installs', () => {
+  const r = check('lifecycle',
+    '```javascript\nreturn new Promise((resolve, reject) => {\n' +
+    '  if (signal.aborted) return reject(signal.reason);\n' +
+    '  const aborted = () => { cleanup(); reject(signal.reason); };\n' +
+    '  const done = value => { cleanup(); resolve(value); };\n' +
+    '  const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+    '  emitter.once("download", done);\n  if (false) { signal.addEventListener("abort", aborted); }\n});\n```');
   assert.equal(r.pass, false);
 });
 
@@ -804,6 +839,23 @@ test('revalidate: replaying a manual redirect unvalidated fails', () => {
   assert.equal(r.pass, false);
 });
 
+test('revalidate: reassigning the validated binding fails', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nlet url = new URL(saved.webhook);\n' +
+    'if (url.protocol !== "https:") throw new Error("bad");\nurl = new URL(untrustedValue);\n' +
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: an unvalidated probe before the guard fails', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'await fetch(url, { method: "HEAD", redirect: "error" });\n' +
+    'if (url.protocol !== "https:") throw new Error("bad");\n' +
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
 test('revalidate: direct use of persisted URL fails', () => {
   const r = check('revalidate',
     '```javascript\nconst saved = JSON.parse(text);\nawait fetch(saved.webhook, { method: "POST", body });\n```');
@@ -1164,6 +1216,16 @@ test('bounds: a callback-style native https download passes', () => {
     '    if (received > MAX_BYTES) { response.destroy(new Error("too large")); return; }\n' +
     '    file.write(chunk);\n  });\n});\n```');
   assert.equal(r.pass, true);
+});
+
+test('bounds: a timeout in an unrelated later block does not bound the request', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url);\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const opts = { signal: AbortSignal.timeout(10_000) };\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
 });
 
 test('bounds: unbounded fetch fails', () => {

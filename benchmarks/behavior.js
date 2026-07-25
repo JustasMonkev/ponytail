@@ -148,9 +148,12 @@ const CHECKS = {
       const lineStart = t.lastIndexOf('\n', index) + 1;
       const indent = t.slice(lineStart).search(/\S/);
       if (indent <= 0) return true;
-      const owner = [...t.slice(0, lineStart).matchAll(/^([ \t]*)def\s+(\w+)\s*\(/gm)]
+      const owner = [...t.slice(0, lineStart)
+        .matchAll(/^([ \t]*)(?:def\s+(\w+)\s*\(|(if\s+(?:False|0)\s*:|while\s+False\s*:))/gm)]
         .reverse().find(match => match[1].length < indent);
-      return !owner || /^test_/.test(owner[2]) || owner[2] === 'main'
+      if (!owner) return true;
+      if (owner[3]) return false;
+      return /^test_/.test(owner[2]) || owner[2] === 'main'
         || (t.match(new RegExp(String.raw`\b${owner[2]}\s*\(`, 'g')) || []).length > 1;
     };
     const checksFailure = [...t.matchAll(markers)].some(match => runs(match.index)
@@ -178,13 +181,18 @@ const CHECKS = {
       // ...and it has to be the one that runs: a merge behind `if (false)` or
       // after an unconditional earlier return is dead code behind a reset.
       if (!merge || !dominates(body, merge.index, body.length)) return false;
-      return ![...body.matchAll(/(?<![.\w])return\b/g)].some(earlier => {
+      // Any earlier return that reaches the caller first disqualifies it: an
+      // unconditional one makes the merge dead, and a conditional reset like
+      // `if (patch.reset) return { theme: 'light' }` drops state on that input.
+      return ![...body.matchAll(/(?<![.\w])return\s*(\{[^}]{0,200}\})?/g)].some(earlier => {
+        if (earlier.index >= merge.index) return false;
         const statement = body.slice(1 + Math.max(
           body.lastIndexOf(';', earlier.index),
           body.lastIndexOf('{', earlier.index),
           body.lastIndexOf('}', earlier.index),
         ), earlier.index);
-        return earlier.index < merge.index && !/\bif\s*\(/.test(statement);
+        const resets = earlier[1] && !earlier[1].includes(`...${match[2]}`);
+        return resets || !/\bif\s*\(/.test(statement);
       });
     });
     const name = updater && updater[1];
@@ -228,7 +236,8 @@ const CHECKS = {
     const checksPreserved = untouched.some(key => new RegExp(String.raw`\b${key}\s*:`).test(expected)
       || new RegExp(String.raw`\.${key}\b`).test(assertions));
     return updater && falsyPatch && checksFalsy && checksPreserved
-      && runs(inlineCall ? structural.index : assigned.index)
+      && (inlineCall || !assigned || runs(assigned.index))
+      && (!onResult || runs(structural.index))
       ? { pass: true, reason: 'Preserves existing state and checks explicit falsy values.' }
       : { pass: false, reason: 'Does not prove state and explicit false/zero/empty values survive.' };
   },
@@ -304,7 +313,13 @@ const CHECKS = {
     const cleanupHandler = cleanupName && handlers.find(handler => handler.name === cleanupName);
     // Removal has to happen on the object the listener was registered on;
     // otherEmitter.off(...) leaves the real listener installed.
-    const cleansAbort = cleanupHandler
+    // A registration behind `if (false)` never installs: both have to run on the
+    // executor's own path, not one branch of it.
+    const executorEnd = executorAt >= 0
+      ? t.indexOf('{', executorAt) + blockAt(t, executorAt).length : t.length;
+    const installed = aborts && ownsDownload
+      && dominates(t, aborts.index, executorEnd) && dominates(t, ownsDownload.index, executorEnd);
+    const cleansAbort = installed && cleanupHandler
       && new RegExp(`${aborts[1]}\\s*\\.\\s*removeEventListener\\s*\\(\\s*['"]abort['"]\\s*,\\s*${abortHandler.name}\\b`).test(cleanupHandler.body);
     const cleansDownload = cleanupHandler
       && new RegExp(`${ownsDownload[1]}\\s*\\.\\s*(?:off|removeListener)\\s*\\(\\s*['"]download['"]\\s*,\\s*${downloadHandler.name}\\b`).test(cleanupHandler.body);
@@ -375,10 +390,13 @@ const CHECKS = {
         || (request.handle && new RegExp(String.raw`\b${request.handle}\s*\.\s*(?:write|end)\s*\(\s*\w`).test(t))));
     // An inline guard only protects the request if it runs on the way to it: a
     // guard sitting in a helper the answer never calls protects nothing.
-    const validations = [
-      ...enforcing(t, url).filter(guard => fetchCall && dominates(t, guard.index, fetchCall.index)),
-      ...(enforcingValidator && fetchCall && dominates(t, validates.index, fetchCall.index) ? [validates] : []),
-    ];
+    const candidates = [...enforcing(t, url), ...(enforcingValidator ? [validates] : [])];
+    const guardsFor = request => (request.target === url ? candidates : enforcing(t, request.target))
+      .filter(guard => guard.index < request.index && dominates(t, guard.index, request.index));
+    // Every request that reaches the destination has to be behind a guard —
+    // an unvalidated probe to the same `url` already crossed the boundary.
+    const allGuarded = requests.length > 0 && requests.every(request => guardsFor(request).length > 0);
+    const validations = fetchCall ? guardsFor(fetchCall) : [];
     // A followed redirect re-enters the network with a destination the policy
     // never saw, so each request has to refuse or hand back the 3xx itself.
     // native https does not follow redirects on its own; fetch does.
@@ -389,15 +407,10 @@ const CHECKS = {
     // — between the last validation and the request — is a new destination.
     const cleared = fetchCall && validations.filter(v => v.index < fetchCall.index)
       .sort((a, b) => a.index - b.index).pop();
-    const mutated = cleared && [...t.matchAll(new RegExp(String.raw`${url}\.\w+\s*=(?!=)`, 'g'))]
+    const mutated = cleared && [...t.matchAll(new RegExp(String.raw`\b${url}\s*(?:\.\w+\s*)?=(?!=)`, 'g'))]
       .some(change => change.index > cleared.index && change.index < fetchCall.index);
     // ...and every other request must clear its own destination the same way.
-    const others = urlRequests.length < requests.length
-      && requests.filter(request => request.target !== url)
-        .every(request => enforcing(t, request.target)
-          .some(guard => dominates(t, guard.index, request.index) && guard.index < request.index));
-    return fetchCall && boundsRedirects && !mutated && cleared
-      && (urlRequests.length === requests.length || others)
+    return fetchCall && boundsRedirects && !mutated && cleared && allGuarded
       ? { pass: true, reason: 'Revalidates persisted URL against a network policy before use.' }
       : fail;
   },
@@ -414,9 +427,10 @@ const CHECKS = {
     // before the request: a timer set afterwards bounds nothing.
     const reads = consumer && t.slice(Math.max(0, consumer.index - 80), consumer.index)
       + consumer.header + consumer.body;
-    const timed = [...t.matchAll(/(?:(?:const|let|var)\s+(\w+)\s*=\s*)?(?:await\s+)?\b(fetch|https?\.(?:get|request))\s*\(/g)]
+    const timed = [...t.matchAll(/(?:(?:const|let|var)\s+(\w+)\s*=\s*)?(?:await\s+)?\b(fetch|https?\.(?:get|request))\s*\(\s*[^,()]{0,80}?\s*(?:(,\s*\{)|[,)])/g)]
       .filter(request => {
-        const options = blockAt(t, request.index).slice(0, 400);
+        // Only this call's own literal: an unrelated later block is not proof.
+        const options = request[3] ? blockAt(t, request.index + request[0].length - 1) : '';
         const signalRef = /\bsignal\s*:\s*AbortSignal\.timeout\s*\(/.test(options)
           ? 'inline'
           : (/\bsignal\s*:\s*(\w+)\s*\.\s*signal\b/.exec(options)
