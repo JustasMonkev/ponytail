@@ -88,7 +88,9 @@ const CHECKS = {
     const hasCheck = /\bassert\b|def\s+test_|if\s+__name__|unittest|pytest|console\.assert|\bexpect\(|\bdescribe\(|\bit\(/.test(t);
     // Both framework-free idioms count: `assert False` after the call inside
     // the try, and the try/except/else layout.
-    const markers = /pytest\.raises|assertRaises|assert\.throws|toThrow|expect\([^\n]*\)\.rejects|assert\s+(?:await\s+)?(?:rejects?|raises?|throws?)\s*\([^)\n]+\)|try\s*:[\s\S]{0,200}\w+\s*\([^)\n]*\)[\s\S]{0,120}\bassert\s+False\b[\s\S]{0,160}except\b|try\s*:[\s\S]{0,300}\w+\s*\([^)]*\)[\s\S]{0,240}except\b[\s\S]{0,160}else\s*:[\s\S]{0,120}assert\s+False/gi;
+    // The sentinel `assert False` runs inside the try, so a broad `except` would
+    // swallow its own AssertionError; only a named exception proves rejection.
+    const markers = /pytest\.raises|assertRaises|assert\.throws|toThrow|expect\([^\n]*\)\.rejects|assert\s+(?:await\s+)?(?:rejects?|raises?|throws?)\s*\([^)\n]+\)|try\s*:[\s\S]{0,200}\w+\s*\([^)\n]*\)[\s\S]{0,120}\bassert\s+False\b[\s\S]{0,160}except\s+(?!Exception\b|BaseException\b)[\w(]|try\s*:[\s\S]{0,300}\w+\s*\([^)]*\)[\s\S]{0,240}except\b[\s\S]{0,160}else\s*:[\s\S]{0,120}assert\s+False/gi;
     // Proving that some other call raises says nothing about this parser, so the
     // failure check has to reach the function under test — directly or one hop
     // through a helper it defines.
@@ -115,24 +117,29 @@ const CHECKS = {
       return new RegExp(String.raw`\breturn\s*\{\s*\.\.\.${match[2]}\s*,\s*\.\.\.${match[3]}\s*\}\s*;?`, 'i').test(body)
         || new RegExp(String.raw`\breturn\s+Object\.assign\s*\(\s*\{\s*\}\s*,\s*${match[2]}\s*,\s*${match[3]}\s*\)\s*;?`, 'i').test(body);
     });
-    const merges = Boolean(updater);
-    const call = updater && new RegExp(String.raw`(?:const|let|var)\s+(\w+)\s*=\s*${updater[1]}\s*\(([\s\S]{0,400}?)\);`).exec(t);
+    const name = updater && updater[1];
+    const assigned = name && new RegExp(String.raw`(?:const|let|var)\s+(\w+)\s*=\s*${name}\s*\(([\s\S]{0,400}?)\);`).exec(t);
+    // One structural assertion proves the same three contracts, whether it runs
+    // the updater inline or names the variable the call was assigned to.
+    const structural = name && (
+      new RegExp(String.raw`(?:deepStrictEqual|deepEqual)\s*\(\s*(\w+)\s*(\([\s\S]{0,300}?\))?\s*,\s*(\{[\s\S]{0,400}?\})`).exec(t)
+      || new RegExp(String.raw`expect\s*\(\s*(\w+)\s*(\([\s\S]{0,300}?\))?\s*\)\s*\.\s*to(?:Strict)?Equal\s*\(\s*(\{[\s\S]{0,400}?\})`).exec(t));
+    const inlineCall = structural && structural[2] && structural[1] === name;
+    const onResult = inlineCall || Boolean(structural && assigned && structural[1] === assigned[1]);
+    const args = inlineCall ? structural[2] : assigned && assigned[2];
     // The falsy values have to be in the patch: that is the argument whose
     // explicit false/0/"" must override truthy existing settings.
-    const patch = call && (call[2].match(/,\s*(\{[\s\S]*\})\s*$/) || [])[1];
+    const patch = args && (args.match(/,\s*(\{[\s\S]*\})\s*\)?\s*$/) || [])[1];
     const falsyPatch = patch && [/\bfalse\b/, /(?:^|\D)0(?:\D|$)/, /['"]{2}/].every(pattern => pattern.test(patch));
     const assertions = t.split('\n').map(line => line.match(/(?:console\.)?assert\b.*|\bexpect\(.*|\bit\(.*/)?.[0]).filter(Boolean).join('\n');
-    const perField = call && [
-      new RegExp(String.raw`${call[1]}\.\w+\s*===?\s*false`, 'i'),
-      new RegExp(String.raw`${call[1]}\.\w+\s*===?\s*0(?:\D|$)`),
-      new RegExp(String.raw`${call[1]}\.\w+\s*===?\s*['"]{2}`),
+    const perField = assigned && [
+      new RegExp(String.raw`${assigned[1]}\.\w+\s*===?\s*false`, 'i'),
+      new RegExp(String.raw`${assigned[1]}\.\w+\s*===?\s*0(?:\D|$)`),
+      new RegExp(String.raw`${assigned[1]}\.\w+\s*===?\s*['"]{2}`),
     ].every(pattern => pattern.test(assertions));
-    // One structural assertion on the result proves the same three contracts.
-    const deep = call && new RegExp(String.raw`(?:deepStrictEqual|deepEqual)\s*\(\s*${call[1]}\s*,\s*\{([\s\S]{0,400}?)\}|expect\s*\(\s*${call[1]}\s*\)\s*\.\s*to(?:Strict)?Equal\s*\(\s*\{([\s\S]{0,400}?)\}`).exec(t);
-    const expected = deep ? deep[1] || deep[2] || '' : '';
     const checksFalsy = perField
-      || [/:\s*false\b/, /:\s*0\b/, /:\s*(?:''|"")/].every(pattern => pattern.test(expected));
-    return merges && falsyPatch && checksFalsy
+      || (onResult && [/:\s*false\b/, /:\s*0\b/, /:\s*(?:''|"")/].every(pattern => pattern.test(structural[3])));
+    return updater && falsyPatch && checksFalsy
       ? { pass: true, reason: 'Preserves existing state and checks explicit falsy values.' }
       : { pass: false, reason: 'Does not prove state and explicit false/zero/empty values survive.' };
   },
@@ -160,14 +167,16 @@ const CHECKS = {
         .map(match => match[1])
         .find(name => new RegExp(`\\b${name}\\s*\\(\\s*\\)`).test(downloadHandler.body));
     const cleanupHandler = cleanupName && handlers.find(handler => handler.name === cleanupName);
+    // Removal has to happen on the object the listener was registered on;
+    // otherEmitter.off(...) leaves the real listener installed.
     const aborts = abortHandler
-      && new RegExp(`addEventListener\\s*\\(\\s*['"]abort['"]\\s*,\\s*${abortHandler.name}\\b`).test(t);
+      && new RegExp(`(\\w+)\\s*\\.\\s*addEventListener\\s*\\(\\s*['"]abort['"]\\s*,\\s*${abortHandler.name}\\b`).exec(t);
     const ownsDownload = downloadHandler
-      && new RegExp(`\\.(?:once|on|addListener)\\s*\\(\\s*['"]download['"]\\s*,\\s*${downloadHandler.name}\\b`).test(t);
-    const cleansAbort = cleanupHandler
-      && new RegExp(`removeEventListener\\s*\\(\\s*['"]abort['"]\\s*,\\s*${abortHandler.name}\\b`).test(cleanupHandler.body);
-    const cleansDownload = cleanupHandler
-      && new RegExp(`(?:\\.off|removeListener)\\s*\\(\\s*['"]download['"]\\s*,\\s*${downloadHandler.name}\\b`).test(cleanupHandler.body);
+      && new RegExp(`(\\w+)\\s*\\.\\s*(?:once|on|addListener)\\s*\\(\\s*['"]download['"]\\s*,\\s*${downloadHandler.name}\\b`).exec(t);
+    const cleansAbort = cleanupHandler && aborts
+      && new RegExp(`${aborts[1]}\\s*\\.\\s*removeEventListener\\s*\\(\\s*['"]abort['"]\\s*,\\s*${abortHandler.name}\\b`).test(cleanupHandler.body);
+    const cleansDownload = cleanupHandler && ownsDownload
+      && new RegExp(`${ownsDownload[1]}\\s*\\.\\s*(?:off|removeListener)\\s*\\(\\s*['"]download['"]\\s*,\\s*${downloadHandler.name}\\b`).test(cleanupHandler.body);
     return preAborted && aborts && ownsDownload && cleansAbort && cleansDownload
       ? { pass: true, reason: 'Owns pre-aborted cancellation and listener cleanup as one lifecycle.' }
       : { pass: false, reason: 'Missing pre-aborted cancellation, listener cleanup, or stale-completion protection.' };
@@ -177,27 +186,32 @@ const CHECKS = {
   revalidate(output) {
     const t = String(output || '');
     const fail = { pass: false, reason: 'Trusts persisted URL without revalidating its current network policy.' };
-    const parsed = t.match(/(?:const|let|var)\s+(\w+)\s*=\s*new URL\s*\(/);
+    const parsed = t.match(/(?:const|let|var)\s+(\w+)\s*=\s*new URL\s*\(\s*([\w.[\]'"]+)/);
     if (!parsed) return fail;
     const url = parsed[1];
+    // The probe is about persisted input: a URL built from a literal proves
+    // nothing about the saved webhook the task actually has to send to.
+    const source = parsed[2].split(/[.[]/)[0];
+    const persisted = !/^['"]/.test(parsed[2]) && (
+      new RegExp(String.raw`\b${source}\s*=\s*(?:await\s+)?(?:JSON\.parse|\w*[Rr]ead\w*|require)\s*\(`).test(t)
+      || new RegExp(String.raw`\{[^}]{0,160}\b${source}\b[^}]{0,160}\}\s*=\s*(?:await\s+)?JSON\.parse`).test(t));
+    if (!persisted) return fail;
     const rejection = String.raw`\s*(?:\{[^}]{0,200}(?:\bthrow\b|\breject\s*\(|\breturn\s+false\b)|(?:\bthrow\b|\breject\s*\(|\breturn\s+false\b))`;
     // Each policy must reject on its own. An `&&` clause only rejects when every
     // condition fails, so an allowed host still reaches the network over http.
-    const clauses = [...t.matchAll(new RegExp(String.raw`if\s*\(([^\n]{0,300}?)\)${rejection}`, 'gi'))]
+    const enforcing = (text, name) => [...text.matchAll(new RegExp(String.raw`if\s*\(([^\n]{0,300}?)\)${rejection}`, 'gi'))]
       .flatMap(match => match[1].split('||').map(clause => ({ index: match.index, clause })))
-      .filter(guard => !guard.clause.includes('&&'));
-    const enforces = guard =>
-      new RegExp(String.raw`${url}\.protocol\s*!==?\s*['"]https:['"]`, 'i').test(guard.clause)
-      || new RegExp(String.raw`!\s*(?:allowedHosts|allowlist)\s*\.\s*(?:has|includes)\s*\(\s*${url}\.hostname\s*\)`, 'i').test(guard.clause);
-    // A named validator only counts if its body actually rejects on a policy;
-    // `function validateWebhookUrl() { return true; }` revalidates nothing.
+      .filter(guard => !guard.clause.includes('&&'))
+      .filter(guard => new RegExp(String.raw`${name}\.protocol\s*!==?\s*['"]https:['"]`, 'i').test(guard.clause)
+        || new RegExp(String.raw`!\s*(?:allowedHosts|allowlist)\s*\.\s*(?:has|includes)\s*\(\s*${name}\.hostname\s*\)`, 'i').test(guard.clause));
+    // A named validator counts only if its own body rejects on the same policy,
+    // with the same polarity an inline guard would need.
     const validates = new RegExp(String.raw`(?:^|[;}\n])\s*(?:await\s+)?((?:validate|assert|ensure|checkNetwork)\w*Url)\s*\(\s*${url}\b`, 'im').exec(t);
-    const validator = validates
-      && (new RegExp(String.raw`(?:function\s+${validates[1]}\s*\(|(?:const|let|var)\s+${validates[1]}\s*=)[\s\S]{0,400}`).exec(t) || [''])[0];
-    const enforcingValidator = validator
-      && /\bthrow\b|\breject\s*\(|\breturn\s+false\b/.test(validator)
-      && /\.protocol\b|\bhostname\b|allowedHosts|allowlist/.test(validator);
-    const validations = [...clauses.filter(enforces), ...(enforcingValidator ? [validates] : [])];
+    const definition = validates
+      && new RegExp(String.raw`(?:function\s+${validates[1]}\s*\(\s*(\w+)|(?:const|let|var)\s+${validates[1]}\s*=\s*(?:async\s*)?\(?\s*(\w+))([\s\S]{0,400})`).exec(t);
+    const enforcingValidator = definition
+      && enforcing(definition[3], definition[1] || definition[2]).length > 0;
+    const validations = [...enforcing(t, url), ...(enforcingValidator ? [validates] : [])];
     const fetchCall = new RegExp(String.raw`\bfetch\s*\(\s*${url}\b([\s\S]{0,300})`).exec(t);
     // A followed redirect re-enters the network with a destination the policy
     // never saw, so the fetch has to refuse or hand back the 3xx itself.
@@ -221,7 +235,8 @@ const CHECKS = {
         || /\b(signal)\s*[,}]/.exec(options) || [])[1];
     const requestTimeout = signalRef === 'inline'
       || Boolean(signalRef && (new RegExp(String.raw`\b${signalRef}\s*=\s*AbortSignal\.timeout\s*\(`).test(t)
-        || /setTimeout\s*\([\s\S]{0,240}\.abort\s*\(/.test(t)));
+        // The timer has to abort the controller this request is actually using.
+        || new RegExp(String.raw`setTimeout\s*\([\s\S]{0,240}\b${signalRef}\s*\.\s*abort\s*\(`).test(t)));
     // Everything below is graded inside the loop that consumes the stream:
     // buffering the whole body first and counting afterwards is no ceiling.
     const consumer = streamConsumer(t);
@@ -231,7 +246,10 @@ const CHECKS = {
     const limitBranch = counter && new RegExp(String.raw`if\s*\([^\n]{0,240}${counter[1]}\s*>=?\s*[A-Za-z_$]\w*[^\n]{0,240}?\)\s*(\{[^}]{0,240}\}|[^\n]{0,160})`, 'i').exec(scope);
     // `return` exits one data callback but leaves an evented stream flowing, so
     // the over-limit path has to tear the stream down too.
-    const stops = limitBranch && /\bthrow\b|\breturn\b/.test(limitBranch[1])
+    // The chunk has to be counted before it is judged, or the last oversized one
+    // slips through and the stream ends without ever tripping the limit.
+    const stops = limitBranch && counter.index < limitBranch.index
+      && /\bthrow\b|\breturn\b/.test(limitBranch[1])
       && (!evented || /\b(?:destroy|abort|cancel|unpipe)\s*\(/.test(limitBranch[1]));
     const writeAfterLimit = stops && /(?:\bwrite\s*\(|\.write\s*\(|writeFile\s*\()/.test(scope.slice(limitBranch.index + limitBranch[0].length));
     return requestTimeout && writeAfterLimit
