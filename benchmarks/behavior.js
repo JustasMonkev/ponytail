@@ -66,13 +66,16 @@ const CHECKS = {
 
   // Merges into existing state and proves falsy values are not treated as absent.
   contracts(output) {
-    const t = String(output || '');
-    const updater = t.match(/function\s+(\w+)\s*\(\s*((?:current|settings)\w*)\s*,\s*(patch\w*)\s*\)/i);
-    const updaterText = updater && t.slice(updater.index, updater.index + 500);
-    const merges = updater && (
-      new RegExp(String.raw`\breturn\s*\{\s*\.\.\.${updater[2]}\s*,\s*\.\.\.${updater[3]}\s*\}\s*;?`, 'i').test(updaterText)
-      || new RegExp(String.raw`\breturn\s+Object\.assign\s*\(\s*\{\s*\}\s*,\s*${updater[2]}\s*,\s*${updater[3]}\s*\)\s*;?`, 'i').test(updaterText)
-    );
+    // Comment-stripped: a carried-over check in a comment is not a runnable one.
+    const t = codeOf(output);
+    // Parameter names are not part of the contract; find the two-arg function
+    // that actually returns the merge, whatever its parameters are called.
+    const updater = [...t.matchAll(/function\s+(\w+)\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)/g)].find(match => {
+      const body = t.slice(match.index, match.index + 500);
+      return new RegExp(String.raw`\breturn\s*\{\s*\.\.\.${match[2]}\s*,\s*\.\.\.${match[3]}\s*\}\s*;?`, 'i').test(body)
+        || new RegExp(String.raw`\breturn\s+Object\.assign\s*\(\s*\{\s*\}\s*,\s*${match[2]}\s*,\s*${match[3]}\s*\)\s*;?`, 'i').test(body);
+    });
+    const merges = Boolean(updater);
     const call = updater && new RegExp(String.raw`(?:const|let|var)\s+(\w+)\s*=\s*${updater[1]}\s*\(([\s\S]{0,400}?)\);`).exec(t);
     const falsyPatch = call && [/\bfalse\b/, /(?:^|\D)0(?:\D|$)/, /['"]{2}/].every(pattern => pattern.test(call[2]));
     const assertions = t.split('\n').map(line => line.match(/(?:console\.)?assert\b.*|\bexpect\(.*|\bit\(.*/)?.[0]).filter(Boolean).join('\n');
@@ -95,10 +98,17 @@ const CHECKS = {
   lifecycle(output) {
     const t = String(output || '');
     // events.once(emitter, 'download', { signal }) is the platform's own answer:
-    // it rejects a pre-aborted signal and removes its listeners either way.
-    if (/\bonce\s*\(\s*\w+\s*,\s*['"]download['"]\s*,\s*\{[^}]{0,120}\bsignal\b/.test(t))
+    // it rejects a pre-aborted signal and removes its listeners either way. Only
+    // the real one counts, so it has to come from node:events, not a local shim.
+    const fromEvents = /(?:require\s*\(\s*['"](?:node:)?events['"]\s*\)|from\s+['"](?:node:)?events['"])/.test(t)
+      && !/function\s+once\b|(?:const|let|var)\s+once\s*=/.test(t);
+    if (fromEvents && /\bonce\s*\(\s*\w+\s*,\s*['"]download['"]\s*,\s*\{[^}]{0,120}\bsignal\b/.test(t))
       return { pass: true, reason: 'Delegates the whole lifecycle to the abort-aware events.once helper.' };
-    const preAborted = /signal\.throwIfAborted\s*\(|throwIfAborted\s*\(\s*signal|if\s*\(\s*signal\??\.aborted\s*\)\s*(?:\{[^}]{0,160}(?:(?:return\s+)?reject\s*\(|\bthrow\b)|(?:return\s+)?reject\s*\(|throw\b)/.test(t);
+    // An already-aborted signal never fires `abort`, so the guard has to run
+    // before any listener is installed or the setup leaks both of them.
+    const guard = /signal\.throwIfAborted\s*\(|throwIfAborted\s*\(\s*signal|if\s*\(\s*signal\??\.aborted\s*\)\s*(?:\{[^}]{0,160}(?:(?:return\s+)?reject\s*\(|\bthrow\b)|(?:return\s+)?reject\s*\(|throw\b)/.exec(t);
+    const firstListener = /addEventListener\s*\(\s*['"]abort['"]|\.(?:once|on|addListener)\s*\(\s*['"]download['"]/.exec(t);
+    const preAborted = Boolean(guard && firstListener && guard.index < firstListener.index);
     const handlers = namedFunctionBodies(t);
     const abortHandler = handlers.find(handler => /abort/i.test(handler.name) && /\breject\s*\(/.test(handler.body));
     const downloadHandler = handlers.find(handler => /\bresolve\s*\(/.test(handler.body));
@@ -150,8 +160,17 @@ const CHECKS = {
   // A remote response needs both a deadline and an enforced streaming byte ceiling.
   bounds(output) {
     const t = String(output || '');
-    const requestTimeout = /\bfetch\s*\([\s\S]{0,240}\bsignal\s*:\s*AbortSignal\.timeout\s*\(/.test(t)
-      || (/\bfetch\s*\([\s\S]{0,240}\bsignal\s*:\s*\w+\.signal\b/.test(t) && /setTimeout\s*\([\s\S]{0,240}\.abort\s*\(/.test(t));
+    // The deadline has to reach the request, whether it is built inline, held in
+    // a variable, or passed as a controller's signal.
+    const options = (/\bfetch\s*\([^,)]{0,120},\s*(\{[\s\S]{0,400}?\})/.exec(t) || ['', ''])[1];
+    const signalRef = /\bsignal\s*:\s*AbortSignal\.timeout\s*\(/.test(options)
+      ? 'inline'
+      : (/\bsignal\s*:\s*(\w+)\s*\.\s*signal\b/.exec(options)
+        || /\bsignal\s*:\s*(\w+)/.exec(options)
+        || /\b(signal)\s*[,}]/.exec(options) || [])[1];
+    const requestTimeout = signalRef === 'inline'
+      || Boolean(signalRef && (new RegExp(String.raw`\b${signalRef}\s*=\s*AbortSignal\.timeout\s*\(`).test(t)
+        || /setTimeout\s*\([\s\S]{0,240}\.abort\s*\(/.test(t)));
     const loops = /getReader\s*\(|for\s+await\s*\(/.test(t);
     const evented = /\.on\s*\(\s*['"]data['"]/.test(t);
     const counter = t.match(/\b([A-Za-z_$]\w*)\s*\+=\s*[^;\n]*(?:byteLength|length)/);

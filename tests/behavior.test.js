@@ -183,6 +183,24 @@ test('contracts: structural assertion missing a falsy field fails', () => {
   assert.equal(r.pass, false);
 });
 
+test('contracts: commented-out check is not a runnable one', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) {\n' +
+    '  return { ...current, ...patch };\n}\n' +
+    '// const result = updateSettings({ enabled: true }, { enabled: false, retries: 0, label: "" });\n' +
+    '// assert.deepStrictEqual(result, { enabled: false, retries: 0, label: "" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('contracts: any two-parameter updater signature passes', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(existing, changes) {\n' +
+    '  return { ...existing, ...changes };\n}\n' +
+    'const result = updateSettings({ enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
+    'console.assert(result.enabled === false && result.retries === 0 && result.label === "");\n```');
+  assert.equal(r.pass, true);
+});
+
 // --- lifecycle: cancellation owns listener cleanup ---
 
 test('lifecycle: abort and listener cleanup pass', () => {
@@ -287,6 +305,25 @@ test('lifecycle: native abort-aware events.once passes', () => {
     '```javascript\nconst { once } = require("node:events");\n' +
     'const waitForDownload = (emitter, signal) => once(emitter, "download", { signal });\n```');
   assert.equal(r.pass, true);
+});
+
+test('lifecycle: a local once shim is not the native helper', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction once(emitter, event, options) {\n' +
+    '  return new Promise(resolve => emitter.on(event, resolve));\n}\n' +
+    'const waitForDownload = (emitter, signal) => once(emitter, "download", { signal });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('lifecycle: pre-abort guard after listener installation fails', () => {
+  const r = check('lifecycle',
+    '```javascript\nreturn new Promise((resolve, reject) => {\n' +
+    '  const aborted = () => { cleanup(); reject(signal.reason); };\n' +
+    '  const done = value => { cleanup(); resolve(value); };\n' +
+    '  const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+    '  emitter.once("download", done); signal.addEventListener("abort", aborted);\n' +
+    '  signal.throwIfAborted();\n});\n```');
+  assert.equal(r.pass, false);
 });
 
 // --- revalidate: persistence is a new trust boundary ---
@@ -445,6 +482,15 @@ test('bounds: destroying the evented stream at the ceiling passes', () => {
     'let received = 0;\nresponse.body.on("data", chunk => {\n  received += chunk.length;\n' +
     '  if (received > MAX_BYTES) { response.body.destroy(new Error("too large")); return; }\n' +
     '  file.write(chunk);\n});\n```');
+  assert.equal(r.pass, true);
+});
+
+test('bounds: pre-created timeout signal passes', () => {
+  const r = check('bounds',
+    '```javascript\nconst signal = AbortSignal.timeout(10_000);\nconst response = await fetch(url, { signal });\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, true);
 });
 
