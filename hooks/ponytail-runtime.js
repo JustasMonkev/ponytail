@@ -41,7 +41,11 @@ function writeHookOutput(event, mode, context = '') {
     return;
   }
   if (isCodex) {
-    const output = { systemMessage: `PONYTAIL:${mode.toUpperCase()}` };
+    // No systemMessage: Codex renders it as a yellow `warning:` line that reads
+    // like an error every session, and dims the completed-hook bullet from green
+    // to neutral (#605). The mode stays visible through the hook-context line
+    // Codex prints from additionalContext ("PONYTAIL MODE ACTIVE — level: …").
+    const output = {};
     if (context) {
       output.hookSpecificOutput = {
         hookEventName: event,
