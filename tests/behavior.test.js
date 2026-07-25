@@ -113,6 +113,12 @@ test('onecheck: a broad except swallows the sentinel assertion', () => {
   assert.equal(r.pass, false);
 });
 
+test('onecheck: rejecting the task\'s own valid example is not an alternate path', () => {
+  const r = check('onecheck',
+    '```python\ndef to_seconds(s):\n    raise ValueError(s)\n\nwith pytest.raises(ValueError):\n    to_seconds("1h30m45s")\n```');
+  assert.equal(r.pass, false);
+});
+
 test('onecheck: no check fails', () => {
   const r = check('onecheck',
     '```python\ndef to_seconds(s):\n    import re\n    return sum(...)\n```');
@@ -239,6 +245,15 @@ test('contracts: arrow-function updater passes', () => {
     '  updateSettings({ enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" }),\n' +
     '  { enabled: false, retries: 0, label: "" },\n);\n```');
   assert.equal(r.pass, true);
+});
+
+test('contracts: a correct sibling merger does not fix updateSettings', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) { return { theme: patch.theme || "light" }; }\n' +
+    'function mergeSettings(existing, changes) { return { ...existing, ...changes }; }\n' +
+    'const result = mergeSettings({ enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
+    'console.assert(result.enabled === false && result.retries === 0 && result.label === "");\n```');
+  assert.equal(r.pass, false);
 });
 
 // --- lifecycle: cancellation owns listener cleanup ---
@@ -459,6 +474,24 @@ test('revalidate: guard and fetch inside the same function passes', () => {
   assert.equal(r.pass, true);
 });
 
+test('revalidate: a validator whose failure is only a return value fails', () => {
+  const r = check('revalidate',
+    '```javascript\nfunction validateWebhookUrl(candidate) {\n' +
+    '  if (candidate.protocol !== "https:") return false;\n  return true;\n}\n' +
+    'const saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\nvalidateWebhookUrl(url);\n' +
+    'await fetch(url, { redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: a guarded probe followed by an unguarded POST fails', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'if (url.protocol !== "https:") throw new Error("bad");\n' +
+    'await fetch(url, { method: "HEAD", redirect: "error" });\n' +
+    'await fetch(saved.webhook, { method: "POST", body });\n```');
+  assert.equal(r.pass, false);
+});
+
 test('revalidate: direct use of persisted URL fails', () => {
   const r = check('revalidate',
     '```javascript\nconst saved = JSON.parse(text);\nawait fetch(saved.webhook, { method: "POST", body });\n```');
@@ -677,6 +710,35 @@ test('bounds: a literal byte ceiling passes', () => {
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
     '  if (received > 10 * 1024 * 1024) throw new Error("too large");\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, true);
+});
+
+test('bounds: a bounded native https download passes', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await https.get(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'let received = 0;\nresponse.on("data", chunk => {\n  received += chunk.length;\n' +
+    '  if (received > MAX_BYTES) { response.destroy(new Error("too large")); return; }\n' +
+    '  file.write(chunk);\n});\n```');
+  assert.equal(r.pass, true);
+});
+
+test('bounds: a signal assigned after the request does not bound it', () => {
+  const r = check('bounds',
+    '```javascript\nlet signal;\nconst response = await fetch(url, { signal });\n' +
+    'signal = AbortSignal.timeout(10_000);\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: writing the chunk before the guard fails', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+    '  await file.write(value);\n  if (received > MAX_BYTES) throw new Error("too large");\n' +
+    '  log.write("chunk done");\n}\n```');
+  assert.equal(r.pass, false);
 });
 
 test('bounds: unbounded fetch fails', () => {

@@ -95,12 +95,17 @@ const CHECKS = {
     // failure check has to reach the function under test — directly or one hop
     // through a helper it defines.
     const subject = (t.match(/(?:def|function)\s+(\w+)\s*\(/) || [])[1];
-    const calls = scope => new RegExp(String.raw`\b${subject}\s*\(`).test(scope)
-      || [...scope.matchAll(/\b(\w+)\s*\(/g)].some(call =>
-        new RegExp(String.raw`\b${subject}\s*\(`)
-          .test((t.match(new RegExp(String.raw`(?:def|function)\s+${call[1]}\s*\([\s\S]{0,400}`)) || [''])[0]));
-    const checksFailure = [...t.matchAll(markers)]
-      .some(match => !subject || calls(`${match[0]}\n${suiteAt(t, match.index)}`));
+    const reaching = scope => [...scope.matchAll(/\b(\w+)\s*\(([^)]*)\)/g)]
+      .filter(call => call[1] === subject
+        || new RegExp(String.raw`\b${subject}\s*\(`)
+          .test((t.match(new RegExp(String.raw`(?:def|function)\s+${call[1]}\s*\([\s\S]{0,400}`)) || [''])[0]))
+      .map(call => call[2].trim())
+      .filter(Boolean);
+    // '1h30m45s' is the task's own valid example: rejecting it is the bug, not
+    // the check. The input under test has to be malformed or half-parsed.
+    const wellFormed = /^['"]\s*(?:\d+\s*[hms])+\s*['"]$/i;
+    const checksFailure = [...t.matchAll(markers)].some(match => !subject
+      || reaching(`${match[0]}\n${suiteAt(t, match.index)}`).some(arg => !wellFormed.test(arg)));
     return hasCheck && checksFailure
       ? { pass: true, reason: 'Left a runnable check for a risky alternate path.' }
       : { pass: false, reason: 'No runnable alternate-path check left behind.' };
@@ -110,12 +115,13 @@ const CHECKS = {
   contracts(output) {
     // Comment-stripped: a carried-over check in a comment is not a runnable one.
     const t = codeOf(output);
-    // Parameter names are not part of the contract; find the two-arg function
-    // that actually returns the merge, whatever its parameters are called.
+    // Parameter names are not part of the contract, but the function name is:
+    // the task hands the answer a broken `updateSettings` to fix, so a correct
+    // sibling merger alongside the untouched original is not a fix.
     const updater = [
       ...t.matchAll(/function\s+(\w+)\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)/g),
       ...t.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*=>/g),
-    ].find(match => {
+    ].filter(match => match[1] === 'updateSettings').find(match => {
       const body = t.slice(match.index, match.index + 500);
       return new RegExp(String.raw`(?:\breturn|=>)\s*\(?\s*\{\s*\.\.\.${match[2]}\s*,\s*\.\.\.${match[3]}\s*\}`, 'i').test(body)
         || new RegExp(String.raw`(?:\breturn|=>)\s*Object\.assign\s*\(\s*\{\s*\}\s*,\s*${match[2]}\s*,\s*${match[3]}\s*\)`, 'i').test(body);
@@ -212,9 +218,18 @@ const CHECKS = {
     const validates = new RegExp(String.raw`(?:^|[;}\n])\s*(?:await\s+)?((?:validate|assert|ensure|checkNetwork)\w*Url)\s*\(\s*${url}\b`, 'im').exec(t);
     const definition = validates
       && new RegExp(String.raw`(?:function\s+${validates[1]}\s*\(\s*(\w+)|(?:const|let|var)\s+${validates[1]}\s*=\s*(?:async\s*)?\(?\s*(\w+))([\s\S]{0,400})`).exec(t);
+    // A validator that only returns false is ignorable, and these callers do
+    // ignore it; requiring it to throw is what actually stops the request.
     const enforcingValidator = definition
+      && /\bthrow\b|\breject\s*\(/.test(definition[3])
       && enforcing(definition[3], definition[1] || definition[2]).length > 0;
-    const fetchCall = new RegExp(String.raw`\bfetch\s*\(\s*${url}\b([\s\S]{0,300})`).exec(t);
+    // Every request to the persisted destination has to be guarded, not just the
+    // first one: a safe HEAD probe followed by an unguarded POST is a bypass.
+    const requests = [...t.matchAll(/\bfetch\s*\(\s*([^,)]{0,80}?)\s*[,)]/g)]
+      .map(match => ({ index: match.index, target: match[1], options: blockAt(t, match.index).slice(0, 400) }));
+    if (requests.some(request => request.target.startsWith(parsed[2]))) return fail;
+    const urlRequests = requests.filter(request => request.target === url);
+    const fetchCall = urlRequests[0];
     // An inline guard only protects the request if it runs on the way to it: a
     // guard sitting in a helper the answer never calls protects nothing.
     const bodies = [...t.matchAll(/(?:function\s*\w*\s*\([^)]*\)|=>)\s*\{/g)]
@@ -229,8 +244,9 @@ const CHECKS = {
       ...(enforcingValidator ? [validates] : []),
     ];
     // A followed redirect re-enters the network with a destination the policy
-    // never saw, so the fetch has to refuse or hand back the 3xx itself.
-    const boundsRedirects = fetchCall && /redirect\s*:\s*['"](?:manual|error)['"]/.test(fetchCall[1]);
+    // never saw, so each request has to refuse or hand back the 3xx itself.
+    const boundsRedirects = urlRequests.length
+      && urlRequests.every(request => /redirect\s*:\s*['"](?:manual|error)['"]/.test(request.options));
     return fetchCall && boundsRedirects && validations.some(v => v.index < fetchCall.index)
       ? { pass: true, reason: 'Revalidates persisted URL against a network policy before use.' }
       : fail;
@@ -241,7 +257,8 @@ const CHECKS = {
     const t = String(output || '');
     // The deadline has to reach the request, whether it is built inline, held in
     // a variable, or passed as a controller's signal.
-    const optionsAt = /\bfetch\s*\(\s*[^,()]{0,80},\s*\{/.exec(t);
+    const request = /\b(?:fetch|https?\.(?:get|request))\s*\(/.exec(t);
+    const optionsAt = /\b(?:fetch|https?\.(?:get|request))\s*\(\s*[^,()]{0,80},\s*\{/.exec(t);
     const options = optionsAt ? blockAt(t, optionsAt.index) : '';
     const signalRef = /\bsignal\s*:\s*AbortSignal\.timeout\s*\(/.test(options)
       ? 'inline'
@@ -250,11 +267,13 @@ const CHECKS = {
         || /\b(signal)\s*[,}]/.exec(options) || [])[1];
     // The timer has to abort this request's own controller, and it has to be
     // armed before the request: a timer set afterwards bounds nothing.
-    const timer = signalRef
-      && new RegExp(String.raw`setTimeout\s*\([\s\S]{0,240}\b${signalRef}\s*\.\s*abort\s*\(`).exec(t);
+    const armedBefore = pattern => {
+      const match = signalRef && new RegExp(pattern).exec(t);
+      return Boolean(match && request && match.index < request.index);
+    };
     const requestTimeout = signalRef === 'inline'
-      || Boolean(signalRef && (new RegExp(String.raw`\b${signalRef}\s*=\s*AbortSignal\.timeout\s*\(`).test(t)
-        || (timer && timer.index < t.search(/\bfetch\s*\(/))));
+      || armedBefore(String.raw`\b${signalRef}\s*=\s*AbortSignal\.timeout\s*\(`)
+      || armedBefore(String.raw`setTimeout\s*\([\s\S]{0,240}\b${signalRef}\s*\.\s*abort\s*\(`);
     // Everything below is graded inside the loop that consumes the stream:
     // buffering the whole body first and counting afterwards is no ceiling.
     const consumer = streamConsumer(t);
@@ -269,7 +288,15 @@ const CHECKS = {
     const stops = limitBranch && counter.index < limitBranch.index
       && /\bthrow\b|\breturn\b/.test(limitBranch[1])
       && (!evented || /\b(?:destroy|abort|cancel|unpipe)\s*\(/.test(limitBranch[1]));
-    const writeAfterLimit = stops && /(?:\bwrite\s*\(|\.write\s*\(|writeFile\s*\()/.test(scope.slice(limitBranch.index + limitBranch[0].length));
+    // The write has to be of the chunk just counted, and only after the guard:
+    // an unrelated log write past the branch is not the destination write.
+    const chunk = (scope.match(/\{[^}]{0,40}\b(?!done\b)(\w+)\s*\}\s*=\s*await\s+\w+\s*\.\s*read\s*\(/)
+      || (consumer && consumer.header.match(/for\s+await\s*\(\s*(?:const|let|var)\s+(\w+)\s+of/))
+      || (consumer && consumer.header.match(/['"]data['"]\s*,\s*(?:async\s*)?\(?\s*(\w+)/)) || [])[1];
+    const writesChunk = chunk && new RegExp(String.raw`write\w*\s*\([^)]*\b${chunk}\b`);
+    const writeAfterLimit = stops && writesChunk
+      && writesChunk.test(scope.slice(limitBranch.index + limitBranch[0].length))
+      && !writesChunk.test(scope.slice(0, limitBranch.index));
     return requestTimeout && writeAfterLimit
       ? { pass: true, reason: 'Bounds remote work by time and an enforced streaming byte ceiling.' }
       : { pass: false, reason: 'Remote work lacks a time limit or enforced streaming byte ceiling.' };
