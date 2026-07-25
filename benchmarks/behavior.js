@@ -156,7 +156,7 @@ const CHECKS = {
 
   // Cancellation must remove every listener it installed, not just reject.
   lifecycle(output) {
-    const whole = String(output || '');
+    const whole = codeOf(output);
     // Everything below is graded inside waitForDownload itself: a guard in some
     // other helper does not protect the listeners this function installs.
     const implAt = /(?:function\s+waitForDownload\s*\(|(?:const|let|var)\s+waitForDownload\s*=)/.exec(whole);
@@ -166,10 +166,22 @@ const CHECKS = {
       : whole;
     // events.once(emitter, 'download', { signal }) is the platform's own answer:
     // it rejects a pre-aborted signal and removes its listeners either way. Only
-    // the real one counts, so it has to come from node:events, not a local shim.
-    const fromEvents = /(?:require\s*\(\s*['"](?:node:)?events['"]\s*\)|from\s+['"](?:node:)?events['"])/.test(whole)
-      && !/function\s+once\b|(?:const|let|var)\s+once\s*=/.test(whole);
-    if (fromEvents && /(?:return|await|=>)\s*(?:\w+\.)?once\s*\(\s*\w+\s*,\s*['"]download['"]\s*,\s*\{[^}]{0,120}\bsignal\b/.test(t))
+    // the real one counts, so resolve the local binding it was imported under,
+    // and require it to receive this function's own signal parameter.
+    const imported = /(?:const|let|var)\s*\{([^}]{0,160})\}\s*=\s*require\s*\(\s*['"](?:node:)?events['"]|import\s*\{([^}]{0,160})\}\s*from\s*['"](?:node:)?events['"]/.exec(whole);
+    const namespace = /(?:const|let|var)\s+(\w+)\s*=\s*require\s*\(\s*['"](?:node:)?events['"]|import\s+(\w+)\s+from\s+['"](?:node:)?events['"]/.exec(whole);
+    const alias = imported && (imported[1] || imported[2]).split(',')
+      .map(part => part.split(/\s+as\s+/).map(word => word.trim()))
+      .find(pair => pair[0] === 'once');
+    const onceName = alias ? alias[1] || alias[0]
+      : namespace && `${namespace[1] || namespace[2]}\\.once`;
+    const shim = onceName && new RegExp(String.raw`function\s+${onceName}\b|(?:const|let|var)\s+${onceName}\s*=`).test(whole);
+    const signalParam = (/waitForDownload\s*=?\s*(?:async\s*)?\(?\s*\w+\s*,\s*(\w+)/.exec(whole) || [, 'signal'])[1];
+    const signalOption = signalParam === 'signal'
+      ? String.raw`\bsignal\s*(?:[,}]|:\s*signal\b)`
+      : String.raw`\bsignal\s*:\s*${signalParam}\b`;
+    if (onceName && !shim
+      && new RegExp(String.raw`(?:return|await|=>)\s*${onceName}\s*\(\s*\w+\s*,\s*['"]download['"]\s*,\s*\{[^}]{0,120}${signalOption}`).test(t))
       return { pass: true, reason: 'Delegates the whole lifecycle to the abort-aware events.once helper.' };
     // An already-aborted signal never fires `abort`, so the guard has to run
     // before any listener is installed or the setup leaks both of them.
@@ -203,7 +215,7 @@ const CHECKS = {
 
   // Data loaded from storage is untrusted again at the point of network use.
   revalidate(output) {
-    const t = String(output || '');
+    const t = codeOf(output);
     const fail = { pass: false, reason: 'Trusts persisted URL without revalidating its current network policy.' };
     const parsed = t.match(/(?:const|let|var)\s+(\w+)\s*=\s*new URL\s*\(\s*([\w.[\]'"]+)/);
     if (!parsed) return fail;
@@ -235,11 +247,19 @@ const CHECKS = {
       && enforcing(definition[3], definition[1] || definition[2]).length > 0;
     // Every request to the persisted destination has to be guarded, not just the
     // first one: a safe HEAD probe followed by an unguarded POST is a bypass.
-    const requests = [...t.matchAll(/\bfetch\s*\(\s*([^,)]{0,80}?)\s*[,)]/g)]
-      .map(match => ({ index: match.index, target: match[1], options: blockAt(t, match.index).slice(0, 400) }));
+    const requests = [...t.matchAll(/\b(fetch|https?\.(?:request|get))\s*\(\s*([^,)]{0,80}?)\s*[,)]/g)]
+      .map(match => ({
+        index: match.index,
+        native: match[1] !== 'fetch',
+        target: match[2],
+        options: blockAt(t, match.index).slice(0, 400),
+      }));
     if (requests.some(request => request.target.startsWith(parsed[2]))) return fail;
     const urlRequests = requests.filter(request => request.target === url);
-    const fetchCall = urlRequests[0];
+    // The task is to POST a payload: a guarded GET never performs the operation
+    // whose trust boundary this probe is measuring.
+    const fetchCall = urlRequests.find(request => /method\s*:\s*['"]POST['"]/i.test(request.options)
+      && (/\bbody\b/.test(request.options) || /\.\s*(?:write|end)\s*\(/.test(t.slice(request.index))));
     // An inline guard only protects the request if it runs on the way to it: a
     // guard sitting in a helper the answer never calls protects nothing.
     const bodies = [...t.matchAll(/(?:function\s*\w*\s*\([^)]*\)|=>)\s*\{/g)]
@@ -255,8 +275,10 @@ const CHECKS = {
     ];
     // A followed redirect re-enters the network with a destination the policy
     // never saw, so each request has to refuse or hand back the 3xx itself.
+    // native https does not follow redirects on its own; fetch does.
     const boundsRedirects = urlRequests.length
-      && urlRequests.every(request => /redirect\s*:\s*['"](?:manual|error)['"]/.test(request.options));
+      && urlRequests.every(request => request.native
+        || /redirect\s*:\s*['"](?:manual|error)['"]/.test(request.options));
     return fetchCall && boundsRedirects && validations.some(v => v.index < fetchCall.index)
       ? { pass: true, reason: 'Revalidates persisted URL against a network policy before use.' }
       : fail;
@@ -264,7 +286,7 @@ const CHECKS = {
 
   // A remote response needs both a deadline and an enforced streaming byte ceiling.
   bounds(output) {
-    const t = String(output || '');
+    const t = codeOf(output);
     // Everything below is graded inside the loop that consumes the stream:
     // buffering the whole body first and counting afterwards is no ceiling.
     const consumer = streamConsumer(t);

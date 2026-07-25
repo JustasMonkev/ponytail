@@ -417,6 +417,20 @@ test('lifecycle: native abort-aware events.once passes', () => {
   assert.equal(r.pass, true);
 });
 
+test('lifecycle: an aliased import of the native once passes', () => {
+  const r = check('lifecycle',
+    '```javascript\nimport { once as onceEvent } from "node:events";\n' +
+    'const waitForDownload = (emitter, signal) => onceEvent(emitter, "download", { signal });\n```');
+  assert.equal(r.pass, true);
+});
+
+test('lifecycle: native once given a different signal fails', () => {
+  const r = check('lifecycle',
+    '```javascript\nconst { once } = require("node:events");\n' +
+    'const waitForDownload = (emitter, signal) => once(emitter, "download", { signal: otherSignal });\n```');
+  assert.equal(r.pass, false);
+});
+
 test('lifecycle: a local once shim is not the native helper', () => {
   const r = check('lifecycle',
     '```javascript\nfunction once(emitter, event, options) {\n' +
@@ -525,6 +539,22 @@ test('revalidate: a guarded probe followed by an unguarded POST fails', () => {
   assert.equal(r.pass, false);
 });
 
+test('revalidate: a guarded GET does not perform the requested POST', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'if (url.protocol !== "https:") throw new Error("bad");\n' +
+    'await fetch(url, { redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: a native https POST passes', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'if (url.protocol !== "https:") throw new Error("bad");\n' +
+    'const request = https.request(url, { method: "POST" });\nrequest.end(payload);\n```');
+  assert.equal(r.pass, true);
+});
+
 test('revalidate: direct use of persisted URL fails', () => {
   const r = check('revalidate',
     '```javascript\nconst saved = JSON.parse(text);\nawait fetch(saved.webhook, { method: "POST", body });\n```');
@@ -579,7 +609,7 @@ test('revalidate: an invoked validator that rejects on policy passes', () => {
     '```javascript\nfunction validateWebhookUrl(candidate) {\n' +
     '  if (candidate.protocol !== "https:") throw new Error("insecure webhook");\n}\n' +
     'const saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\nvalidateWebhookUrl(url);\n' +
-    'await fetch(url, { redirect: "error" });\n```');
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
   assert.equal(r.pass, true);
 });
 
@@ -790,6 +820,15 @@ test('bounds: returning a truncated download instead of failing fails', () => {
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
     '  if (received > MAX_BYTES) { await reader.cancel(); return; }\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a commented-out byte guard is not a ceiling', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+    '  // if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, false);
 });
 
