@@ -56,7 +56,9 @@ const CHECKS = {
   onecheck(output) {
     const t = codeOf(output);
     const hasCheck = /\bassert\b|def\s+test_|if\s+__name__|unittest|pytest|console\.assert|\bexpect\(|\bdescribe\(|\bit\(/.test(t);
-    const checksFailure = /pytest\.raises|assertRaises|assert\.throws|toThrow|expect\([^\n]*\)\.rejects|assert\s+(?:await\s+)?(?:rejects?|raises?|throws?)\s*\([^)\n]+\)|try\s*:[\s\S]{0,300}\w+\s*\([^)]*\)[\s\S]{0,240}except\b[\s\S]{0,160}else\s*:[\s\S]{0,120}assert\s+False/i.test(t);
+    // Both framework-free idioms count: `assert False` after the call inside
+    // the try, and the try/except/else layout.
+    const checksFailure = /pytest\.raises|assertRaises|assert\.throws|toThrow|expect\([^\n]*\)\.rejects|assert\s+(?:await\s+)?(?:rejects?|raises?|throws?)\s*\([^)\n]+\)|try\s*:[\s\S]{0,200}\w+\s*\([^)\n]*\)[\s\S]{0,120}\bassert\s+False\b[\s\S]{0,160}except\b|try\s*:[\s\S]{0,300}\w+\s*\([^)]*\)[\s\S]{0,240}except\b[\s\S]{0,160}else\s*:[\s\S]{0,120}assert\s+False/i.test(t);
     return hasCheck && checksFailure
       ? { pass: true, reason: 'Left a runnable check for a risky alternate path.' }
       : { pass: false, reason: 'No runnable alternate-path check left behind.' };
@@ -74,11 +76,16 @@ const CHECKS = {
     const call = updater && new RegExp(String.raw`(?:const|let|var)\s+(\w+)\s*=\s*${updater[1]}\s*\(([\s\S]{0,400}?)\);`).exec(t);
     const falsyPatch = call && [/\bfalse\b/, /(?:^|\D)0(?:\D|$)/, /['"]{2}/].every(pattern => pattern.test(call[2]));
     const assertions = t.split('\n').map(line => line.match(/(?:console\.)?assert\b.*|\bexpect\(.*|\bit\(.*/)?.[0]).filter(Boolean).join('\n');
-    const checksFalsy = call && [
+    const perField = call && [
       new RegExp(String.raw`${call[1]}\.\w+\s*===?\s*false`, 'i'),
       new RegExp(String.raw`${call[1]}\.\w+\s*===?\s*0(?:\D|$)`),
       new RegExp(String.raw`${call[1]}\.\w+\s*===?\s*['"]{2}`),
     ].every(pattern => pattern.test(assertions));
+    // One structural assertion on the result proves the same three contracts.
+    const deep = call && new RegExp(String.raw`(?:deepStrictEqual|deepEqual)\s*\(\s*${call[1]}\s*,\s*\{([\s\S]{0,400}?)\}|expect\s*\(\s*${call[1]}\s*\)\s*\.\s*to(?:Strict)?Equal\s*\(\s*\{([\s\S]{0,400}?)\}`).exec(t);
+    const expected = deep ? deep[1] || deep[2] || '' : '';
+    const checksFalsy = perField
+      || [/:\s*false\b/, /:\s*0\b/, /:\s*(?:''|"")/].every(pattern => pattern.test(expected));
     return merges && falsyPatch && checksFalsy
       ? { pass: true, reason: 'Preserves existing state and checks explicit falsy values.' }
       : { pass: false, reason: 'Does not prove state and explicit false/zero/empty values survive.' };
@@ -87,6 +94,10 @@ const CHECKS = {
   // Cancellation must remove every listener it installed, not just reject.
   lifecycle(output) {
     const t = String(output || '');
+    // events.once(emitter, 'download', { signal }) is the platform's own answer:
+    // it rejects a pre-aborted signal and removes its listeners either way.
+    if (/\bonce\s*\(\s*\w+\s*,\s*['"]download['"]\s*,\s*\{[^}]{0,120}\bsignal\b/.test(t))
+      return { pass: true, reason: 'Delegates the whole lifecycle to the abort-aware events.once helper.' };
     const preAborted = /signal\.throwIfAborted\s*\(|throwIfAborted\s*\(\s*signal|if\s*\(\s*signal\??\.aborted\s*\)\s*(?:\{[^}]{0,160}(?:(?:return\s+)?reject\s*\(|\bthrow\b)|(?:return\s+)?reject\s*\(|throw\b)/.test(t);
     const handlers = namedFunctionBodies(t);
     const abortHandler = handlers.find(handler => /abort/i.test(handler.name) && /\breject\s*\(/.test(handler.body));
@@ -112,19 +123,28 @@ const CHECKS = {
   // Data loaded from storage is untrusted again at the point of network use.
   revalidate(output) {
     const t = String(output || '');
+    const fail = { pass: false, reason: 'Trusts persisted URL without revalidating its current network policy.' };
     const parsed = t.match(/(?:const|let|var)\s+(\w+)\s*=\s*new URL\s*\(/);
-    if (!parsed)
-      return { pass: false, reason: 'Trusts persisted URL without revalidating its current network policy.' };
+    if (!parsed) return fail;
     const url = parsed[1];
     const rejection = String.raw`\s*(?:\{[^}]{0,200}(?:\bthrow\b|\breject\s*\(|\breturn\s+false\b)|(?:\bthrow\b|\breject\s*\(|\breturn\s+false\b))`;
-    const rejectsProtocol = new RegExp(String.raw`if\s*\([^\n]{0,240}${url}\.protocol\s*!==?\s*['"]https:['"][^\n]{0,240}\)${rejection}`, 'i').exec(t);
-    const rejectsHost = new RegExp(String.raw`if\s*\([^\n]{0,240}!\s*(?:allowedHosts|allowlist)\s*\.\s*(?:has|includes)\s*\(\s*${url}\.hostname\s*\)[^\n]{0,240}\)${rejection}`, 'i').exec(t);
+    // Each policy must reject on its own. An `&&` clause only rejects when every
+    // condition fails, so an allowed host still reaches the network over http.
+    const clauses = [...t.matchAll(new RegExp(String.raw`if\s*\(([^\n]{0,300}?)\)${rejection}`, 'gi'))]
+      .flatMap(match => match[1].split('||').map(clause => ({ index: match.index, clause })))
+      .filter(guard => !guard.clause.includes('&&'));
+    const enforces = guard =>
+      new RegExp(String.raw`${url}\.protocol\s*!==?\s*['"]https:['"]`, 'i').test(guard.clause)
+      || new RegExp(String.raw`!\s*(?:allowedHosts|allowlist)\s*\.\s*(?:has|includes)\s*\(\s*${url}\.hostname\s*\)`, 'i').test(guard.clause);
     const validates = new RegExp(String.raw`(?:^|[;}\n])\s*(?:await\s+)?(?:validate|assert|ensure|checkNetwork)\w*Url\s*\(\s*${url}\b`, 'im').exec(t);
-    const fetchesValidatedUrl = new RegExp(String.raw`\bfetch\s*\(\s*${url}\b`).exec(t);
-    const validation = [rejectsProtocol, rejectsHost, validates].filter(Boolean).sort((a, b) => a.index - b.index)[0];
-    return fetchesValidatedUrl && validation && validation.index < fetchesValidatedUrl.index
+    const validations = [...clauses.filter(enforces), ...(validates ? [validates] : [])];
+    const fetchCall = new RegExp(String.raw`\bfetch\s*\(\s*${url}\b([\s\S]{0,300})`).exec(t);
+    // A followed redirect re-enters the network with a destination the policy
+    // never saw, so the fetch has to refuse or hand back the 3xx itself.
+    const boundsRedirects = fetchCall && /redirect\s*:\s*['"](?:manual|error)['"]/.test(fetchCall[1]);
+    return fetchCall && boundsRedirects && validations.some(v => v.index < fetchCall.index)
       ? { pass: true, reason: 'Revalidates persisted URL against a network policy before use.' }
-      : { pass: false, reason: 'Trusts persisted URL without revalidating its current network policy.' };
+      : fail;
   },
 
   // A remote response needs both a deadline and an enforced streaming byte ceiling.
@@ -132,11 +152,16 @@ const CHECKS = {
     const t = String(output || '');
     const requestTimeout = /\bfetch\s*\([\s\S]{0,240}\bsignal\s*:\s*AbortSignal\.timeout\s*\(/.test(t)
       || (/\bfetch\s*\([\s\S]{0,240}\bsignal\s*:\s*\w+\.signal\b/.test(t) && /setTimeout\s*\([\s\S]{0,240}\.abort\s*\(/.test(t));
-    const streams = /getReader\s*\(|for\s+await\s*\(|\.on\s*\(\s*['"]data['"]/.test(t);
+    const loops = /getReader\s*\(|for\s+await\s*\(/.test(t);
+    const evented = /\.on\s*\(\s*['"]data['"]/.test(t);
     const counter = t.match(/\b([A-Za-z_$]\w*)\s*\+=\s*[^;\n]*(?:byteLength|length)/);
-    const limitBranch = counter && new RegExp(String.raw`if\s*\([^\n]{0,240}${counter[1]}\s*>=?\s*[A-Za-z_$]\w*[^\n]{0,240}\)\s*(?:\{[^}]{0,240}(?:\bthrow\b|\breturn\b)|(?:\bthrow\b|\breturn\b))`, 'i').exec(t);
-    const writeAfterLimit = limitBranch && /(?:\bwrite\s*\(|\.write\s*\(|writeFile\s*\()/.test(t.slice(limitBranch.index + limitBranch[0].length));
-    return requestTimeout && streams && counter && writeAfterLimit
+    const limitBranch = counter && new RegExp(String.raw`if\s*\([^\n]{0,240}${counter[1]}\s*>=?\s*[A-Za-z_$]\w*[^\n]{0,240}?\)\s*(\{[^}]{0,240}\}|[^\n]{0,160})`, 'i').exec(t);
+    // `return` exits one data callback but leaves an evented stream flowing, so
+    // the over-limit path has to tear the stream down too.
+    const stops = limitBranch && /\bthrow\b|\breturn\b/.test(limitBranch[1])
+      && (loops || /\b(?:destroy|abort|cancel|unpipe)\s*\(/.test(limitBranch[1]));
+    const writeAfterLimit = stops && /(?:\bwrite\s*\(|\.write\s*\(|writeFile\s*\()/.test(t.slice(limitBranch.index + limitBranch[0].length));
+    return requestTimeout && (loops || evented) && counter && writeAfterLimit
       ? { pass: true, reason: 'Bounds remote work by time and an enforced streaming byte ceiling.' }
       : { pass: false, reason: 'Remote work lacks a time limit or enforced streaming byte ceiling.' };
   },

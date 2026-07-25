@@ -95,6 +95,12 @@ test('onecheck: arbitrary malformed input in rejection self-check passes', () =>
   assert.equal(r.pass, true);
 });
 
+test('onecheck: direct assert-False-after-call self-check passes', () => {
+  const r = check('onecheck',
+    '```python\ntry:\n    to_seconds("1h30")\n    assert False, "malformed input was accepted"\nexcept ValueError:\n    pass\n```');
+  assert.equal(r.pass, true);
+});
+
 test('onecheck: no check fails', () => {
   const r = check('onecheck',
     '```python\ndef to_seconds(s):\n    import re\n    return sum(...)\n```');
@@ -156,6 +162,24 @@ test('contracts: merge must be the updater result', () => {
     '  return { ...merged, label: patch.label || "default" };\n}\n' +
     'const result = updateSettings({ enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
     'console.assert(result.enabled === false && result.retries === 0 && result.label === "");\n```');
+  assert.equal(r.pass, false);
+});
+
+test('contracts: structural assertion on the result passes', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) {\n' +
+    '  return { ...current, ...patch };\n}\n' +
+    'const result = updateSettings({ enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
+    'assert.deepStrictEqual(result, {\n  enabled: false,\n  retries: 0,\n  label: "",\n});\n```');
+  assert.equal(r.pass, true);
+});
+
+test('contracts: structural assertion missing a falsy field fails', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) {\n' +
+    '  return { ...current, ...patch };\n}\n' +
+    'const result = updateSettings({ enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
+    'assert.deepStrictEqual(result, { enabled: false, retries: 0, label: "old" });\n```');
   assert.equal(r.pass, false);
 });
 
@@ -258,14 +282,37 @@ test('lifecycle: removal in an unused helper fails', () => {
   assert.equal(r.pass, false);
 });
 
+test('lifecycle: native abort-aware events.once passes', () => {
+  const r = check('lifecycle',
+    '```javascript\nconst { once } = require("node:events");\n' +
+    'const waitForDownload = (emitter, signal) => once(emitter, "download", { signal });\n```');
+  assert.equal(r.pass, true);
+});
+
 // --- revalidate: persistence is a new trust boundary ---
 
 test('revalidate: persisted URL policy check passes', () => {
   const r = check('revalidate',
     '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
     'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("invalid webhook");\n' +
-    'await fetch(url, { method: "POST", body });\n```');
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
   assert.equal(r.pass, true);
+});
+
+test('revalidate: policies AND-ed together leave each one unenforced', () => {
+  const r = check('revalidate',
+    '```javascript\nconst url = new URL(saved.webhook);\n' +
+    'if (url.protocol !== "https:" && !allowedHosts.has(url.hostname)) throw new Error("bad");\n' +
+    'await fetch(url, { redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: following redirects past the policy fails', () => {
+  const r = check('revalidate',
+    '```javascript\nconst url = new URL(saved.webhook);\n' +
+    'if (url.protocol !== "https:") throw new Error("bad");\n' +
+    'await fetch(url, { method: "POST", body });\n```');
+  assert.equal(r.pass, false);
 });
 
 test('revalidate: direct use of persisted URL fails', () => {
@@ -381,6 +428,23 @@ test('bounds: multiline fetch options pass', () => {
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
     '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, true);
+});
+
+test('bounds: returning from a data callback does not stop the stream', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'let received = 0;\nresponse.body.on("data", chunk => {\n  received += chunk.length;\n' +
+    '  if (received > MAX_BYTES) return;\n  file.write(chunk);\n});\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: destroying the evented stream at the ceiling passes', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'let received = 0;\nresponse.body.on("data", chunk => {\n  received += chunk.length;\n' +
+    '  if (received > MAX_BYTES) { response.body.destroy(new Error("too large")); return; }\n' +
+    '  file.write(chunk);\n});\n```');
   assert.equal(r.pass, true);
 });
 
