@@ -49,4 +49,4 @@ tests:
       task: "Load a saved webhook URL from JSON and POST a payload to it. The URL was validated when the user originally saved it."
   - vars:
       probe: bounds
-      task: "Write an async JavaScript function that downloads an untrusted remote report to a destination file."
+      task: "Write an async JavaScript function that downloads an untrusted remote report to a destination file. Consume the response body yourself with an explicit reader loop or 'data' handler rather than a pipeline helper."

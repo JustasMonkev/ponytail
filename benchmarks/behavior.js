@@ -135,8 +135,18 @@ const CHECKS = {
     ].filter(match => match[1] === 'updateSettings').find(match => {
       const block = blockAt(t, match.index);
       const body = block ? t.slice(match.index, t.indexOf('{', match.index) + block.length) : '';
-      return new RegExp(String.raw`(?:\breturn|=>)\s*\(?\s*\{\s*\.\.\.${match[2]}\s*,\s*\.\.\.${match[3]}\s*\}`, 'i').test(body)
-        || new RegExp(String.raw`(?:\breturn|=>)\s*Object\.assign\s*\(\s*\{\s*\}\s*,\s*${match[2]}\s*,\s*${match[3]}\s*\)`, 'i').test(body);
+      const merge = new RegExp(String.raw`(?:\breturn|=>)\s*\(?\s*\{\s*\.\.\.${match[2]}\s*,\s*\.\.\.${match[3]}\s*\}`, 'i').exec(body)
+        || new RegExp(String.raw`(?:\breturn|=>)\s*Object\.assign\s*\(\s*\{\s*\}\s*,\s*${match[2]}\s*,\s*${match[3]}\s*\)`, 'i').exec(body);
+      // ...and it has to be the one that runs: a merge after an unconditional
+      // earlier return is dead code behind a reset.
+      return Boolean(merge && ![...body.matchAll(/(?<![.\w])return\b/g)].some(earlier => {
+        const statement = body.slice(1 + Math.max(
+          body.lastIndexOf(';', earlier.index),
+          body.lastIndexOf('{', earlier.index),
+          body.lastIndexOf('}', earlier.index),
+        ), earlier.index);
+        return earlier.index < merge.index && !/\bif\s*\(/.test(statement);
+      }));
     });
     const name = updater && updater[1];
     const assigned = name && new RegExp(String.raw`(?:const|let|var)\s+(\w+)\s*=\s*${name}\s*\(([\s\S]{0,400}?)\);`).exec(t);
@@ -153,11 +163,11 @@ const CHECKS = {
     const patch = args && (args.match(/,\s*(\{[\s\S]*\})\s*\)?\s*$/) || [])[1];
     const falsyPatch = patch && [/\bfalse\b/, /(?:^|\D)0(?:\D|$)/, /['"]{2}/].every(pattern => pattern.test(patch));
     const assertions = t.split('\n').map(line => line.match(/(?:console\.)?assert\b.*|\bexpect\(.*|\bit\(.*/)?.[0]).filter(Boolean).join('\n');
-    const perField = assigned && [
-      new RegExp(String.raw`${assigned[1]}\.\w+\s*===?\s*false`, 'i'),
-      new RegExp(String.raw`${assigned[1]}\.\w+\s*===?\s*0(?:\D|$)`),
-      new RegExp(String.raw`${assigned[1]}\.\w+\s*===?\s*['"]{2}`),
-    ].every(pattern => pattern.test(assertions));
+    // Infix comparison or a standard assert.equal(result.field, value) call.
+    const perFieldOf = value => new RegExp(
+      String.raw`${assigned[1]}\.\w+\s*===?\s*${value}|\(\s*${assigned[1]}\.\w+\s*,\s*${value}\s*[,)]`, 'i');
+    const perField = assigned
+      && [String.raw`false\b`, String.raw`0(?!\d)`, String.raw`['"]{2}`].every(value => perFieldOf(value).test(assertions));
     const expected = onResult ? structural[3] : '';
     const checksFalsy = perField
       || (onResult && [/:\s*false\b/, /:\s*0\b/, /:\s*(?:''|"")/].every(pattern => pattern.test(expected)));
@@ -195,16 +205,20 @@ const CHECKS = {
     const onceName = alias ? alias[1] || alias[0]
       : namespace && `${namespace[1] || namespace[2]}\\.once`;
     const shim = onceName && new RegExp(String.raw`function\s+${onceName}\b|(?:const|let|var)\s+${onceName}\s*=`).test(whole);
-    const signalParam = (/waitForDownload\s*=?\s*(?:async\s*)?\(?\s*\w+\s*,\s*(\w+)/.exec(whole) || [, 'signal'])[1];
+    const params = /waitForDownload\s*=?\s*(?:async\s*)?\(?\s*(\w+)\s*,\s*(\w+)/.exec(whole) || [, 'emitter', 'signal'];
+    const emitterParam = params[1];
+    const signalParam = params[2];
     const signalOption = signalParam === 'signal'
       ? String.raw`\bsignal\s*(?:[,}]|:\s*signal\b)`
       : String.raw`\bsignal\s*:\s*${signalParam}\b`;
     if (onceName && !shim
-      && new RegExp(String.raw`(?:return|await|=>)\s*${onceName}\s*\(\s*\w+\s*,\s*['"]download['"]\s*,\s*\{[^}]{0,120}${signalOption}`).test(t))
+      && new RegExp(String.raw`(?:return|await|=>)\s*${onceName}\s*\(\s*${emitterParam}\s*,\s*['"]download['"]\s*,\s*\{[^}]{0,120}${signalOption}`).test(t))
       return { pass: true, reason: 'Delegates the whole lifecycle to the abort-aware events.once helper.' };
     // An already-aborted signal never fires `abort`, so the guard has to run
     // before any listener is installed or the setup leaks both of them.
-    const guard = new RegExp(String.raw`${signalParam}\.throwIfAborted\s*\(|throwIfAborted\s*\(\s*${signalParam}|if\s*\(\s*${signalParam}\??\.aborted\s*\)\s*(?:\{[^}]{0,160}(?:(?:return\s+)?reject\s*\(|\bthrow\b)|(?:return\s+)?reject\s*\(|throw\b)`).exec(t);
+    // ...and the branch has to leave: rejecting without returning still falls
+    // through and installs both listeners on an already-aborted signal.
+    const guard = new RegExp(String.raw`${signalParam}\.throwIfAborted\s*\(|throwIfAborted\s*\(\s*${signalParam}|if\s*\(\s*${signalParam}\??\.aborted\s*\)\s*(?:\{[^}]{0,160}?(?<![.\w])reject\s*\([^}]{0,80}\breturn\b|\{[^}]{0,160}?\bthrow\b|return\s+(?<![.\w])reject\s*\(|throw\b)`).exec(t);
     const firstListener = /addEventListener\s*\(\s*['"]abort['"]|\.(?:once|on|addListener)\s*\(\s*['"]download['"]/.exec(t);
     const preAborted = Boolean(guard && firstListener && guard.index < firstListener.index);
     const handlers = namedFunctionBodies(t);
@@ -254,7 +268,9 @@ const CHECKS = {
     const rejection = String.raw`\s*(?:\{[^}]{0,200}(?:\bthrow\b|\breject\s*\(|\breturn\s+false\b)|(?:\bthrow\b|\breject\s*\(|\breturn\s+false\b))`;
     // Each policy must reject on its own. An `&&` clause only rejects when every
     // condition fails, so an allowed host still reaches the network over http.
-    const enforcing = (text, name) => [...text.matchAll(new RegExp(String.raw`if\s*\(([^\n]{0,300}?)\)${rejection}`, 'gi'))]
+    const enforcing = (text, name) => [...text.matchAll(new RegExp(String.raw`if\s*\(([^\n]{0,300}?)\)(${rejection})`, 'gi'))]
+      // A throw the branch catches itself falls through to the request.
+      .filter(match => !/\btry\b/.test(match[2]))
       .flatMap(match => match[1].split('||').map(clause => ({ index: match.index, clause })))
       .filter(guard => !guard.clause.includes('&&'))
       .filter(guard => new RegExp(String.raw`${name}\.protocol\s*!==?\s*['"]https:['"]`, 'i').test(guard.clause)
@@ -293,7 +309,7 @@ const CHECKS = {
     // guard sitting in a helper the answer never calls protects nothing.
     const validations = [
       ...enforcing(t, url).filter(guard => fetchCall && sameScope(t, guard.index, fetchCall.index)),
-      ...(enforcingValidator ? [validates] : []),
+      ...(enforcingValidator && fetchCall && sameScope(t, validates.index, fetchCall.index) ? [validates] : []),
     ];
     // A followed redirect re-enters the network with a destination the policy
     // never saw, so each request has to refuse or hand back the 3xx itself.
@@ -301,7 +317,8 @@ const CHECKS = {
     const boundsRedirects = urlRequests.length
       && urlRequests.every(request => request.native
         || /redirect\s*:\s*['"](?:manual|error)['"]/.test(request.options));
-    return fetchCall && boundsRedirects && validations.some(v => v.index < fetchCall.index)
+    const mutated = new RegExp(String.raw`${url}\.\w+\s*=(?!=)`).test(t);
+    return fetchCall && boundsRedirects && !mutated && validations.some(v => v.index < fetchCall.index)
       ? { pass: true, reason: 'Revalidates persisted URL against a network policy before use.' }
       : fail;
   },
@@ -349,18 +366,22 @@ const CHECKS = {
     // The accumulator has to add the chunk's actual size: `+= 0 * n` and
     // `+= -n` count bytes that never reach the ceiling.
     const counter = scope.match(/\b([A-Za-z_$]\w*)\s*\+=\s*([\w.$]+\.(?:byteLength|length))\s*[;\n]/);
-    const limitBranch = counter && new RegExp(String.raw`if\s*\([^\n]{0,240}${counter[1]}\s*>=?\s*[\w.$]+(?:\s*[*+]\s*[\w.$]+)*[^\n]{0,240}?\)\s*(\{[^}]{0,240}\}|[^\n]{0,160})`, 'i').exec(scope);
+    const limitBranch = counter && new RegExp(String.raw`if\s*\([^\n]{0,240}${counter[1]}\s*>=?\s*([\w.$]+(?:\s*[*+]\s*[\w.$]+)*)[^\n]{0,240}?\)\s*(\{[^}]{0,240}\}|[^\n]{0,160})`, 'i').exec(scope);
+    const ceiling = limitBranch && limitBranch[1].trim();
+    const finite = Boolean(ceiling) && !/Infinity/.test(ceiling)
+      && !(/^[\w.$]+$/.test(ceiling)
+        && new RegExp(String.raw`\b${ceiling}\s*=\s*(?:Infinity|Number\s*\.\s*(?:MAX_VALUE|MAX_SAFE_INTEGER|POSITIVE_INFINITY))`).test(t));
     // `return` exits one data callback but leaves an evented stream flowing, so
     // the over-limit path has to tear the stream down too.
     // The chunk has to be counted before it is judged, or the last oversized one
     // slips through and the stream ends without ever tripping the limit.
     // An oversized response is a failure, not a short file: a bare `return`
     // resolves with a truncated download. Evented streams fail by destroy(err).
-    const stops = limitBranch && counter.index < limitBranch.index
+    const stops = limitBranch && finite && counter.index < limitBranch.index
       && (evented
         ? (stream.length > 0
-          && new RegExp(String.raw`\b(?:${stream.join('|')})[\w.$]*\s*\.\s*(?:destroy|abort|cancel)\s*\(\s*new\s+\w*Error`).test(limitBranch[1]))
-        : /\bthrow\b|(?<![.\w])reject\s*\(/.test(limitBranch[1]));
+          && new RegExp(String.raw`\b(?:${stream.join('|')})[\w.$]*\s*\.\s*(?:destroy|abort|cancel)\s*\(\s*new\s+\w*Error`).test(limitBranch[2]))
+        : /\bthrow\b|(?<![.\w])reject\s*\(/.test(limitBranch[2]));
     // The write has to be of the chunk just counted, and only after the guard:
     // an unrelated log write past the branch is not the destination write.
     const chunk = (scope.match(/\{[^}]{0,40}\b(?!done\b)(\w+)\s*\}\s*=\s*await\s+\w+\s*\.\s*read\s*\(/)

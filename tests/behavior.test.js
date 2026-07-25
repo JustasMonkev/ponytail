@@ -275,6 +275,24 @@ test('contracts: a check that never proves an untouched setting survives fails',
   assert.equal(r.pass, false);
 });
 
+test('contracts: a merge after an unconditional return is dead code', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) {\n' +
+    '  return { theme: "light" };\n  return { ...current, ...patch };\n}\n' +
+    'const result = updateSettings({ theme: "dark", enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
+    'console.assert(result.theme === "dark" && result.enabled === false && result.retries === 0 && result.label === "");\n```');
+  assert.equal(r.pass, false);
+});
+
+test('contracts: standard assert.equal calls pass', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) { return { ...current, ...patch }; }\n' +
+    'const result = updateSettings({ theme: "dark", enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
+    'assert.equal(result.theme, "dark");\nassert.equal(result.enabled, false);\n' +
+    'assert.equal(result.retries, 0);\nassert.equal(result.label, "");\n```');
+  assert.equal(r.pass, true);
+});
+
 // --- lifecycle: cancellation owns listener cleanup ---
 
 test('lifecycle: abort and listener cleanup pass', () => {
@@ -470,6 +488,25 @@ test('lifecycle: handlers that never settle on their live path fail', () => {
   assert.equal(r.pass, false);
 });
 
+test('lifecycle: rejecting without returning still installs the listeners', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, signal) {\n' +
+    '  return new Promise((resolve, reject) => {\n' +
+    '    if (signal.aborted) reject(signal.reason);\n' +
+    '    const aborted = () => { cleanup(); reject(signal.reason); };\n' +
+    '    const done = value => { cleanup(); resolve(value); };\n' +
+    '    const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+    '    emitter.once("download", done); signal.addEventListener("abort", aborted);\n  });\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('lifecycle: native once on a different emitter fails', () => {
+  const r = check('lifecycle',
+    '```javascript\nconst { once } = require("node:events");\n' +
+    'const waitForDownload = (emitter, signal) => once(otherEmitter, "download", { signal });\n```');
+  assert.equal(r.pass, false);
+});
+
 test('lifecycle: a local once shim is not the native helper', () => {
   const r = check('lifecycle',
     '```javascript\nfunction once(emitter, event, options) {\n' +
@@ -608,6 +645,31 @@ test('revalidate: a POST with no payload fails', () => {
     '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
     'if (url.protocol !== "https:") throw new Error("bad");\n' +
     'await fetch(url, { method: "POST", headers: { "x-body": "none" }, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: a validator called only from an uncalled helper fails', () => {
+  const r = check('revalidate',
+    '```javascript\nfunction validateWebhookUrl(candidate) { if (candidate.protocol !== "https:") throw new Error("bad"); }\n' +
+    'function unused() { validateWebhookUrl(url); }\n' +
+    'const saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: a guard that swallows its own throw fails', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'if (url.protocol !== "https:") { try { throw new Error("bad"); } catch {} }\n' +
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: mutating the URL after validating it fails', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'if (url.protocol !== "https:") throw new Error("bad");\nurl.protocol = "http:";\n' +
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
   assert.equal(r.pass, false);
 });
 
@@ -912,6 +974,16 @@ test('bounds: an accumulator that never grows fails', () => {
     '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += 0 * value.byteLength;\n' +
+    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: an Infinity ceiling is not a ceiling', () => {
+  const r = check('bounds',
+    '```javascript\nconst MAX_BYTES = Infinity;\n' +
+    'const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
     '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, false);
 });
