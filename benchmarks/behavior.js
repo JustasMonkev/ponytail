@@ -31,6 +31,36 @@ function namedFunctionBodies(text) {
   ].map(match => ({ name: match[1], body: match[2] }));
 }
 
+// The `{...}` starting at or after `from`, brace-balanced so nested option
+// objects and inner blocks stay inside it.
+function blockAt(text, from) {
+  const open = text.indexOf('{', from);
+  if (open < 0) return '';
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    if (text[i] === '{') depth += 1;
+    else if (text[i] === '}' && (depth -= 1) === 0) return text.slice(open, i + 1);
+  }
+  return '';
+}
+
+// The indentation-delimited suite a Python statement owns, for languages where
+// blockAt has no braces to count.
+function suiteAt(text, index) {
+  const lines = text.slice(text.lastIndexOf('\n', index) + 1).split('\n');
+  const indent = lines[0].search(/\S/);
+  const end = lines.slice(1).findIndex(line => line.trim() && line.search(/\S/) <= indent);
+  return lines.slice(0, end < 0 ? lines.length : end + 1).join('\n');
+}
+
+// The loop or listener that actually consumes the response stream. Counting
+// bytes in a later pass over a buffered array is not a ceiling.
+function streamConsumer(text) {
+  return [...text.matchAll(/(?:while\s*\([^)]{0,80}\)|for\s+await\s*\([^)]{0,120}\)|\.on\s*\(\s*['"]data['"]\s*,[^{]{0,60})\s*\{/g)]
+    .map(match => ({ header: match[0], body: blockAt(text, match.index + match[0].length - 1) }))
+    .find(loop => /\.read\s*\(/.test(loop.body) || /for\s+await|['"]data['"]/.test(loop.header));
+}
+
 const CHECKS = {
   // Treats the device as non-ideal: leaves a tunable knob or flags per-unit drift.
   // A passing mention of "calibration" is not enough; it must be actionable.
@@ -58,7 +88,17 @@ const CHECKS = {
     const hasCheck = /\bassert\b|def\s+test_|if\s+__name__|unittest|pytest|console\.assert|\bexpect\(|\bdescribe\(|\bit\(/.test(t);
     // Both framework-free idioms count: `assert False` after the call inside
     // the try, and the try/except/else layout.
-    const checksFailure = /pytest\.raises|assertRaises|assert\.throws|toThrow|expect\([^\n]*\)\.rejects|assert\s+(?:await\s+)?(?:rejects?|raises?|throws?)\s*\([^)\n]+\)|try\s*:[\s\S]{0,200}\w+\s*\([^)\n]*\)[\s\S]{0,120}\bassert\s+False\b[\s\S]{0,160}except\b|try\s*:[\s\S]{0,300}\w+\s*\([^)]*\)[\s\S]{0,240}except\b[\s\S]{0,160}else\s*:[\s\S]{0,120}assert\s+False/i.test(t);
+    const markers = /pytest\.raises|assertRaises|assert\.throws|toThrow|expect\([^\n]*\)\.rejects|assert\s+(?:await\s+)?(?:rejects?|raises?|throws?)\s*\([^)\n]+\)|try\s*:[\s\S]{0,200}\w+\s*\([^)\n]*\)[\s\S]{0,120}\bassert\s+False\b[\s\S]{0,160}except\b|try\s*:[\s\S]{0,300}\w+\s*\([^)]*\)[\s\S]{0,240}except\b[\s\S]{0,160}else\s*:[\s\S]{0,120}assert\s+False/gi;
+    // Proving that some other call raises says nothing about this parser, so the
+    // failure check has to reach the function under test — directly or one hop
+    // through a helper it defines.
+    const subject = (t.match(/(?:def|function)\s+(\w+)\s*\(/) || [])[1];
+    const calls = scope => new RegExp(String.raw`\b${subject}\s*\(`).test(scope)
+      || [...scope.matchAll(/\b(\w+)\s*\(/g)].some(call =>
+        new RegExp(String.raw`\b${subject}\s*\(`)
+          .test((t.match(new RegExp(String.raw`(?:def|function)\s+${call[1]}\s*\([\s\S]{0,400}`)) || [''])[0]));
+    const checksFailure = [...t.matchAll(markers)]
+      .some(match => !subject || calls(`${match[0]}\n${suiteAt(t, match.index)}`));
     return hasCheck && checksFailure
       ? { pass: true, reason: 'Left a runnable check for a risky alternate path.' }
       : { pass: false, reason: 'No runnable alternate-path check left behind.' };
@@ -77,7 +117,10 @@ const CHECKS = {
     });
     const merges = Boolean(updater);
     const call = updater && new RegExp(String.raw`(?:const|let|var)\s+(\w+)\s*=\s*${updater[1]}\s*\(([\s\S]{0,400}?)\);`).exec(t);
-    const falsyPatch = call && [/\bfalse\b/, /(?:^|\D)0(?:\D|$)/, /['"]{2}/].every(pattern => pattern.test(call[2]));
+    // The falsy values have to be in the patch: that is the argument whose
+    // explicit false/0/"" must override truthy existing settings.
+    const patch = call && (call[2].match(/,\s*(\{[\s\S]*\})\s*$/) || [])[1];
+    const falsyPatch = patch && [/\bfalse\b/, /(?:^|\D)0(?:\D|$)/, /['"]{2}/].every(pattern => pattern.test(patch));
     const assertions = t.split('\n').map(line => line.match(/(?:console\.)?assert\b.*|\bexpect\(.*|\bit\(.*/)?.[0]).filter(Boolean).join('\n');
     const perField = call && [
       new RegExp(String.raw`${call[1]}\.\w+\s*===?\s*false`, 'i'),
@@ -102,7 +145,7 @@ const CHECKS = {
     // the real one counts, so it has to come from node:events, not a local shim.
     const fromEvents = /(?:require\s*\(\s*['"](?:node:)?events['"]\s*\)|from\s+['"](?:node:)?events['"])/.test(t)
       && !/function\s+once\b|(?:const|let|var)\s+once\s*=/.test(t);
-    if (fromEvents && /\bonce\s*\(\s*\w+\s*,\s*['"]download['"]\s*,\s*\{[^}]{0,120}\bsignal\b/.test(t))
+    if (fromEvents && /(?:return|await|=>)\s*(?:\w+\.)?once\s*\(\s*\w+\s*,\s*['"]download['"]\s*,\s*\{[^}]{0,120}\bsignal\b/.test(t))
       return { pass: true, reason: 'Delegates the whole lifecycle to the abort-aware events.once helper.' };
     // An already-aborted signal never fires `abort`, so the guard has to run
     // before any listener is installed or the setup leaks both of them.
@@ -146,8 +189,15 @@ const CHECKS = {
     const enforces = guard =>
       new RegExp(String.raw`${url}\.protocol\s*!==?\s*['"]https:['"]`, 'i').test(guard.clause)
       || new RegExp(String.raw`!\s*(?:allowedHosts|allowlist)\s*\.\s*(?:has|includes)\s*\(\s*${url}\.hostname\s*\)`, 'i').test(guard.clause);
-    const validates = new RegExp(String.raw`(?:^|[;}\n])\s*(?:await\s+)?(?:validate|assert|ensure|checkNetwork)\w*Url\s*\(\s*${url}\b`, 'im').exec(t);
-    const validations = [...clauses.filter(enforces), ...(validates ? [validates] : [])];
+    // A named validator only counts if its body actually rejects on a policy;
+    // `function validateWebhookUrl() { return true; }` revalidates nothing.
+    const validates = new RegExp(String.raw`(?:^|[;}\n])\s*(?:await\s+)?((?:validate|assert|ensure|checkNetwork)\w*Url)\s*\(\s*${url}\b`, 'im').exec(t);
+    const validator = validates
+      && (new RegExp(String.raw`(?:function\s+${validates[1]}\s*\(|(?:const|let|var)\s+${validates[1]}\s*=)[\s\S]{0,400}`).exec(t) || [''])[0];
+    const enforcingValidator = validator
+      && /\bthrow\b|\breject\s*\(|\breturn\s+false\b/.test(validator)
+      && /\.protocol\b|\bhostname\b|allowedHosts|allowlist/.test(validator);
+    const validations = [...clauses.filter(enforces), ...(enforcingValidator ? [validates] : [])];
     const fetchCall = new RegExp(String.raw`\bfetch\s*\(\s*${url}\b([\s\S]{0,300})`).exec(t);
     // A followed redirect re-enters the network with a destination the policy
     // never saw, so the fetch has to refuse or hand back the 3xx itself.
@@ -162,7 +212,8 @@ const CHECKS = {
     const t = String(output || '');
     // The deadline has to reach the request, whether it is built inline, held in
     // a variable, or passed as a controller's signal.
-    const options = (/\bfetch\s*\([^,)]{0,120},\s*(\{[\s\S]{0,400}?\})/.exec(t) || ['', ''])[1];
+    const optionsAt = /\bfetch\s*\(\s*[^,()]{0,80},\s*\{/.exec(t);
+    const options = optionsAt ? blockAt(t, optionsAt.index) : '';
     const signalRef = /\bsignal\s*:\s*AbortSignal\.timeout\s*\(/.test(options)
       ? 'inline'
       : (/\bsignal\s*:\s*(\w+)\s*\.\s*signal\b/.exec(options)
@@ -171,16 +222,19 @@ const CHECKS = {
     const requestTimeout = signalRef === 'inline'
       || Boolean(signalRef && (new RegExp(String.raw`\b${signalRef}\s*=\s*AbortSignal\.timeout\s*\(`).test(t)
         || /setTimeout\s*\([\s\S]{0,240}\.abort\s*\(/.test(t)));
-    const loops = /getReader\s*\(|for\s+await\s*\(/.test(t);
-    const evented = /\.on\s*\(\s*['"]data['"]/.test(t);
-    const counter = t.match(/\b([A-Za-z_$]\w*)\s*\+=\s*[^;\n]*(?:byteLength|length)/);
-    const limitBranch = counter && new RegExp(String.raw`if\s*\([^\n]{0,240}${counter[1]}\s*>=?\s*[A-Za-z_$]\w*[^\n]{0,240}?\)\s*(\{[^}]{0,240}\}|[^\n]{0,160})`, 'i').exec(t);
+    // Everything below is graded inside the loop that consumes the stream:
+    // buffering the whole body first and counting afterwards is no ceiling.
+    const consumer = streamConsumer(t);
+    const scope = consumer ? consumer.body : '';
+    const evented = Boolean(consumer && /['"]data['"]/.test(consumer.header));
+    const counter = scope.match(/\b([A-Za-z_$]\w*)\s*\+=\s*[^;\n]*(?:byteLength|length)/);
+    const limitBranch = counter && new RegExp(String.raw`if\s*\([^\n]{0,240}${counter[1]}\s*>=?\s*[A-Za-z_$]\w*[^\n]{0,240}?\)\s*(\{[^}]{0,240}\}|[^\n]{0,160})`, 'i').exec(scope);
     // `return` exits one data callback but leaves an evented stream flowing, so
     // the over-limit path has to tear the stream down too.
     const stops = limitBranch && /\bthrow\b|\breturn\b/.test(limitBranch[1])
-      && (loops || /\b(?:destroy|abort|cancel|unpipe)\s*\(/.test(limitBranch[1]));
-    const writeAfterLimit = stops && /(?:\bwrite\s*\(|\.write\s*\(|writeFile\s*\()/.test(t.slice(limitBranch.index + limitBranch[0].length));
-    return requestTimeout && (loops || evented) && counter && writeAfterLimit
+      && (!evented || /\b(?:destroy|abort|cancel|unpipe)\s*\(/.test(limitBranch[1]));
+    const writeAfterLimit = stops && /(?:\bwrite\s*\(|\.write\s*\(|writeFile\s*\()/.test(scope.slice(limitBranch.index + limitBranch[0].length));
+    return requestTimeout && writeAfterLimit
       ? { pass: true, reason: 'Bounds remote work by time and an enforced streaming byte ceiling.' }
       : { pass: false, reason: 'Remote work lacks a time limit or enforced streaming byte ceiling.' };
   },
