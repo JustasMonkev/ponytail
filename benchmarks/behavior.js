@@ -57,7 +57,7 @@ function suiteAt(text, index) {
 // bytes in a later pass over a buffered array is not a ceiling.
 function streamConsumer(text) {
   return [...text.matchAll(/(?:while\s*\([^)]{0,80}\)|for\s+await\s*\([^)]{0,120}\)|\.on\s*\(\s*['"]data['"]\s*,[^{]{0,60})\s*\{/g)]
-    .map(match => ({ header: match[0], body: blockAt(text, match.index + match[0].length - 1) }))
+    .map(match => ({ index: match.index, header: match[0], body: blockAt(text, match.index + match[0].length - 1) }))
     .find(loop => /\.read\s*\(/.test(loop.body) || /for\s+await|['"]data['"]/.test(loop.header));
 }
 
@@ -122,7 +122,8 @@ const CHECKS = {
       ...t.matchAll(/function\s+(\w+)\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)/g),
       ...t.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*=>/g),
     ].filter(match => match[1] === 'updateSettings').find(match => {
-      const body = t.slice(match.index, match.index + 500);
+      const block = blockAt(t, match.index);
+      const body = block ? t.slice(match.index, t.indexOf('{', match.index) + block.length) : '';
       return new RegExp(String.raw`(?:\breturn|=>)\s*\(?\s*\{\s*\.\.\.${match[2]}\s*,\s*\.\.\.${match[3]}\s*\}`, 'i').test(body)
         || new RegExp(String.raw`(?:\breturn|=>)\s*Object\.assign\s*\(\s*\{\s*\}\s*,\s*${match[2]}\s*,\s*${match[3]}\s*\)`, 'i').test(body);
     });
@@ -155,12 +156,19 @@ const CHECKS = {
 
   // Cancellation must remove every listener it installed, not just reject.
   lifecycle(output) {
-    const t = String(output || '');
+    const whole = String(output || '');
+    // Everything below is graded inside waitForDownload itself: a guard in some
+    // other helper does not protect the listeners this function installs.
+    const implAt = /(?:function\s+waitForDownload\s*\(|(?:const|let|var)\s+waitForDownload\s*=)/.exec(whole);
+    const implBlock = implAt && blockAt(whole, implAt.index);
+    const t = implBlock
+      ? whole.slice(implAt.index, whole.indexOf('{', implAt.index) + implBlock.length)
+      : whole;
     // events.once(emitter, 'download', { signal }) is the platform's own answer:
     // it rejects a pre-aborted signal and removes its listeners either way. Only
     // the real one counts, so it has to come from node:events, not a local shim.
-    const fromEvents = /(?:require\s*\(\s*['"](?:node:)?events['"]\s*\)|from\s+['"](?:node:)?events['"])/.test(t)
-      && !/function\s+once\b|(?:const|let|var)\s+once\s*=/.test(t);
+    const fromEvents = /(?:require\s*\(\s*['"](?:node:)?events['"]\s*\)|from\s+['"](?:node:)?events['"])/.test(whole)
+      && !/function\s+once\b|(?:const|let|var)\s+once\s*=/.test(whole);
     if (fromEvents && /(?:return|await|=>)\s*(?:\w+\.)?once\s*\(\s*\w+\s*,\s*['"]download['"]\s*,\s*\{[^}]{0,120}\bsignal\b/.test(t))
       return { pass: true, reason: 'Delegates the whole lifecycle to the abort-aware events.once helper.' };
     // An already-aborted signal never fires `abort`, so the guard has to run
@@ -173,8 +181,10 @@ const CHECKS = {
     // 'abort', not by whether its name happens to say so.
     const aborts = /(\w+)\s*\.\s*addEventListener\s*\(\s*['"]abort['"]\s*,\s*(\w+)/.exec(t);
     const ownsDownload = /(\w+)\s*\.\s*(?:once|on|addListener)\s*\(\s*['"]download['"]\s*,\s*(\w+)/.exec(t);
-    const abortHandler = aborts && handlers.find(handler => handler.name === aborts[2] && /\breject\s*\(/.test(handler.body));
-    const downloadHandler = ownsDownload && handlers.find(handler => handler.name === ownsDownload[2] && /\bresolve\s*\(/.test(handler.body));
+    // Promise.reject() inside the handler settles nothing: the outer promise
+    // stays pending, so it has to be the executor's own reject callback.
+    const abortHandler = aborts && handlers.find(handler => handler.name === aborts[2] && /(?<![.\w])reject\s*\(/.test(handler.body));
+    const downloadHandler = ownsDownload && handlers.find(handler => handler.name === ownsDownload[2] && /(?<![.\w])resolve\s*\(/.test(handler.body));
     const cleanupName = abortHandler && downloadHandler
       && [...abortHandler.body.matchAll(/\b(\w+)\s*\(\s*\)/g)]
         .map(match => match[1])
@@ -255,29 +265,36 @@ const CHECKS = {
   // A remote response needs both a deadline and an enforced streaming byte ceiling.
   bounds(output) {
     const t = String(output || '');
-    // The deadline has to reach the request, whether it is built inline, held in
-    // a variable, or passed as a controller's signal.
-    const request = /\b(?:fetch|https?\.(?:get|request))\s*\(/.exec(t);
-    const optionsAt = /\b(?:fetch|https?\.(?:get|request))\s*\(\s*[^,()]{0,80},\s*\{/.exec(t);
-    const options = optionsAt ? blockAt(t, optionsAt.index) : '';
-    const signalRef = /\bsignal\s*:\s*AbortSignal\.timeout\s*\(/.test(options)
-      ? 'inline'
-      : (/\bsignal\s*:\s*(\w+)\s*\.\s*signal\b/.exec(options)
-        || /\bsignal\s*:\s*(\w+)/.exec(options)
-        || /\b(signal)\s*[,}]/.exec(options) || [])[1];
-    // The timer has to abort this request's own controller, and it has to be
-    // armed before the request: a timer set afterwards bounds nothing.
-    const armedBefore = pattern => {
-      const match = signalRef && new RegExp(pattern).exec(t);
-      return Boolean(match && request && match.index < request.index);
-    };
-    const requestTimeout = signalRef === 'inline'
-      || armedBefore(String.raw`\b${signalRef}\s*=\s*AbortSignal\.timeout\s*\(`)
-      || armedBefore(String.raw`setTimeout\s*\([\s\S]{0,240}\b${signalRef}\s*\.\s*abort\s*\(`);
     // Everything below is graded inside the loop that consumes the stream:
     // buffering the whole body first and counting afterwards is no ceiling.
     const consumer = streamConsumer(t);
     const scope = consumer ? consumer.body : '';
+    // The deadline has to belong to the request whose response that loop reads,
+    // not to some earlier bounded preliminary call, and it has to be armed
+    // before the request: a timer set afterwards bounds nothing.
+    const reads = consumer && t.slice(Math.max(0, consumer.index - 80), consumer.index) + consumer.body;
+    const timed = [...t.matchAll(/(?:(?:const|let|var)\s+(\w+)\s*=\s*)?(?:await\s+)?\b(?:fetch|https?\.(?:get|request))\s*\(/g)]
+      .filter(request => {
+        const options = blockAt(t, request.index).slice(0, 400);
+        const signalRef = /\bsignal\s*:\s*AbortSignal\.timeout\s*\(/.test(options)
+          ? 'inline'
+          : (/\bsignal\s*:\s*(\w+)\s*\.\s*signal\b/.exec(options)
+            || /\bsignal\s*:\s*(\w+)/.exec(options)
+            || /\b(signal)\s*[,}]/.exec(options) || [])[1];
+        const armedBefore = pattern => {
+          const match = new RegExp(pattern).exec(t);
+          return Boolean(match && match.index < request.index);
+        };
+        return signalRef === 'inline'
+          || Boolean(signalRef && (armedBefore(String.raw`\b${signalRef}\s*=\s*AbortSignal\.timeout\s*\(`)
+            || armedBefore(String.raw`setTimeout\s*\([\s\S]{0,240}\b${signalRef}\s*\.\s*abort\s*\(`)));
+      });
+    const requestTimeout = Boolean(reads && timed.some(request => {
+      const names = new Set([request[1]].filter(Boolean));
+      for (const binding of t.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*([\w.$]+)/g))
+        if (names.has(binding[2].split('.')[0])) names.add(binding[1]);
+      return [...names].some(name => new RegExp(String.raw`\b${name}\b`).test(reads));
+    }));
     const evented = Boolean(consumer && /['"]data['"]/.test(consumer.header));
     const counter = scope.match(/\b([A-Za-z_$]\w*)\s*\+=\s*[^;\n]*(?:byteLength|length)/);
     const limitBranch = counter && new RegExp(String.raw`if\s*\([^\n]{0,240}${counter[1]}\s*>=?\s*[\w.$]+(?:\s*[*+]\s*[\w.$]+)*[^\n]{0,240}?\)\s*(\{[^}]{0,240}\}|[^\n]{0,160})`, 'i').exec(scope);
@@ -285,9 +302,12 @@ const CHECKS = {
     // the over-limit path has to tear the stream down too.
     // The chunk has to be counted before it is judged, or the last oversized one
     // slips through and the stream ends without ever tripping the limit.
+    // An oversized response is a failure, not a short file: a bare `return`
+    // resolves with a truncated download. Evented streams fail by destroy(err).
     const stops = limitBranch && counter.index < limitBranch.index
-      && /\bthrow\b|\breturn\b/.test(limitBranch[1])
-      && (!evented || /\b(?:destroy|abort|cancel|unpipe)\s*\(/.test(limitBranch[1]));
+      && (evented
+        ? /\b(?:destroy|abort|cancel)\s*\(\s*new\s+\w*Error|(?<![.\w])reject\s*\(/.test(limitBranch[1])
+        : /\bthrow\b|(?<![.\w])reject\s*\(/.test(limitBranch[1]));
     // The write has to be of the chunk just counted, and only after the guard:
     // an unrelated log write past the branch is not the destination write.
     const chunk = (scope.match(/\{[^}]{0,40}\b(?!done\b)(\w+)\s*\}\s*=\s*await\s+\w+\s*\.\s*read\s*\(/)

@@ -256,6 +256,16 @@ test('contracts: a correct sibling merger does not fix updateSettings', () => {
   assert.equal(r.pass, false);
 });
 
+test('contracts: a sibling merge does not count as the updater body', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(existing, changes) {\n' +
+    '  return { theme: changes.theme || "light" };\n}\n' +
+    'function mergeSettings(existing, changes) {\n  return { ...existing, ...changes };\n}\n' +
+    'const result = updateSettings({ enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
+    'console.assert(result.enabled === false && result.retries === 0 && result.label === "");\n```');
+  assert.equal(r.pass, false);
+});
+
 // --- lifecycle: cancellation owns listener cleanup ---
 
 test('lifecycle: abort and listener cleanup pass', () => {
@@ -313,6 +323,29 @@ test('lifecycle: a neutrally named abort handler passes', () => {
     '  const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", onCancel); };\n' +
     '  emitter.once("download", done); signal.addEventListener("abort", onCancel);\n});\n```');
   assert.equal(r.pass, true);
+});
+
+test('lifecycle: a pre-abort guard in another helper does not count', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction assertLive(signal) { signal.throwIfAborted(); }\n' +
+    'function waitForDownload(emitter, signal) {\n' +
+    '  return new Promise((resolve, reject) => {\n' +
+    '    const aborted = () => { cleanup(); reject(signal.reason); };\n' +
+    '    const done = value => { cleanup(); resolve(value); };\n' +
+    '    const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+    '    emitter.once("download", done); signal.addEventListener("abort", aborted);\n  });\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('lifecycle: an abort handler using Promise.reject fails', () => {
+  const r = check('lifecycle',
+    '```javascript\nreturn new Promise((resolve, reject) => {\n' +
+    '  if (signal.aborted) return reject(signal.reason);\n' +
+    '  const aborted = () => { cleanup(); return Promise.reject(signal.reason); };\n' +
+    '  const done = value => { cleanup(); resolve(value); };\n' +
+    '  const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+    '  emitter.once("download", done); signal.addEventListener("abort", aborted);\n});\n```');
+  assert.equal(r.pass, false);
 });
 
 test('lifecycle: cleanup of unrelated listeners fails', () => {
@@ -738,6 +771,25 @@ test('bounds: writing the chunk before the guard fails', () => {
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
     '  await file.write(value);\n  if (received > MAX_BYTES) throw new Error("too large");\n' +
     '  log.write("chunk done");\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a bounded probe does not bound the unbounded report request', () => {
+  const r = check('bounds',
+    '```javascript\nawait fetch(metaUrl, { signal: AbortSignal.timeout(2_000) });\n' +
+    'const response = await fetch(url);\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: returning a truncated download instead of failing fails', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+    '  if (received > MAX_BYTES) { await reader.cancel(); return; }\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, false);
 });
 
