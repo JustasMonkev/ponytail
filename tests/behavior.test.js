@@ -232,6 +232,15 @@ test('contracts: structural assertion on the call itself passes', () => {
   assert.equal(r.pass, true);
 });
 
+test('contracts: arrow-function updater passes', () => {
+  const r = check('contracts',
+    '```javascript\nconst updateSettings = (existing, changes) => ({ ...existing, ...changes });\n' +
+    'assert.deepStrictEqual(\n' +
+    '  updateSettings({ enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" }),\n' +
+    '  { enabled: false, retries: 0, label: "" },\n);\n```');
+  assert.equal(r.pass, true);
+});
+
 // --- lifecycle: cancellation owns listener cleanup ---
 
 test('lifecycle: abort and listener cleanup pass', () => {
@@ -277,6 +286,17 @@ test('lifecycle: function-declared abort handler passes', () => {
     '  function done(value) { cleanup(); resolve(value); }\n' +
     '  function cleanup() { emitter.off("download", done); signal.removeEventListener("abort", onAbort); }\n' +
     '  emitter.once("download", done); signal.addEventListener("abort", onAbort, { once: true });\n});\n```');
+  assert.equal(r.pass, true);
+});
+
+test('lifecycle: a neutrally named abort handler passes', () => {
+  const r = check('lifecycle',
+    '```javascript\nreturn new Promise((resolve, reject) => {\n' +
+    '  if (signal.aborted) return reject(signal.reason);\n' +
+    '  const onCancel = () => { cleanup(); reject(signal.reason); };\n' +
+    '  const done = value => { cleanup(); resolve(value); };\n' +
+    '  const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", onCancel); };\n' +
+    '  emitter.once("download", done); signal.addEventListener("abort", onCancel);\n});\n```');
   assert.equal(r.pass, true);
 });
 
@@ -419,6 +439,24 @@ test('revalidate: an inverted validator policy fails', () => {
     'const saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\nvalidateWebhookUrl(url);\n' +
     'await fetch(url, { redirect: "error" });\n```');
   assert.equal(r.pass, false);
+});
+
+test('revalidate: a policy guard in an uncalled helper fails', () => {
+  const r = check('revalidate',
+    '```javascript\nfunction unused(url) {\n' +
+    '  if (url.protocol !== "https:") throw new Error("bad");\n}\n' +
+    'const saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'await fetch(url, { redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: guard and fetch inside the same function passes', () => {
+  const r = check('revalidate',
+    '```javascript\nasync function postWebhook(text, body) {\n' +
+    '  const saved = JSON.parse(text);\n  const url = new URL(saved.webhook);\n' +
+    '  if (url.protocol !== "https:") throw new Error("bad");\n' +
+    '  await fetch(url, { method: "POST", body, redirect: "error" });\n}\n```');
+  assert.equal(r.pass, true);
 });
 
 test('revalidate: direct use of persisted URL fails', () => {
@@ -619,6 +657,26 @@ test('bounds: checking the ceiling before counting the chunk fails', () => {
     '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n' +
     '  received += value.byteLength;\n}\n```');
   assert.equal(r.pass, false);
+});
+
+test('bounds: a timer armed after the request does not bound it', () => {
+  const r = check('bounds',
+    '```javascript\nconst controller = new AbortController();\n' +
+    'const response = await fetch(url, { signal: controller.signal });\n' +
+    'setTimeout(() => controller.abort(), 10_000);\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a literal byte ceiling passes', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+    '  if (received > 10 * 1024 * 1024) throw new Error("too large");\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, true);
 });
 
 test('bounds: unbounded fetch fails', () => {

@@ -112,10 +112,13 @@ const CHECKS = {
     const t = codeOf(output);
     // Parameter names are not part of the contract; find the two-arg function
     // that actually returns the merge, whatever its parameters are called.
-    const updater = [...t.matchAll(/function\s+(\w+)\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)/g)].find(match => {
+    const updater = [
+      ...t.matchAll(/function\s+(\w+)\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)/g),
+      ...t.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*=>/g),
+    ].find(match => {
       const body = t.slice(match.index, match.index + 500);
-      return new RegExp(String.raw`\breturn\s*\{\s*\.\.\.${match[2]}\s*,\s*\.\.\.${match[3]}\s*\}\s*;?`, 'i').test(body)
-        || new RegExp(String.raw`\breturn\s+Object\.assign\s*\(\s*\{\s*\}\s*,\s*${match[2]}\s*,\s*${match[3]}\s*\)\s*;?`, 'i').test(body);
+      return new RegExp(String.raw`(?:\breturn|=>)\s*\(?\s*\{\s*\.\.\.${match[2]}\s*,\s*\.\.\.${match[3]}\s*\}`, 'i').test(body)
+        || new RegExp(String.raw`(?:\breturn|=>)\s*Object\.assign\s*\(\s*\{\s*\}\s*,\s*${match[2]}\s*,\s*${match[3]}\s*\)`, 'i').test(body);
     });
     const name = updater && updater[1];
     const assigned = name && new RegExp(String.raw`(?:const|let|var)\s+(\w+)\s*=\s*${name}\s*\(([\s\S]{0,400}?)\);`).exec(t);
@@ -160,8 +163,12 @@ const CHECKS = {
     const firstListener = /addEventListener\s*\(\s*['"]abort['"]|\.(?:once|on|addListener)\s*\(\s*['"]download['"]/.exec(t);
     const preAborted = Boolean(guard && firstListener && guard.index < firstListener.index);
     const handlers = namedFunctionBodies(t);
-    const abortHandler = handlers.find(handler => /abort/i.test(handler.name) && /\breject\s*\(/.test(handler.body));
-    const downloadHandler = handlers.find(handler => /\bresolve\s*\(/.test(handler.body));
+    // Which callback is the abort handler is decided by what was registered for
+    // 'abort', not by whether its name happens to say so.
+    const aborts = /(\w+)\s*\.\s*addEventListener\s*\(\s*['"]abort['"]\s*,\s*(\w+)/.exec(t);
+    const ownsDownload = /(\w+)\s*\.\s*(?:once|on|addListener)\s*\(\s*['"]download['"]\s*,\s*(\w+)/.exec(t);
+    const abortHandler = aborts && handlers.find(handler => handler.name === aborts[2] && /\breject\s*\(/.test(handler.body));
+    const downloadHandler = ownsDownload && handlers.find(handler => handler.name === ownsDownload[2] && /\bresolve\s*\(/.test(handler.body));
     const cleanupName = abortHandler && downloadHandler
       && [...abortHandler.body.matchAll(/\b(\w+)\s*\(\s*\)/g)]
         .map(match => match[1])
@@ -169,15 +176,11 @@ const CHECKS = {
     const cleanupHandler = cleanupName && handlers.find(handler => handler.name === cleanupName);
     // Removal has to happen on the object the listener was registered on;
     // otherEmitter.off(...) leaves the real listener installed.
-    const aborts = abortHandler
-      && new RegExp(`(\\w+)\\s*\\.\\s*addEventListener\\s*\\(\\s*['"]abort['"]\\s*,\\s*${abortHandler.name}\\b`).exec(t);
-    const ownsDownload = downloadHandler
-      && new RegExp(`(\\w+)\\s*\\.\\s*(?:once|on|addListener)\\s*\\(\\s*['"]download['"]\\s*,\\s*${downloadHandler.name}\\b`).exec(t);
-    const cleansAbort = cleanupHandler && aborts
+    const cleansAbort = cleanupHandler
       && new RegExp(`${aborts[1]}\\s*\\.\\s*removeEventListener\\s*\\(\\s*['"]abort['"]\\s*,\\s*${abortHandler.name}\\b`).test(cleanupHandler.body);
-    const cleansDownload = cleanupHandler && ownsDownload
+    const cleansDownload = cleanupHandler
       && new RegExp(`${ownsDownload[1]}\\s*\\.\\s*(?:off|removeListener)\\s*\\(\\s*['"]download['"]\\s*,\\s*${downloadHandler.name}\\b`).test(cleanupHandler.body);
-    return preAborted && aborts && ownsDownload && cleansAbort && cleansDownload
+    return preAborted && cleansAbort && cleansDownload
       ? { pass: true, reason: 'Owns pre-aborted cancellation and listener cleanup as one lifecycle.' }
       : { pass: false, reason: 'Missing pre-aborted cancellation, listener cleanup, or stale-completion protection.' };
   },
@@ -211,8 +214,20 @@ const CHECKS = {
       && new RegExp(String.raw`(?:function\s+${validates[1]}\s*\(\s*(\w+)|(?:const|let|var)\s+${validates[1]}\s*=\s*(?:async\s*)?\(?\s*(\w+))([\s\S]{0,400})`).exec(t);
     const enforcingValidator = definition
       && enforcing(definition[3], definition[1] || definition[2]).length > 0;
-    const validations = [...enforcing(t, url), ...(enforcingValidator ? [validates] : [])];
     const fetchCall = new RegExp(String.raw`\bfetch\s*\(\s*${url}\b([\s\S]{0,300})`).exec(t);
+    // An inline guard only protects the request if it runs on the way to it: a
+    // guard sitting in a helper the answer never calls protects nothing.
+    const bodies = [...t.matchAll(/(?:function\s*\w*\s*\([^)]*\)|=>)\s*\{/g)]
+      .map(match => t.indexOf('{', match.index + match[0].length - 1))
+      .map(open => ({ open, end: open + blockAt(t, open).length }))
+      .filter(range => range.end > range.open);
+    const reachesFetch = index => fetchCall
+      && bodies.every(range => index < range.open || index > range.end
+        || (fetchCall.index >= range.open && fetchCall.index <= range.end));
+    const validations = [
+      ...enforcing(t, url).filter(guard => reachesFetch(guard.index)),
+      ...(enforcingValidator ? [validates] : []),
+    ];
     // A followed redirect re-enters the network with a destination the policy
     // never saw, so the fetch has to refuse or hand back the 3xx itself.
     const boundsRedirects = fetchCall && /redirect\s*:\s*['"](?:manual|error)['"]/.test(fetchCall[1]);
@@ -233,17 +248,20 @@ const CHECKS = {
       : (/\bsignal\s*:\s*(\w+)\s*\.\s*signal\b/.exec(options)
         || /\bsignal\s*:\s*(\w+)/.exec(options)
         || /\b(signal)\s*[,}]/.exec(options) || [])[1];
+    // The timer has to abort this request's own controller, and it has to be
+    // armed before the request: a timer set afterwards bounds nothing.
+    const timer = signalRef
+      && new RegExp(String.raw`setTimeout\s*\([\s\S]{0,240}\b${signalRef}\s*\.\s*abort\s*\(`).exec(t);
     const requestTimeout = signalRef === 'inline'
       || Boolean(signalRef && (new RegExp(String.raw`\b${signalRef}\s*=\s*AbortSignal\.timeout\s*\(`).test(t)
-        // The timer has to abort the controller this request is actually using.
-        || new RegExp(String.raw`setTimeout\s*\([\s\S]{0,240}\b${signalRef}\s*\.\s*abort\s*\(`).test(t)));
+        || (timer && timer.index < t.search(/\bfetch\s*\(/))));
     // Everything below is graded inside the loop that consumes the stream:
     // buffering the whole body first and counting afterwards is no ceiling.
     const consumer = streamConsumer(t);
     const scope = consumer ? consumer.body : '';
     const evented = Boolean(consumer && /['"]data['"]/.test(consumer.header));
     const counter = scope.match(/\b([A-Za-z_$]\w*)\s*\+=\s*[^;\n]*(?:byteLength|length)/);
-    const limitBranch = counter && new RegExp(String.raw`if\s*\([^\n]{0,240}${counter[1]}\s*>=?\s*[A-Za-z_$]\w*[^\n]{0,240}?\)\s*(\{[^}]{0,240}\}|[^\n]{0,160})`, 'i').exec(scope);
+    const limitBranch = counter && new RegExp(String.raw`if\s*\([^\n]{0,240}${counter[1]}\s*>=?\s*[\w.$]+(?:\s*[*+]\s*[\w.$]+)*[^\n]{0,240}?\)\s*(\{[^}]{0,240}\}|[^\n]{0,160})`, 'i').exec(scope);
     // `return` exits one data callback but leaves an evented stream flowing, so
     // the over-limit path has to tear the stream down too.
     // The chunk has to be counted before it is judged, or the last oversized one
