@@ -137,8 +137,8 @@ test('contracts: merge plus falsy regression check passes', () => {
   const r = check('contracts',
     '```javascript\nfunction updateSettings(current, patch) {\n' +
     '  return { ...current, ...patch };\n}\n' +
-    'const result = updateSettings({ enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
-    'console.assert(result.enabled === false && result.retries === 0 && result.label === "");\n```');
+    'const result = updateSettings({ theme: "dark", enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
+    'console.assert(result.theme === "dark" && result.enabled === false && result.retries === 0 && result.label === "");\n```');
   assert.equal(r.pass, true);
 });
 
@@ -178,7 +178,7 @@ test('contracts: merge must be the updater result', () => {
     '```javascript\nfunction updateSettings(current, patch) {\n' +
     '  const merged = { ...current, ...patch };\n' +
     '  return { ...merged, label: patch.label || "default" };\n}\n' +
-    'const result = updateSettings({ enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
+    'const result = updateSettings({ theme: "dark", enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
     'console.assert(result.enabled === false && result.retries === 0 && result.label === "");\n```');
   assert.equal(r.pass, false);
 });
@@ -187,8 +187,8 @@ test('contracts: structural assertion on the result passes', () => {
   const r = check('contracts',
     '```javascript\nfunction updateSettings(current, patch) {\n' +
     '  return { ...current, ...patch };\n}\n' +
-    'const result = updateSettings({ enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
-    'assert.deepStrictEqual(result, {\n  enabled: false,\n  retries: 0,\n  label: "",\n});\n```');
+    'const result = updateSettings({ theme: "dark", enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
+    'assert.deepStrictEqual(result, {\n  theme: "dark",\n  enabled: false,\n  retries: 0,\n  label: "",\n});\n```');
   assert.equal(r.pass, true);
 });
 
@@ -196,7 +196,7 @@ test('contracts: structural assertion missing a falsy field fails', () => {
   const r = check('contracts',
     '```javascript\nfunction updateSettings(current, patch) {\n' +
     '  return { ...current, ...patch };\n}\n' +
-    'const result = updateSettings({ enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
+    'const result = updateSettings({ theme: "dark", enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
     'assert.deepStrictEqual(result, { enabled: false, retries: 0, label: "old" });\n```');
   assert.equal(r.pass, false);
 });
@@ -214,8 +214,8 @@ test('contracts: any two-parameter updater signature passes', () => {
   const r = check('contracts',
     '```javascript\nfunction updateSettings(existing, changes) {\n' +
     '  return { ...existing, ...changes };\n}\n' +
-    'const result = updateSettings({ enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
-    'console.assert(result.enabled === false && result.retries === 0 && result.label === "");\n```');
+    'const result = updateSettings({ theme: "dark", enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
+    'console.assert(result.theme === "dark" && result.enabled === false && result.retries === 0 && result.label === "");\n```');
   assert.equal(r.pass, true);
 });
 
@@ -233,8 +233,8 @@ test('contracts: structural assertion on the call itself passes', () => {
     '```javascript\nfunction updateSettings(existing, changes) {\n' +
     '  return { ...existing, ...changes };\n}\n' +
     'assert.deepStrictEqual(\n' +
-    '  updateSettings({ enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" }),\n' +
-    '  { enabled: false, retries: 0, label: "" },\n);\n```');
+    '  updateSettings({ theme: "dark", enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" }),\n' +
+    '  { theme: "dark", enabled: false, retries: 0, label: "" },\n);\n```');
   assert.equal(r.pass, true);
 });
 
@@ -242,8 +242,8 @@ test('contracts: arrow-function updater passes', () => {
   const r = check('contracts',
     '```javascript\nconst updateSettings = (existing, changes) => ({ ...existing, ...changes });\n' +
     'assert.deepStrictEqual(\n' +
-    '  updateSettings({ enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" }),\n' +
-    '  { enabled: false, retries: 0, label: "" },\n);\n```');
+    '  updateSettings({ theme: "dark", enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" }),\n' +
+    '  { theme: "dark", enabled: false, retries: 0, label: "" },\n);\n```');
   assert.equal(r.pass, true);
 });
 
@@ -251,7 +251,7 @@ test('contracts: a correct sibling merger does not fix updateSettings', () => {
   const r = check('contracts',
     '```javascript\nfunction updateSettings(current, patch) { return { theme: patch.theme || "light" }; }\n' +
     'function mergeSettings(existing, changes) { return { ...existing, ...changes }; }\n' +
-    'const result = mergeSettings({ enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
+    'const result = mergeSettings({ theme: "dark", enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
     'console.assert(result.enabled === false && result.retries === 0 && result.label === "");\n```');
   assert.equal(r.pass, false);
 });
@@ -261,7 +261,16 @@ test('contracts: a sibling merge does not count as the updater body', () => {
     '```javascript\nfunction updateSettings(existing, changes) {\n' +
     '  return { theme: changes.theme || "light" };\n}\n' +
     'function mergeSettings(existing, changes) {\n  return { ...existing, ...changes };\n}\n' +
-    'const result = updateSettings({ enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
+    'const result = updateSettings({ theme: "dark", enabled: true, retries: 3, label: "old" }, { enabled: false, retries: 0, label: "" });\n' +
+    'console.assert(result.enabled === false && result.retries === 0 && result.label === "");\n```');
+  assert.equal(r.pass, false);
+});
+
+test('contracts: a check that never proves an untouched setting survives fails', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) {\n' +
+    '  current = {};\n  return { ...current, ...patch };\n}\n' +
+    'const result = updateSettings({ theme: "dark", enabled: true }, { enabled: false, retries: 0, label: "" });\n' +
     'console.assert(result.enabled === false && result.retries === 0 && result.label === "");\n```');
   assert.equal(r.pass, false);
 });
@@ -431,6 +440,36 @@ test('lifecycle: native once given a different signal fails', () => {
   assert.equal(r.pass, false);
 });
 
+test('lifecycle: a CommonJS-aliased native once passes', () => {
+  const r = check('lifecycle',
+    '```javascript\nconst { once: onceEvent } = require("node:events");\n' +
+    'const waitForDownload = (emitter, signal) => onceEvent(emitter, "download", { signal });\n```');
+  assert.equal(r.pass, true);
+});
+
+test('lifecycle: a renamed signal parameter still passes', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, abortSignal) {\n' +
+    '  return new Promise((resolve, reject) => {\n' +
+    '    if (abortSignal.aborted) return reject(abortSignal.reason);\n' +
+    '    const aborted = () => { cleanup(); reject(abortSignal.reason); };\n' +
+    '    const done = value => { cleanup(); resolve(value); };\n' +
+    '    const cleanup = () => { emitter.off("download", done); abortSignal.removeEventListener("abort", aborted); };\n' +
+    '    emitter.once("download", done); abortSignal.addEventListener("abort", aborted);\n  });\n}\n```');
+  assert.equal(r.pass, true);
+});
+
+test('lifecycle: handlers that never settle on their live path fail', () => {
+  const r = check('lifecycle',
+    '```javascript\nreturn new Promise((resolve, reject) => {\n' +
+    '  if (signal.aborted) return reject(signal.reason);\n' +
+    '  const aborted = () => { cleanup(); if (false) reject(signal.reason); };\n' +
+    '  const done = value => { cleanup(); if (false) resolve(value); };\n' +
+    '  const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+    '  emitter.once("download", done); signal.addEventListener("abort", aborted);\n});\n```');
+  assert.equal(r.pass, false);
+});
+
 test('lifecycle: a local once shim is not the native helper', () => {
   const r = check('lifecycle',
     '```javascript\nfunction once(emitter, event, options) {\n' +
@@ -553,6 +592,23 @@ test('revalidate: a native https POST passes', () => {
     'if (url.protocol !== "https:") throw new Error("bad");\n' +
     'const request = https.request(url, { method: "POST" });\nrequest.end(payload);\n```');
   assert.equal(r.pass, true);
+});
+
+test('revalidate: a policy guard in an unused sibling of the validator fails', () => {
+  const r = check('revalidate',
+    '```javascript\nfunction validateWebhookUrl(candidate) { return true; }\n' +
+    'function unused(candidate) { if (candidate.protocol !== "https:") throw new Error("bad"); }\n' +
+    'const saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\nvalidateWebhookUrl(url);\n' +
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: a POST with no payload fails', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'if (url.protocol !== "https:") throw new Error("bad");\n' +
+    'await fetch(url, { method: "POST", headers: { "x-body": "none" }, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
 });
 
 test('revalidate: direct use of persisted URL fails', () => {
@@ -829,6 +885,34 @@ test('bounds: a commented-out byte guard is not a ceiling', () => {
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
     '  // if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: tearing down an unrelated object does not stop the stream', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'let received = 0;\nresponse.on("data", chunk => {\n  received += chunk.length;\n' +
+    '  if (received > MAX_BYTES) { otherController.abort(new Error("too large")); return; }\n' +
+    '  file.write(chunk);\n});\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a timeout armed only in an uncalled helper fails', () => {
+  const r = check('bounds',
+    '```javascript\nlet signal;\nfunction unused() { signal = AbortSignal.timeout(10_000); }\n' +
+    'const response = await fetch(url, { signal });\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: an accumulator that never grows fails', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += 0 * value.byteLength;\n' +
+    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, false);
 });
 

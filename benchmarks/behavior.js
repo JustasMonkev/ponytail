@@ -53,6 +53,17 @@ function suiteAt(text, index) {
   return lines.slice(0, end < 0 ? lines.length : end + 1).join('\n');
 }
 
+// True when nothing but a function body containing `target` also contains
+// `index` — i.e. the two are on the same execution path, not stranded in an
+// uncalled helper.
+function sameScope(text, index, target) {
+  return [...text.matchAll(/(?:function\s*\w*\s*\([^)]*\)|=>)\s*\{/g)]
+    .map(match => text.indexOf('{', match.index + match[0].length - 1))
+    .map(open => ({ open, end: open + blockAt(text, open).length }))
+    .every(range => index < range.open || index > range.end
+      || (target >= range.open && target <= range.end));
+}
+
 // The loop or listener that actually consumes the response stream. Counting
 // bytes in a later pass over a buffered array is not a ceiling.
 function streamConsumer(text) {
@@ -147,9 +158,17 @@ const CHECKS = {
       new RegExp(String.raw`${assigned[1]}\.\w+\s*===?\s*0(?:\D|$)`),
       new RegExp(String.raw`${assigned[1]}\.\w+\s*===?\s*['"]{2}`),
     ].every(pattern => pattern.test(assertions));
+    const expected = onResult ? structural[3] : '';
     const checksFalsy = perField
-      || (onResult && [/:\s*false\b/, /:\s*0\b/, /:\s*(?:''|"")/].every(pattern => pattern.test(structural[3])));
-    return updater && falsyPatch && checksFalsy
+      || (onResult && [/:\s*false\b/, /:\s*0\b/, /:\s*(?:''|"")/].every(pattern => pattern.test(expected)));
+    // "without resetting existing settings" is half the contract: the check has
+    // to prove a setting the patch never mentions is still there afterwards.
+    const keysOf = object => [...String(object || '').matchAll(/(\w+)\s*:/g)].map(match => match[1]);
+    const untouched = keysOf(args && (args.match(/\(?\s*(\{[\s\S]*?\})\s*,/) || [])[1])
+      .filter(key => !keysOf(patch).includes(key));
+    const checksPreserved = untouched.some(key => new RegExp(String.raw`\b${key}\s*:`).test(expected)
+      || new RegExp(String.raw`\.${key}\b`).test(assertions));
+    return updater && falsyPatch && checksFalsy && checksPreserved
       ? { pass: true, reason: 'Preserves existing state and checks explicit falsy values.' }
       : { pass: false, reason: 'Does not prove state and explicit false/zero/empty values survive.' };
   },
@@ -171,7 +190,7 @@ const CHECKS = {
     const imported = /(?:const|let|var)\s*\{([^}]{0,160})\}\s*=\s*require\s*\(\s*['"](?:node:)?events['"]|import\s*\{([^}]{0,160})\}\s*from\s*['"](?:node:)?events['"]/.exec(whole);
     const namespace = /(?:const|let|var)\s+(\w+)\s*=\s*require\s*\(\s*['"](?:node:)?events['"]|import\s+(\w+)\s+from\s+['"](?:node:)?events['"]/.exec(whole);
     const alias = imported && (imported[1] || imported[2]).split(',')
-      .map(part => part.split(/\s+as\s+/).map(word => word.trim()))
+      .map(part => part.split(/\s+as\s+|:/).map(word => word.trim()))
       .find(pair => pair[0] === 'once');
     const onceName = alias ? alias[1] || alias[0]
       : namespace && `${namespace[1] || namespace[2]}\\.once`;
@@ -185,7 +204,7 @@ const CHECKS = {
       return { pass: true, reason: 'Delegates the whole lifecycle to the abort-aware events.once helper.' };
     // An already-aborted signal never fires `abort`, so the guard has to run
     // before any listener is installed or the setup leaks both of them.
-    const guard = /signal\.throwIfAborted\s*\(|throwIfAborted\s*\(\s*signal|if\s*\(\s*signal\??\.aborted\s*\)\s*(?:\{[^}]{0,160}(?:(?:return\s+)?reject\s*\(|\bthrow\b)|(?:return\s+)?reject\s*\(|throw\b)/.exec(t);
+    const guard = new RegExp(String.raw`${signalParam}\.throwIfAborted\s*\(|throwIfAborted\s*\(\s*${signalParam}|if\s*\(\s*${signalParam}\??\.aborted\s*\)\s*(?:\{[^}]{0,160}(?:(?:return\s+)?reject\s*\(|\bthrow\b)|(?:return\s+)?reject\s*\(|throw\b)`).exec(t);
     const firstListener = /addEventListener\s*\(\s*['"]abort['"]|\.(?:once|on|addListener)\s*\(\s*['"]download['"]/.exec(t);
     const preAborted = Boolean(guard && firstListener && guard.index < firstListener.index);
     const handlers = namedFunctionBodies(t);
@@ -195,8 +214,13 @@ const CHECKS = {
     const ownsDownload = /(\w+)\s*\.\s*(?:once|on|addListener)\s*\(\s*['"]download['"]\s*,\s*(\w+)/.exec(t);
     // Promise.reject() inside the handler settles nothing: the outer promise
     // stays pending, so it has to be the executor's own reject callback.
-    const abortHandler = aborts && handlers.find(handler => handler.name === aborts[2] && /(?<![.\w])reject\s*\(/.test(handler.body));
-    const downloadHandler = ownsDownload && handlers.find(handler => handler.name === ownsDownload[2] && /(?<![.\w])resolve\s*\(/.test(handler.body));
+    // ...and it has to run unconditionally: `if (false) reject(reason)` leaves
+    // the promise pending on the one path that matters.
+    const settles = (body, call) => body.split(';')
+      .some(statement => new RegExp(String.raw`(?<![.\w])${call}\s*\(`).test(statement)
+        && !/\bif\s*\(|\?|&&|\|\|/.test(statement));
+    const abortHandler = aborts && handlers.find(handler => handler.name === aborts[2] && settles(handler.body, 'reject'));
+    const downloadHandler = ownsDownload && handlers.find(handler => handler.name === ownsDownload[2] && settles(handler.body, 'resolve'));
     const cleanupName = abortHandler && downloadHandler
       && [...abortHandler.body.matchAll(/\b(\w+)\s*\(\s*\)/g)]
         .map(match => match[1])
@@ -239,38 +263,36 @@ const CHECKS = {
     // with the same polarity an inline guard would need.
     const validates = new RegExp(String.raw`(?:^|[;}\n])\s*(?:await\s+)?((?:validate|assert|ensure|checkNetwork)\w*Url)\s*\(\s*${url}\b`, 'im').exec(t);
     const definition = validates
-      && new RegExp(String.raw`(?:function\s+${validates[1]}\s*\(\s*(\w+)|(?:const|let|var)\s+${validates[1]}\s*=\s*(?:async\s*)?\(?\s*(\w+))([\s\S]{0,400})`).exec(t);
-    // A validator that only returns false is ignorable, and these callers do
+      && new RegExp(String.raw`(?:function\s+${validates[1]}\s*\(\s*(\w+)|(?:const|let|var)\s+${validates[1]}\s*=\s*(?:async\s*)?\(?\s*(\w+))`).exec(t);
+    // Only the invoked validator's own body counts — not whatever follows it.
+    // And a validator that returns false is ignorable, as these callers do
     // ignore it; requiring it to throw is what actually stops the request.
-    const enforcingValidator = definition
-      && /\bthrow\b|\breject\s*\(/.test(definition[3])
-      && enforcing(definition[3], definition[1] || definition[2]).length > 0;
+    const validatorBody = definition ? blockAt(t, definition.index) : '';
+    const enforcingValidator = Boolean(definition
+      && /\bthrow\b|\breject\s*\(/.test(validatorBody)
+      && enforcing(validatorBody, definition[1] || definition[2]).length > 0);
     // Every request to the persisted destination has to be guarded, not just the
     // first one: a safe HEAD probe followed by an unguarded POST is a bypass.
-    const requests = [...t.matchAll(/\b(fetch|https?\.(?:request|get))\s*\(\s*([^,)]{0,80}?)\s*[,)]/g)]
+    const requests = [...t.matchAll(/(?:(?:const|let|var)\s+(\w+)\s*=\s*)?(?:await\s+)?\b(fetch|https?\.(?:request|get))\s*\(\s*([^,)]{0,80}?)\s*[,)]/g)]
       .map(match => ({
         index: match.index,
-        native: match[1] !== 'fetch',
-        target: match[2],
+        handle: match[1],
+        native: match[2] !== 'fetch',
+        target: match[3],
         options: blockAt(t, match.index).slice(0, 400),
       }));
     if (requests.some(request => request.target.startsWith(parsed[2]))) return fail;
     const urlRequests = requests.filter(request => request.target === url);
     // The task is to POST a payload: a guarded GET never performs the operation
-    // whose trust boundary this probe is measuring.
+    // whose trust boundary this probe is measuring, and an `x-body` header is
+    // not a payload — it has to be a real body option or a write on the request.
     const fetchCall = urlRequests.find(request => /method\s*:\s*['"]POST['"]/i.test(request.options)
-      && (/\bbody\b/.test(request.options) || /\.\s*(?:write|end)\s*\(/.test(t.slice(request.index))));
+      && (/\bbody\s*(?::|[,}])/.test(request.options)
+        || (request.handle && new RegExp(String.raw`\b${request.handle}\s*\.\s*(?:write|end)\s*\(\s*\w`).test(t))));
     // An inline guard only protects the request if it runs on the way to it: a
     // guard sitting in a helper the answer never calls protects nothing.
-    const bodies = [...t.matchAll(/(?:function\s*\w*\s*\([^)]*\)|=>)\s*\{/g)]
-      .map(match => t.indexOf('{', match.index + match[0].length - 1))
-      .map(open => ({ open, end: open + blockAt(t, open).length }))
-      .filter(range => range.end > range.open);
-    const reachesFetch = index => fetchCall
-      && bodies.every(range => index < range.open || index > range.end
-        || (fetchCall.index >= range.open && fetchCall.index <= range.end));
     const validations = [
-      ...enforcing(t, url).filter(guard => reachesFetch(guard.index)),
+      ...enforcing(t, url).filter(guard => fetchCall && sameScope(t, guard.index, fetchCall.index)),
       ...(enforcingValidator ? [validates] : []),
     ];
     // A followed redirect re-enters the network with a destination the policy
@@ -303,22 +325,30 @@ const CHECKS = {
           : (/\bsignal\s*:\s*(\w+)\s*\.\s*signal\b/.exec(options)
             || /\bsignal\s*:\s*(\w+)/.exec(options)
             || /\b(signal)\s*[,}]/.exec(options) || [])[1];
+        // The initializer has to run on the way to this request, not sit in an
+        // uncalled helper that leaves `signal` undefined when the request fires.
         const armedBefore = pattern => {
           const match = new RegExp(pattern).exec(t);
-          return Boolean(match && match.index < request.index);
+          return Boolean(match && match.index < request.index
+            && sameScope(t, match.index, request.index));
         };
         return signalRef === 'inline'
           || Boolean(signalRef && (armedBefore(String.raw`\b${signalRef}\s*=\s*AbortSignal\.timeout\s*\(`)
             || armedBefore(String.raw`setTimeout\s*\([\s\S]{0,240}\b${signalRef}\s*\.\s*abort\s*\(`)));
       });
+    let stream = [];
     const requestTimeout = Boolean(reads && timed.some(request => {
       const names = new Set([request[1]].filter(Boolean));
       for (const binding of t.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*([\w.$]+)/g))
         if (names.has(binding[2].split('.')[0])) names.add(binding[1]);
-      return [...names].some(name => new RegExp(String.raw`\b${name}\b`).test(reads));
+      if (![...names].some(name => new RegExp(String.raw`\b${name}\b`).test(reads))) return false;
+      stream = [...names];
+      return true;
     }));
     const evented = Boolean(consumer && /['"]data['"]/.test(consumer.header));
-    const counter = scope.match(/\b([A-Za-z_$]\w*)\s*\+=\s*[^;\n]*(?:byteLength|length)/);
+    // The accumulator has to add the chunk's actual size: `+= 0 * n` and
+    // `+= -n` count bytes that never reach the ceiling.
+    const counter = scope.match(/\b([A-Za-z_$]\w*)\s*\+=\s*([\w.$]+\.(?:byteLength|length))\s*[;\n]/);
     const limitBranch = counter && new RegExp(String.raw`if\s*\([^\n]{0,240}${counter[1]}\s*>=?\s*[\w.$]+(?:\s*[*+]\s*[\w.$]+)*[^\n]{0,240}?\)\s*(\{[^}]{0,240}\}|[^\n]{0,160})`, 'i').exec(scope);
     // `return` exits one data callback but leaves an evented stream flowing, so
     // the over-limit path has to tear the stream down too.
@@ -328,7 +358,8 @@ const CHECKS = {
     // resolves with a truncated download. Evented streams fail by destroy(err).
     const stops = limitBranch && counter.index < limitBranch.index
       && (evented
-        ? /\b(?:destroy|abort|cancel)\s*\(\s*new\s+\w*Error|(?<![.\w])reject\s*\(/.test(limitBranch[1])
+        ? (stream.length > 0
+          && new RegExp(String.raw`\b(?:${stream.join('|')})[\w.$]*\s*\.\s*(?:destroy|abort|cancel)\s*\(\s*new\s+\w*Error`).test(limitBranch[1]))
         : /\bthrow\b|(?<![.\w])reject\s*\(/.test(limitBranch[1]));
     // The write has to be of the chunk just counted, and only after the guard:
     // an unrelated log write past the branch is not the destination write.
