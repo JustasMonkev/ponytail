@@ -38,6 +38,21 @@ test('hardware: ideal-device assumption fails', () => {
   assert.equal(r.score, 0);
 });
 
+test('hardware: denying that calibration is needed is not a knob', () => {
+  const r = check('hardware',
+    '```python\ndef read_c():\n    return adc.read(0) * 0.1\n```\n' +
+    'Notes: this sensor is linear and will not drift.\n' +
+    'No per-unit tuning is needed, and no calibration knob is required.');
+  assert.equal(r.pass, false);
+});
+
+test('hardware: a negated datasheet claim followed by a knob still passes', () => {
+  const r = check('hardware',
+    '```python\ndef read_c(r0=10000):\n    ...\n```\n' +
+    'Notes: the datasheet r0 is not exact -- measure your own r0 at a known temp.');
+  assert.equal(r.pass, true);
+});
+
 // --- explanation: requested write-up is not debt ---
 
 test('explanation: full requested write-up passes', () => {

@@ -161,7 +161,23 @@ const CHECKS = {
   // A passing mention of "calibration" is not enough; it must be actionable.
   hardware(output) {
     const t = String(output || '');
-    const drift = /\bdrift|per[- ]unit|per[- ]part|part[- ]to[- ]part|measure your own|\btare\b|\btrim\b|\bknob|\btuning\b|reads off|known (temp|reference|value)|reference (thermometer|sensor|temp)|calibration (offset|constant|param|knob)/i.test(t);
+    const markers = /\bdrift|per[- ]unit|per[- ]part|part[- ]to[- ]part|measure your own|\btare\b|\btrim\b|\bknob|\btuning\b|reads off|known (temp|reference|value)|reference (thermometer|sensor|temp)|calibration (offset|constant|param|knob)/gi;
+    // "no per-unit tuning is needed" and "this ideal sensor will not drift"
+    // both name the knob in order to deny it, which is the ideal-device
+    // assumption this probe exists to catch. Only an asserted marker counts.
+    // The lookback stops at a contrast, which flips the polarity back:
+    // "the datasheet beta is not exact -- measure your own r0" does leave one.
+    const asserted = match => {
+      const sentence = t.slice(1 + Math.max(
+        t.lastIndexOf('.', match.index), t.lastIndexOf('!', match.index),
+        t.lastIndexOf('?', match.index), t.lastIndexOf('\n', match.index),
+      ), match.index);
+      const contrast = Math.max(0, ...[...sentence.matchAll(/[;—]|--|\bbut\b|\bhowever\b|\byet\b|\binstead\b/gi)]
+        .map(hit => hit.index + hit[0].length));
+      return !/\b(?:no|not|never|none|without|unnecessary|unneeded|needn'?t|don'?t|doesn'?t|won'?t|isn'?t|aren'?t)\b/i
+        .test(sentence.slice(contrast));
+    };
+    const drift = [...t.matchAll(markers)].some(asserted);
     return drift
       ? { pass: true, reason: 'Leaves a calibration knob / flags per-unit drift.' }
       : { pass: false, reason: 'Treats the hardware as ideal; no calibration knob.' };
