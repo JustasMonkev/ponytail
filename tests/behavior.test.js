@@ -1234,6 +1234,160 @@ test('bounds: unbounded fetch fails', () => {
   assert.equal(r.pass, false);
 });
 
+// --- comments are not behavior, but strings are not comments ---
+
+test('contracts: a block-commented check is not a runnable one', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) { return { ...current, ...patch }; }\n' +
+    '/* const result = updateSettings({ theme: "dark", sound: true, label: "x" },\n' +
+    '  { sound: false, volume: 0, label: "" });\n' +
+    'console.assert(result.sound === false); console.assert(result.volume === 0);\n' +
+    'console.assert(result.label === ""); console.assert(result.theme === "dark"); */\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: a block-commented policy guard is not a guard', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    '/* if (url.protocol !== "https:") throw new Error("invalid webhook"); */\n' +
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a trailing-comment byte guard is not a ceiling', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+    '  await file.write(value); // if (received > MAX_BYTES) throw new Error("too large");\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: a policy guard quoting "//" in a URL still counts', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'if (url.protocol !== "https:") throw new Error("expected https://host form");\n' +
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, true);
+});
+
+// --- structure, not formatting: balanced bodies and optional semicolons ---
+
+test('lifecycle: a nested object before cleanup does not truncate the handler', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, signal) {\n' +
+    '  return new Promise((resolve, reject) => {\n' +
+    '    if (signal.aborted) return reject(signal.reason);\n' +
+    '    const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+    '    const done = value => { const result = { value, at: Date.now() }; cleanup(); resolve(result); };\n' +
+    '    const aborted = () => { const reason = { cause: signal.reason }; cleanup(); reject(reason); };\n' +
+    '    emitter.once("download", done); signal.addEventListener("abort", aborted, { once: true });\n' +
+    '  });\n}\n```');
+  assert.equal(r.pass, true);
+});
+
+test('contracts: a semicolonless result assignment still binds the result', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) { return { ...current, ...patch } }\n' +
+    'const result = updateSettings({ theme: "dark", sound: true, label: "x" },\n' +
+    '  { sound: false, volume: 0, label: "" })\n' +
+    'console.assert(result.sound === false)\nconsole.assert(result.volume === 0)\n' +
+    'console.assert(result.label === "")\nconsole.assert(result.theme === "dark")\n```');
+  assert.equal(r.pass, true);
+});
+
+// --- every path, every request ---
+
+test('contracts: a conditional non-literal reset before the merge drops state', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) {\n' +
+    '  if (patch.reset) return defaults();\n  return { ...current, ...patch };\n}\n' +
+    'const result = updateSettings({ theme: "dark", sound: true, label: "x" },\n' +
+    '  { sound: false, volume: 0, label: "" });\n' +
+    'console.assert(result.sound === false); console.assert(result.volume === 0);\n' +
+    'console.assert(result.label === ""); console.assert(result.theme === "dark");\n```');
+  assert.equal(r.pass, false);
+});
+
+test('contracts: an early return of the existing settings still merges every patch', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) {\n' +
+    '  if (!patch) return current;\n  return { ...current, ...patch };\n}\n' +
+    'const result = updateSettings({ theme: "dark", sound: true, label: "x" },\n' +
+    '  { sound: false, volume: 0, label: "" });\n' +
+    'console.assert(result.sound === false); console.assert(result.volume === 0);\n' +
+    'console.assert(result.label === ""); console.assert(result.theme === "dark");\n```');
+  assert.equal(r.pass, true);
+});
+
+test('lifecycle: a synchronous throwIfAborted breaks the promise contract', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, signal) {\n' +
+    '  signal.throwIfAborted();\n' +
+    '  return new Promise((resolve, reject) => {\n' +
+    '    const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+    '    const done = value => { cleanup(); resolve(value); };\n' +
+    '    const aborted = () => { cleanup(); reject(signal.reason); };\n' +
+    '    emitter.once("download", done); signal.addEventListener("abort", aborted);\n' +
+    '  });\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('lifecycle: an async throwIfAborted still returns a rejected promise', () => {
+  const r = check('lifecycle',
+    '```javascript\nasync function waitForDownload(emitter, signal) {\n' +
+    '  signal.throwIfAborted();\n' +
+    '  return new Promise((resolve, reject) => {\n' +
+    '    const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+    '    const done = value => { cleanup(); resolve(value); };\n' +
+    '    const aborted = () => { cleanup(); reject(signal.reason); };\n' +
+    '    emitter.once("download", done); signal.addEventListener("abort", aborted);\n' +
+    '  });\n}\n```');
+  assert.equal(r.pass, true);
+});
+
+test('revalidate: mutating the cleared URL through an alias bypasses the policy', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'if (url.protocol !== "https:") throw new Error("invalid webhook");\n' +
+    'const alias = url;\nalias.protocol = "http:";\n' +
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a timeout armed only in a branch does not bound the request', () => {
+  const r = check('bounds',
+    '```javascript\nlet controller;\nif (enforceDeadline) {\n' +
+    '  controller = new AbortController();\n  setTimeout(() => controller.abort(), 10000);\n}\n' +
+    'const response = await fetch(url, { signal: controller.signal });\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a bounded request in another function does not bound this reader', () => {
+  const r = check('bounds',
+    '```javascript\nasync function probe(url) {\n' +
+    '  const response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+    '  return response.status;\n}\n' +
+    'async function download(url, file) {\n' +
+    '  const response = await fetch(url);\n' +
+    '  const reader = response.body.getReader();\n  let received = 0;\n  while (true) {\n' +
+    '    const { done, value } = await reader.read(); if (done) break;\n    received += value.byteLength;\n' +
+    '    if (received > MAX_BYTES) throw new Error("too large");\n    await file.write(value);\n  }\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a conjunction that disables the byte ceiling fails', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+    '  if (received > MAX_BYTES && strictMode) throw new Error("too large");\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
 // --- unknown probe is skipped, not failed ---
 
 test('unknown probe is skipped', () => {
