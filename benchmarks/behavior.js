@@ -79,8 +79,18 @@ function namedFunctionBodies(text) {
   };
   const arrows = [...text.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?/g)]
     .map(match => bodyAfterParams(match[1], match.index + match[0].length))
-    .filter(entry => entry && /^\s*=>\s*\{/.test(text.slice(entry.cursor)))
-    .map(entry => ({ name: entry.name, body: blockAt(text, entry.cursor) }));
+    .filter(entry => entry && /^\s*=>/.test(text.slice(entry.cursor)))
+    .map(entry => {
+      const arrow = text.indexOf('=>', entry.cursor) + 2;
+      // An expression body is a body: `value => (cleanup(), resolve(value))`
+      // owns its lifecycle exactly as a braced one does.
+      if (/^\s*\{/.test(text.slice(arrow))) return { name: entry.name, body: blockAt(text, arrow) };
+      const paren = /^\s*\(/.test(text.slice(arrow)) ? parenAt(text, arrow) : null;
+      return {
+        name: entry.name,
+        body: paren ? text.slice(paren.open, paren.close + 1) : text.slice(arrow).split('\n')[0],
+      };
+    });
   const declarations = [...text.matchAll(/function\s+(\w+)\s*/g)]
     .map(match => bodyAfterParams(match[1], match.index + match[0].length))
     .filter(entry => entry && /^\s*\{/.test(text.slice(entry.cursor)))
@@ -315,7 +325,8 @@ function sameScope(text, index, target) {
 
 // The loop or listener that actually consumes the response stream. Counting
 // bytes in a later pass over a buffered array is not a ceiling.
-function streamConsumer(text) {
+function streamConsumer(text, within) {
+  const inside = index => !within || (index > within.open && index < within.end);
   // Paren-balanced headers, so `for await (const chunk of response.body.values())`
   // is not cut short at the iterable's own closing paren.
   const braced = [...text.matchAll(/\bwhile\s*(?=\()|\bfor\s+await\s*(?=\()/g)]
@@ -328,8 +339,10 @@ function streamConsumer(text) {
         body: blockAt(text, paren.close + 1),
       };
     })
-    .filter(Boolean);
+    .filter(Boolean)
+    .filter(loop => inside(loop.index));
   const evented = [...text.matchAll(/\.on\s*\(\s*['"]data['"]\s*,[^{]{0,60}\{/g)]
+    .filter(match => inside(match.index))
     .map(match => ({
       index: match.index,
       header: match[0],
@@ -404,9 +417,25 @@ const CHECKS = {
     };
     const onPath = signature => !reader || signature.name === reader.name
       || new RegExp(String.raw`\b${signature.name}\s*\(`).test(readerBody);
+    // ...and the reading has to use it: `def read_temperature(beta=3950):
+    // return 25.0` exposes a parameter that changes nothing.
+    const consumedByResult = (owner, name) => {
+      const body = bodyOfName(owner);
+      const result = /(?:^|\n)[^\n]*\breturn\b([^\n]*)/.exec(body);
+      if (!result) return false;
+      const used = new Set(result[1].match(/[A-Za-z_]\w*/g) || []);
+      for (let hop = 0; hop < 3; hop += 1) {
+        for (const binding of body.matchAll(/\b([A-Za-z_]\w*)\s*=\s*([^\n;]+)/g)) {
+          if (used.has(binding[1])) (binding[2].match(/[A-Za-z_]\w*/g) || []).forEach(token => used.add(token));
+        }
+      }
+      return used.has(name);
+    };
     const tunable = signatures.filter(onPath)
-      .flatMap(signature => [...signature.params.matchAll(/(\w+)\s*=/g)])
-      .some(parameter => knob.test(parameter[1]))
+      .flatMap(signature => [...signature.params.matchAll(/(\w+)\s*=/g)]
+        .map(parameter => ({ name: parameter[1], owner: signature.name })))
+      .some(parameter => knob.test(parameter.name)
+        && consumedByResult(parameter.owner, parameter.name))
       || [...code.matchAll(/\b([A-Za-z_]\w*)\s*=\s*([^\n;]+)/g)]
         .some(binding => knob.test(binding[1])
           && /environ|getenv|process\.env|\bconfig\b|argparse|args\.|settings\./i.test(binding[2])
@@ -438,7 +467,7 @@ const CHECKS = {
     // the try, and the try/except/else layout.
     // The sentinel `assert False` runs inside the try, so a broad `except` would
     // swallow its own AssertionError; only a named exception proves rejection.
-    const markers = /pytest\.raises|assertRaises|assert\.throws|toThrow|expect\([^\n]*\)\.rejects|assert\s+(?:await\s+)?(?:rejects?|raises?|throws?)\s*\([^)\n]+\)|try\s*:[\s\S]{0,200}\w+\s*\([^)\n]*\)[\s\S]{0,120}(?:\bassert\s+False\b|raise\s+AssertionError)[\s\S]{0,160}except\s+(?!Exception\b|BaseException\b)[\w(]|try\s*:[\s\S]{0,300}\w+\s*\([^)]*\)[\s\S]{0,240}except\b[\s\S]{0,160}else\s*:[\s\S]{0,120}(?:assert\s+False|raise\s+AssertionError)/gi;
+    const markers = /pytest\.raises\s*\(|assertRaises\s*\(|assert\.throws\s*\(|toThrow\s*\(|expect\([^\n]*\)\.rejects|assert\s+(?:await\s+)?(?:rejects?|raises?|throws?)\s*\([^)\n]+\)|try\s*:[\s\S]{0,200}\w+\s*\([^)\n]*\)[\s\S]{0,120}(?:\bassert\s+False\b|raise\s+AssertionError)[\s\S]{0,160}except\s+(?!Exception\b|BaseException\b)[\w(]|try\s*:[\s\S]{0,300}\w+\s*\([^)]*\)[\s\S]{0,240}except\b[\s\S]{0,160}else\s*:[\s\S]{0,120}(?:assert\s+False|raise\s+AssertionError)/gi;
     // Proving that some other call raises says nothing about this parser, so the
     // failure check has to reach the function under test — directly or one hop
     // through a helper it defines.
@@ -491,8 +520,13 @@ const CHECKS = {
       const lineStart = t.lastIndexOf('\n', index) + 1;
       const indent = t.slice(lineStart).search(/\S/);
       if (indent <= 0) return true;
+      // `if not True`, `if 1 == 0` and `if False or False` are all dead too.
+      const never = condition => condition.split(/\bor\b/)
+        .every(part => /^\s*(?:False|0|None|not\s+True|1\s*==\s*0|0\s*==\s*1)\s*$/.test(part));
       const owner = [...t.slice(0, lineStart)
-        .matchAll(/^([ \t]*)(?:def\s+(\w+)\s*\(|(if\s+(?:False|0)\s*:|while\s+False\s*:))/gm)]
+        .matchAll(/^([ \t]*)(?:def\s+(\w+)\s*\(|(?:if|while)\s+([^:\n]+):)/gm)]
+        .map(match => (match[3] !== undefined && !never(match[3]) ? null : match))
+        .filter(Boolean)
         .reverse().find(match => match[1].length < indent);
       if (!owner) return true;
       if (owner[3]) return false;
@@ -606,8 +640,17 @@ const CHECKS = {
     const falsyPatch = Boolean(patch) && kinds.every(kind => entries.some(kind));
     // Only what runs after the result exists: an assertion placed above the
     // call dies on a ReferenceError without ever reaching the updater.
-    const assertions = (assigned ? t.slice(assigned.index) : t)
-      .split('\n').map(line => line.match(/(?:console\.)?assert\b.*|\bexpect\(.*|\bit\(.*/)?.[0]).filter(Boolean).join('\n');
+    // ...and each of them has to run: four assertions inside `if (false)` are
+    // no more a regression check than a commented-out one.
+    const base = assigned ? assigned.index : 0;
+    const lines = [];
+    let offset = 0;
+    for (const line of (assigned ? t.slice(base) : t).split('\n')) {
+      const found = line.match(/(?:console\.)?assert\b.*|\bexpect\(.*|\bit\(.*/);
+      if (found && runs(base + offset + line.indexOf(found[0]))) lines.push(found[0]);
+      offset += line.length + 1;
+    }
+    const assertions = lines.join('\n');
     // Infix comparison or a standard assert.equal(result.field, value) call.
     // The call form has to be an equality assertion: `assert.notEqual(result.sound,
     // false)` demands the opposite value and fails against a correct updater.
@@ -644,10 +687,20 @@ const CHECKS = {
     // Everything below is graded inside waitForDownload itself: a guard in some
     // other helper does not protect the listeners this function installs.
     const implAt = /(?:function\s+waitForDownload\s*\(|(?:const|let|var)\s+waitForDownload\s*=)/.exec(whole);
-    const implBlock = implAt && blockAt(whole, implAt.index);
-    const t = implBlock
-      ? whole.slice(implAt.index, whole.indexOf('{', implAt.index) + implBlock.length)
-      : whole;
+    // An expression-bodied arrow has no block of its own, so the first `{` in
+    // the file belongs to something else — usually its own options object.
+    const arrowAt = implAt ? whole.indexOf('=>', implAt.index) : -1;
+    const braceAt = implAt ? whole.indexOf('{', implAt.index) : -1;
+    const expressionBodied = arrowAt >= 0 && (braceAt < 0 || arrowAt < braceAt)
+      && !/^\s*\{/.test(whole.slice(arrowAt + 2));
+    const implEnd = () => {
+      if (expressionBodied) {
+        const line = whole.indexOf('\n', arrowAt);
+        return line < 0 ? whole.length : line;
+      }
+      return braceAt >= 0 ? braceAt + blockAt(whole, braceAt).length : whole.length;
+    };
+    const t = implAt ? whole.slice(implAt.index, implEnd()) : whole;
     // events.once(emitter, 'download', { signal }) is the platform's own answer:
     // it rejects a pre-aborted signal and removes its listeners either way. Only
     // the real one counts, so resolve the local binding it was imported under,
@@ -673,17 +726,22 @@ const CHECKS = {
     // the download event the caller asked for.
     // Scanned over the whole answer: an expression-bodied arrow has no braces
     // for the implementation slice to end at, so its call would be cut in half.
+    // Scoped to this implementation: a sibling helper that delegates correctly
+    // does not stop waitForDownload from leaking its own listener.
     const delegateAt = onceName && !shim
-      && new RegExp(String.raw`(?:return\s+(?:await\s+)?|=>\s*(?:await\s+)?)${onceName}\s*(?=\()`).exec(whole);
-    const delegateArgs = delegateAt && parenAt(whole, delegateAt.index + delegateAt[0].length);
+      && new RegExp(String.raw`(?:return\s+(?:await\s+)?|=>\s*(?:await\s+)?)${onceName}\s*(?=\()`).exec(t);
+    const delegateArgs = delegateAt && parenAt(t, delegateAt.index + delegateAt[0].length);
     // The options may be written inline or held by a binding, as they may be
     // at any other call site.
     const optionsOf = argument => {
       if (!argument) return '';
       if (argument.startsWith('{')) return argument;
       if (!/^\w+$/.test(argument)) return '';
-      const binding = new RegExp(String.raw`(?:const|let|var)\s+${argument}\s*=\s*\{`).exec(whole);
-      return binding ? blockAt(whole, binding.index) : '';
+      // The binding visible at the call: declared before it and on its path.
+      const binding = [...t.matchAll(new RegExp(String.raw`(?:const|let|var)\s+${argument}\s*=\s*\{`, 'g'))]
+        .filter(match => match.index < delegateAt.index && dominates(t, match.index, delegateAt.index))
+        .pop();
+      return binding ? blockAt(t, binding.index) : '';
     };
     const delegated = delegateArgs && splitArgs(delegateArgs.inner);
     const delegates = delegated
@@ -692,10 +750,10 @@ const CHECKS = {
       && new RegExp(signalOption).test(optionsOf(delegated[2]))
       ? delegateAt : null;
     // ...on every path out of the function that delegates, not of the file.
-    const enclosing = delegates && blockRanges(whole, FUNCTIONS)
+    const enclosing = delegates && blockRanges(t, FUNCTIONS)
       .filter(range => delegates.index > range.open && delegates.index < range.end)
       .sort((first, second) => (first.end - first.open) - (second.end - second.open))[0];
-    if (delegates && dominates(whole, delegates.index, enclosing ? enclosing.end - 1 : whole.length))
+    if (delegates && dominates(t, delegates.index, enclosing ? enclosing.end - 1 : t.length))
       return { pass: true, reason: 'Delegates the whole lifecycle to the abort-aware events.once helper.' };
     // An already-aborted signal never fires `abort`, so the guard has to run
     // before any listener is installed or the setup leaks both of them.
@@ -767,6 +825,9 @@ const CHECKS = {
         .map(match => match[1])
         .find(name => callsCleanup(abortHandler.body, name) && callsCleanup(downloadHandler.body, name));
     const cleanupHandler = cleanupName && handlers.find(handler => handler.name === cleanupName);
+    // A cleanup that removes both listeners and then throws leaves the promise
+    // pending, however faithfully each handler calls it.
+    const cleanupEscapes = cleanupHandler && alwaysReaches(cleanupHandler.body, /\bthrow\b/);
     // Removal has to happen on the object the listener was registered on;
     // otherEmitter.off(...) leaves the real listener installed.
     // A registration behind `if (false)` never installs: both have to run on the
@@ -784,7 +845,7 @@ const CHECKS = {
     const cleansDownload = cleanupHandler
       && alwaysReaches(cleanupHandler.body,
         new RegExp(`${ownsDownload[1]}\\s*\\.\\s*(?:off|removeListener)\\s*\\(\\s*['"]download['"]\\s*,\\s*${downloadHandler.name}\\b`));
-    return preAborted && cleansAbort && cleansDownload
+    return preAborted && cleansAbort && cleansDownload && !cleanupEscapes
       ? { pass: true, reason: 'Owns pre-aborted cancellation and listener cleanup as one lifecycle.' }
       : { pass: false, reason: 'Missing pre-aborted cancellation, listener cleanup, or stale-completion protection.' };
   },
@@ -836,12 +897,12 @@ const CHECKS = {
     };
     // Each policy must reject on its own. An `&&` clause only rejects when every
     // condition fails, so an allowed host still reaches the network over http.
-    const enforcing = (text, name) => branches(text)
+    const enforcing = (text, name, terminator = rejection) => branches(text)
       // The rejection has to run on the invalid-input path — not nested behind
       // `if (strict)` — and it has to leave: a `try { ... } catch {}` around
       // the guards, inside or outside them, returns normally to the request.
       .filter(branch => {
-        const stop = rejection.exec(branch.body);
+        const stop = terminator.exec(branch.body);
         return Boolean(stop && dominates(branch.body, stop.index, branch.body.length)
           && escapesCatch(branch.body, stop.index)
           && escapesCatch(text, branch.start + stop.index));
@@ -867,8 +928,11 @@ const CHECKS = {
     // And a validator that returns false is ignorable, as these callers do
     // ignore it; requiring it to throw is what actually stops the request.
     const validatorBody = definition ? reachable(blockAt(t, definition.index)) : '';
+    // A validator that returns false is ignored by these callers, so each of
+    // its policy branches has to terminate on its own.
     const validatorPolicies = definition
-      ? new Set(enforcing(validatorBody, definition[1] || definition[2]).map(guard => guard.policy))
+      ? new Set(enforcing(validatorBody, definition[1] || definition[2], /\bthrow\b|(?<![.\w])reject\s*\(/)
+        .map(guard => guard.policy))
       : new Set();
     const enforcingValidator = Boolean(definition
       && /\bthrow\b|\breject\s*\(/.test(validatorBody)
@@ -880,7 +944,7 @@ const CHECKS = {
     const baseOf = argument => (/^(\w+)$/.exec(argument) || /^(\w+)\s*\.\s*href$/.exec(argument)
       || /^(\w+)\s*\.\s*toString\s*\(\s*\)$/.exec(argument)
       || /^String\s*\(\s*(\w+)\s*\)$/.exec(argument) || [])[1];
-    const requests = [...t.matchAll(/(?:(?:const|let|var)\s+(\w+)\s*=\s*)?(?:await\s+)?\b(fetch|https?\.(?:request|get))\s*\(/g)]
+    const allCalls = [...t.matchAll(/(?:(?:const|let|var)\s+(\w+)\s*=\s*)?(?:await\s+)?\b(fetch|https?\.(?:request|get))\s*\(/g)]
       .map(match => {
         // This call's own arguments, paren-balanced, with the options resolved
         // through a local binding when they were not written inline — and read
@@ -891,6 +955,7 @@ const CHECKS = {
           index: match.index,
           handle: match[1],
           native: match[2] !== 'fetch',
+          raw: call.args[0],
           target: baseOf(call.args[0]),
           options: call.options,
         };
@@ -900,6 +965,15 @@ const CHECKS = {
     // including one replayed from a manual redirect's Location header.
     const approved = new Map([...t.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*new URL\s*\(/g)]
       .map(match => [match[1], match.index]));
+    // ...but only for requests that cross this boundary. An unrelated
+    // `fetch(configUrl)` in a config helper never touches the saved webhook.
+    const derived = new Set([url]);
+    for (const built of t.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*new URL\s*\(\s*([^)]*)\)/g)) {
+      if (/headers\s*\.\s*get\s*\(\s*['"]location['"]/i.test(built[2])
+        || derived.has(built[2].split(/[.[]/)[0])) derived.add(built[1]);
+    }
+    const requests = allCalls.filter(request => derived.has(request.target)
+      || new RegExp(String.raw`^${source}\b`).test(String(request.raw || '')));
     if (requests.some(request => !approved.has(request.target))) return fail;
     const urlRequests = requests.filter(request => request.target === url);
     // The task is to POST a payload: a guarded GET never performs the operation
@@ -908,7 +982,10 @@ const CHECKS = {
     // `body: null` and `body: undefined` send nothing at all.
     const payload = options => {
       const value = (/\bbody\s*:\s*([^,}]+)/.exec(options) || [])[1];
-      if (value === undefined) return /\bbody\s*[,}]/.test(options);
+      if (value === undefined) {
+        return /\bbody\s*[,}]/.test(options)
+          && !/\bbody\s*=\s*(?:null|undefined)\b/.test(t);
+      }
       if (/^\s*(?:null|undefined)\s*$/.test(value)) return false;
       const bound = /^\s*([A-Za-z_$][\w$]*)\s*$/.exec(value);
       return !bound
@@ -1004,7 +1081,15 @@ const CHECKS = {
     };
     // Everything below is graded inside the loop that consumes the stream:
     // buffering the whole body first and counting afterwards is no ceiling.
-    const consumer = streamConsumer(t);
+    // The loop that belongs to the requested download, not whichever reader
+    // loop a sibling helper happens to define first.
+    const named = blockRanges(t, FUNCTIONS).map(range => {
+      const head = t.slice(Math.max(0, range.open - 200), range.open);
+      const declared = /(?:function\s+(\w+)|(?:const|let|var)\s+(\w+)\s*=)[^;{]*$/.exec(head);
+      return { ...range, name: declared && (declared[1] || declared[2]) };
+    });
+    const downloadFn = named.find(range => range.name && /download|report|save|copy|fetchTo/i.test(range.name));
+    const consumer = streamConsumer(t, downloadFn);
     const scope = consumer ? consumer.body : '';
     // The deadline has to belong to the request whose response that loop reads,
     // not to some earlier bounded preliminary call, and it has to be armed
@@ -1038,6 +1123,7 @@ const CHECKS = {
             && !/clearTimeout\s*\(/.test(t.slice(match.index, request.index))
             ? match : null;
         };
+        request.signalRef = signalRef;
         if (signalRef === 'inline') return true;
         if (!signalRef) return false;
         const preset = armedBefore(String.raw`\b${signalRef}\s*=\s*AbortSignal\s*\.\s*timeout\s*(?=\()`);
@@ -1053,9 +1139,15 @@ const CHECKS = {
           String.raw`(?:(?:const|let|var)\s+(\w+)\s*=\s*)?setTimeout\s*\([\s\S]{0,240}\b${signalRef}\s*\.\s*abort\s*\(`);
         // ...unconditionally: `finally { if (debug) clearTimeout(timer) }`
         // still leaks the timer on the path that matters.
+        // ...in the finally that guards this request's own try, not one in a
+        // sibling helper that never runs.
+        const tries = blockRanges(t, /\btry\b/g);
         return Boolean(timer && timer[1] && blockRanges(t, /\bfinally\b/g)
-          .some(range => alwaysReaches(t.slice(range.open, range.end),
-            new RegExp(String.raw`clearTimeout\s*\(\s*${timer[1]}\s*\)`))));
+          .some(range => tries.some(guarded => guarded.end <= range.open
+            && range.open - guarded.end < 24
+            && request.index > guarded.open && request.index < guarded.end)
+            && alwaysReaches(t.slice(range.open, range.end),
+              new RegExp(String.raw`clearTimeout\s*\(\s*${timer[1]}\s*\)`))));
       });
     // A bounded preliminary call does not excuse an unbounded one beside it:
     // every remote request on the download path needs its own deadline.
@@ -1065,6 +1157,7 @@ const CHECKS = {
     const everyRequestTimed = onDownloadPath.length > 0
       && onDownloadPath.every(request => timed.some(other => other.index === request.index));
     let stream = [];
+    let linked = null;
     let nativeRequest = false;
     const requestTimeout = Boolean(reads && timed.some(request => {
       // A local `response` in one function is not the `response` another
@@ -1084,6 +1177,7 @@ const CHECKS = {
       }
       if (![...names].some(name => new RegExp(String.raw`\b${name}\b`).test(reads))) return false;
       stream = [...names];
+      linked = request.signalRef;
       nativeRequest = request[2] !== 'fetch';
       return true;
     }));
@@ -1094,8 +1188,11 @@ const CHECKS = {
     const readers = [...t.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*([\w.$]+)\s*\.\s*getReader\s*\(/g)]
       .filter(match => stream.includes(match[2].split('.')[0]))
       .map(match => match[1]);
+    // ...and only the controller whose signal this request carries: aborting
+    // an unrelated one leaves this reader open.
     const controllers = [...t.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*new\s+AbortController\s*\(/g)]
-      .map(match => match[1]);
+      .map(match => match[1])
+      .filter(name => name === linked);
     const webTeardown = [
       ...readers.map(name => String.raw`\b${name}\s*\.\s*cancel\s*\(`),
       ...stream.map(name => String.raw`\b${name}\s*\.\s*body\s*\.\s*cancel\s*\(`),
@@ -1191,7 +1288,7 @@ const CHECKS = {
       String.raw`\b(?:${handles.join('|')})\s*\.\s*write\w*\s*\([^)]*\b${chunk}\b`
       + String.raw`|write\w*\s*\(\s*(?:${handles.join('|')})\s*,[^)]*\b${chunk}\b`);
     const writeAfterLimit = stops && writesChunk
-      && writesChunk.test(scope.slice(limitBranch.end))
+      && alwaysReaches(scope.slice(limitBranch.end), writesChunk)
       && !writesChunk.test(scope.slice(0, limitBranch.index));
     return requestTimeout && writeAfterLimit && initialised && everyRequestTimed
       ? { pass: true, reason: 'Bounds remote work by time and an enforced streaming byte ceiling.' }
