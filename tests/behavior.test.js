@@ -2510,6 +2510,132 @@ test('revalidate: \'!url.protocol === "https:"\' lets http through', () => {
   assert.equal(r.pass, false);
 });
 
+// --- round 9: reachable, exclusive, and complete ---
+
+test('lifecycle: a delegation buried in a nested helper returns to nobody', () => {
+  const r = check('lifecycle',
+    '```javascript\nconst { once } = require("node:events");\n' +
+  'function waitForDownload(emitter, signal) {\n  const helper = () => once(emitter, "download", { signal });\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: a payload write in an uncalled helper sends nothing', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' + 'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad");\n' +
+  'const request = https.request(url, { method: "POST" });\n' +
+  'function unused() { request.end(payload); }\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a compound signal expression does not bound the request', () => {
+  const r = check('bounds',
+    '```javascript\nconst timeoutSignal = AbortSignal.timeout(10000);\n' +
+  'const response = await fetch(url, { signal: timeoutSignal && otherSignal });\n' + 'const file = await open(destination, "w");\nconst reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n' + '```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: destroy() without returning still writes the oversized chunk', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await https.get(url, { signal: AbortSignal.timeout(10000) });\n' +
+  'const file = createWriteStream(destination);\nlet received = 0;\nresponse.on("data", chunk => {\n  received += chunk.length;\n' +
+  '  if (received > MAX_BYTES) { response.destroy(new Error("too large")); }\n  file.write(chunk);\n});\n```');
+  assert.equal(r.pass, false);
+});
+
+test('hardware: a knob assigned after the return never reaches it', () => {
+  const r = check('hardware',
+    '```python\ndef read_temperature(raw, beta=3950):\n    result = raw * 0.1\n    return result\n    result = raw * beta\n```\nReturns Celsius.');
+  assert.equal(r.pass, false);
+});
+
+test('contracts: the else of `if (true)` is dead', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) { return { ...current, ...patch }; }\n' +
+  'const result = updateSettings({ theme: "dark", sound: true, label: "x" }, { sound: false, volume: 0, label: "" });\n' +
+  'if (true) {} else {\n  console.assert(result.sound === false); console.assert(result.volume === 0);\n' +
+  '  console.assert(result.label === ""); console.assert(result.theme === "dark");\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('onecheck: expecting rejection of a valid fixture is not an alternate path', () => {
+  const r = check('onecheck',
+    '```python\ndef parse_duration(s):\n    return 0\n\nvalid = "1h"\nwith pytest.raises(ValueError):\n    parse_duration(valid)\n```');
+  assert.equal(r.pass, false);
+});
+
+test('contracts: a disjoined comparison never fails the assertion', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) { return { ...current, ...patch }; }\n' +
+  'const result = updateSettings({ theme: "dark", sound: true, label: "x" }, { sound: false, volume: 0, label: "" });\n' +
+  'console.assert(true || result.sound === false); console.assert(true || result.volume === 0);\n' +
+  'console.assert(true || result.label === ""); console.assert(true || result.theme === "dark");\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a consumer parked in a dead branch consumes nothing', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+  'const file = createWriteStream(destination);\nlet received = 0;\nif (false) {\n' +
+  '  response.on("data", chunk => {\n    received += chunk.length;\n' +
+  '    if (received > MAX_BYTES) { response.destroy(new Error("too large")); return; }\n    file.write(chunk);\n  });\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: a helper that guards its own POST is the POST', () => {
+  const r = check('revalidate',
+    '```javascript\nfunction sendAgain(target) {\n' +
+  '  if (target.protocol !== "https:" || !allowedHosts.has(target.hostname)) throw new Error("bad");\n' +
+  '  return fetch(target, { method: "POST", body, redirect: "error" });\n}\n' +
+  'const saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' + 'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad");\n' + 'sendAgain(url);\n```');
+  assert.equal(r.pass, true);
+});
+
+test('contracts: a merge after resetting current preserves nothing', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) {\n  current = {};\n  return { ...current, ...patch };\n}\n' +
+  'const result = updateSettings({ theme: "dark", sound: true, label: "x" }, { sound: false, volume: 0, label: "" });\n' +
+  'console.assert(result.sound === false); console.assert(result.volume === 0);\n' +
+  'console.assert(result.label === ""); console.assert(result.theme === "dark");\n```');
+  assert.equal(r.pass, false);
+});
+
+test('lifecycle: an extra listener beside the cleaned-up one still leaks', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, signal) {\n  return new Promise((resolve, reject) => {\n' +
+  '    if (signal.aborted) return reject(signal.reason);\n' +
+  '    const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+  '    const done = value => { cleanup(); resolve(value); };\n' +
+  '    const aborted = () => { cleanup(); reject(signal.reason); };\n' +
+  '    emitter.once("download", done); signal.addEventListener("abort", aborted);\n' +
+  '    emitter.on("download", audit);\n  });\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: a bracketed property write mutates the cleared URL', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' + 'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad");\n' +
+  'url["protocol"] = "http:";\nawait fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: an accumulator reset before the check never trips', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+  'const file = await open(destination, "w");\nconst reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+  '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\nreceived = 0;\n' +
+  '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a timer callback that never aborts bounds nothing', () => {
+  const r = check('bounds',
+    '```javascript\nconst controller = new AbortController();\n' +
+  'const timer = setTimeout(() => { if (false) controller.abort(); }, 10000);\ntry {\n' +
+  'const response = await fetch(url, { signal: controller.signal });\n' + 'const file = await open(destination, "w");\nconst reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n' +
+  '} finally { clearTimeout(timer); }\n```');
+  assert.equal(r.pass, false);
+});
+
 // --- unknown probe is skipped, not failed ---
 
 test('unknown probe is skipped', () => {
