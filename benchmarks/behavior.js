@@ -311,7 +311,12 @@ function callAt(text, from) {
     const binding = [...text.matchAll(new RegExp(String.raw`(?:const|let|var)\s+${second}\s*=\s*\{`, 'g'))]
       .filter(match => match.index < paren.open && dominates(text, match.index, paren.open))
       .pop();
-    if (binding) literal = blockAt(text, binding.index);
+    // ...unless something rewrote it in between: `options.signal = undefined`
+    // means the call receives a different object than the literal shows.
+    const rewritten = binding && [...text.matchAll(new RegExp(
+      String.raw`\b${second}\s*(?:\.\s*\w+|\[[^\]]*\])\s*=(?!=)`, 'g'))]
+      .some(write => write.index > binding.index && write.index < paren.open);
+    if (binding && !rewritten) literal = blockAt(text, binding.index);
   }
   return { args, options: topLevelOf(literal) };
 }
@@ -334,17 +339,34 @@ function inside(ranges, index, target) {
     || (target >= range.open && target <= range.end));
 }
 
-// True when `index` sits on a statement that runs unconditionally on the way to
-// `target`: not in a sibling function, and not behind a branch target skips.
-function dominates(text, index, target) {
+// True when `index` runs unconditionally: not inside a block the path to
+// `target` can skip, and not behind an inline branch of its own.
+// A ternary can skip the statement; `?.` and `??` cannot — reading them as a
+// branch would fail ordinary optional-chaining code for its punctuation.
+function unconditional(text, index, target) {
   const statement = text.slice(1 + Math.max(
     text.lastIndexOf(';', index), text.lastIndexOf('{', index),
     text.lastIndexOf('}', index), text.lastIndexOf('\n', index),
   ), index);
-  // A ternary can skip the statement; `?.` and `??` cannot — reading them as a
-  // branch would fail ordinary optional-chaining code for its punctuation.
   return inside(blockRanges(text, SKIPPABLE), index, target)
-    && !/\bif\s*\(|(?<!\?)\?(?![.?])/.test(statement);
+    && !/\bif\s*\(|\belse\b|(?<!\?)\?(?![.?])/.test(statement);
+}
+
+// True when `index` sits on a statement that runs unconditionally on the way to
+// `target`: not in a sibling function, not behind a branch target skips, and
+// with nothing before it that leaves the function first.
+function dominates(text, index, target) {
+  if (!unconditional(text, index, target)) return false;
+  // An unconditional `return` or `throw` earlier in the same scope means
+  // control never arrives here at all.
+  return ![...text.matchAll(/(?<![.\w])(?:return|throw)\b/g)]
+    .some(exit => exit.index < index
+      && sameScope(text, exit.index, index)
+      && unconditional(text, exit.index, index)
+      // `return new Promise(executor)` does not precede the executor's body —
+      // it is the statement that creates it.
+      && !blockRanges(text, FUNCTIONS)
+        .some(range => range.open > exit.index && index > range.open && index < range.end));
 }
 
 // True when nothing but a function body containing `target` also contains
@@ -372,11 +394,12 @@ function streamConsumer(text, within) {
     })
     .filter(Boolean)
     .filter(loop => inside(loop.index) && reachableAt(text, loop.index));
-  const evented = [...text.matchAll(/\.on\s*\(\s*['"]data['"]\s*,[^{]{0,60}\{/g)]
+  const evented = [...text.matchAll(/\b([\w.$]+)\s*\.\s*on\s*\(\s*['"]data['"]\s*,[^{]{0,60}\{/g)]
     .filter(match => inside(match.index) && reachableAt(text, match.index))
     .map(match => ({
       index: match.index,
       header: match[0],
+      receiver: match[1],
       body: blockAt(text, match.index + match[0].length - 1),
     }));
   return [...braced, ...evented]
@@ -405,8 +428,14 @@ const CHECKS = {
       // A negation of a dismissing verb affirms the marker: "do not ignore
       // per-unit drift" and "calibration does not remove part-to-part drift"
       // are warnings, not denials.
-      return !/\b(?:no|not|never|none|without|unnecessary|unneeded|needn'?t|don'?t|doesn'?t|won'?t|isn'?t|aren'?t)\b(?!(?:\s+\w+){0,2}\s+(?:ignore|overlook|skip|neglect|remove|eliminate|obviate|forget|discount|assume|trust)\b)/i
-        .test(sentence.slice(contrast));
+      const denies = /\b(?:no|not|never|none|without|unnecessary|unneeded|needn'?t|don'?t|doesn'?t|won'?t|isn'?t|aren'?t)\b(?!(?:\s+\w+){0,2}\s+(?:ignore|overlook|skip|neglect|remove|eliminate|obviate|forget|discount|assume|trust)\b)/i;
+      if (denies.test(sentence.slice(contrast))) return false;
+      // ...and the denial may follow the marker: "calibration offset is
+      // unnecessary" names the knob only to rule it out.
+      const rest = t.slice(match.index + match[0].length);
+      const tail = rest.slice(0, Math.min(...[rest.search(/[.!?\n]/), 200].filter(at => at >= 0)));
+      return !denies.test(tail)
+        && !/\b(?:impossible|unnecessary|unneeded|irrelevant|superfluous)\b/i.test(tail);
     };
     // The thermistor coefficients are the knob: exposing r0/beta/the series
     // resistor as a tunable default is leaving one, whatever the prose says.
@@ -520,7 +549,7 @@ const CHECKS = {
     // the try, and the try/except/else layout.
     // The sentinel `assert False` runs inside the try, so a broad `except` would
     // swallow its own AssertionError; only a named exception proves rejection.
-    const markers = /pytest\.raises\s*\(|assertRaises\s*\(|assert\.throws\s*\(|toThrow\s*\(|expect\([^\n]*\)\.rejects|assert\s+(?:await\s+)?(?:rejects?|raises?|throws?)\s*\([^)\n]+\)|try\s*:[\s\S]{0,200}\w+\s*\([^)\n]*\)[\s\S]{0,120}(?:\bassert\s+False\b|raise\s+AssertionError)[\s\S]{0,160}except\s+(?!Exception\b|BaseException\b)[\w(]|try\s*:[\s\S]{0,300}\w+\s*\([^)]*\)[\s\S]{0,240}except\b[\s\S]{0,160}else\s*:[\s\S]{0,120}(?:assert\s+False|raise\s+AssertionError)/gi;
+    const markers = /with\s+[\w.]*pytest\.raises\s*\(|assertRaises\s*\(|assert\.throws\s*\(|toThrow\s*\(|expect\([^\n]*\)\.rejects|assert\s+(?:await\s+)?(?:rejects?|raises?|throws?)\s*\([^)\n]+\)|try\s*:[\s\S]{0,200}\w+\s*\([^)\n]*\)[\s\S]{0,120}(?:\bassert\s+False\b|raise\s+AssertionError)[\s\S]{0,160}except\s+(?!Exception\b|BaseException\b)[\w(]|try\s*:[\s\S]{0,300}\w+\s*\([^)]*\)[\s\S]{0,240}except\b[\s\S]{0,160}else\s*:[\s\S]{0,120}(?:assert\s+False|raise\s+AssertionError)/gi;
     // Proving that some other call raises says nothing about this parser, so the
     // failure check has to reach the function under test — directly or one hop
     // through a helper it defines.
@@ -627,7 +656,11 @@ const CHECKS = {
       // after an unconditional earlier return is dead code behind a reset.
       if (!merge || !dominates(body, merge.index, body.length)) return false;
       // `current = {}` before the merge empties what the spread preserves.
-      const overwritten = new RegExp(String.raw`\b(?:${match[2]}|${match[3]})\s*=(?!=)`, 'g');
+      // Rebinding it, writing through it, or deleting from it: all three make
+      // the spread preserve something other than what the caller passed in.
+      const overwritten = new RegExp(
+        String.raw`\b(?:${match[2]}|${match[3]})\s*(?:\.\s*\w+|\[[^\]]*\])?\s*=(?!=)`
+        + String.raw`|delete\s+(?:${match[2]}|${match[3]})\s*[.[]`, 'g');
       if ([...body.matchAll(overwritten)].some(reset => reset.index < merge.index)) return false;
       // Any earlier return reaches the caller before the merge ever runs, so it
       // is only harmless when it hands the existing settings straight back.
@@ -794,7 +827,11 @@ const CHECKS = {
       .find(pair => pair[0] === 'once');
     const onceName = alias ? alias[1] || alias[0]
       : namespace && `${namespace[1] || namespace[2]}\\.once`;
-    const shim = onceName && new RegExp(String.raw`function\s+${onceName}\b|(?:const|let|var)\s+${onceName}\s*=`).test(whole);
+    // ...and still the one it was imported as: `let { once } = require(...);
+    // once = () => Promise.resolve()` waits for nothing.
+    const shim = onceName && new RegExp(
+      String.raw`function\s+${onceName}\b|(?:const|let|var)\s+${onceName}\s*=`
+      + String.raw`|(?<![.\w])${onceName}\s*=(?!=)`).test(whole);
     const params = /waitForDownload\s*=?\s*(?:async\s*)?\(?\s*(\w+)\s*,\s*(\w+)/.exec(whole) || [, 'emitter', 'signal'];
     const emitterParam = params[1];
     const signalParam = params[2];
@@ -929,6 +966,11 @@ const CHECKS = {
         .map(match => match[1])
         .find(name => callsCleanup(abortHandler.body, name) && callsCleanup(downloadHandler.body, name));
     const cleanupHandler = cleanupName && handlers.find(handler => handler.name === cleanupName);
+    // An async cleanup removes its listeners a tick later, so a handler that
+    // settles without awaiting it leaves them live across the gap.
+    const cleanupAsync = cleanupName && new RegExp(
+      String.raw`(?:const|let|var)\s+${cleanupName}\s*=\s*async\b|async\s+function\s+${cleanupName}\b`).test(t);
+    const awaitsCleanup = body => new RegExp(String.raw`await\s+${cleanupName}\s*\(`).test(body);
     // A cleanup that removes both listeners and then throws leaves the promise
     // pending, however faithfully each handler calls it.
     // Any reachable throw, not just an unconditional one: on that path both
@@ -964,6 +1006,8 @@ const CHECKS = {
       && alwaysReaches(cleanupHandler.body,
         new RegExp(`${ownsDownload[1]}\\s*\\.\\s*(?:off|removeListener)\\s*\\(\\s*['"]download['"]\\s*,\\s*${downloadHandler.name}\\b`));
     return preAborted && cleansAbort && cleansDownload && !cleanupEscapes
+      && (!cleanupAsync || (abortHandler && downloadHandler
+        && awaitsCleanup(abortHandler.body) && awaitsCleanup(downloadHandler.body)))
       ? { pass: true, reason: 'Owns pre-aborted cancellation and listener cleanup as one lifecycle.' }
       : { pass: false, reason: 'Missing pre-aborted cancellation, listener cleanup, or stale-completion protection.' };
   },
@@ -1211,17 +1255,21 @@ const CHECKS = {
     // cleared; rebinding `url` itself replaces it outright. Checked per request:
     // a guarded POST, a mutation, then a second POST reuses the stale guards.
     // Every write that could change the destination, wherever it comes from.
-    const mutations = [
+    const mutationSites = [
       ...[...aliases].flatMap(name => [...t.matchAll(new RegExp(
         String.raw`\b${name}\s*(?:\.\s*\w+|\[\s*['"]\w+['"]\s*\])\s*=(?!=)`
         + String.raw`|Object\s*\.\s*assign\s*\(\s*${name}\b`, 'g'))]),
       ...[...t.matchAll(new RegExp(String.raw`(?<!(?:const|let|var)\s{1,8})\b${url}\s*=(?!=)`, 'g'))],
     ].map(change => change.index);
+    // ...that can actually run on the way to the request: an uncalled helper
+    // rewriting the URL never touches the one this request sends to.
+    const mutationsFor = request => mutationSites.filter(at => at < request.index
+      && reachableAt(t, at) && sameScope(t, at, request.index));
     // Each policy has to hold at the moment of the request, so each needs a
     // guard after the last mutation — a later host check does not re-clear a
     // protocol that was rewritten after the transport check ran.
     const freshPolicies = request => {
-      const latest = Math.max(-1, ...mutations.filter(at => at < request.index));
+      const latest = Math.max(-1, ...mutationsFor(request));
       return new Set(guardsFor(request)
         .filter(guard => guard.index < request.index && guard.index > latest)
         .map(guard => guard.policy));
@@ -1392,12 +1440,18 @@ const CHECKS = {
       .filter(name => name === linked);
     const webTeardown = [
       ...readers.map(name => String.raw`\b${name}\s*\.\s*cancel\s*\(`),
-      ...stream.map(name => String.raw`\b${name}\s*\.\s*body\s*\.\s*cancel\s*\(`),
+      // A ReadableStream is locked while a reader exists, so body.cancel()
+      // throws; it only tears down an iterator-style consumer.
+      ...(readers.length ? [] : stream.map(name => String.raw`\b${name}\s*\.\s*body\s*\.\s*cancel\s*\(`)),
       ...controllers.map(name => String.raw`\b${name}\s*\.\s*abort\s*\(`),
     ];
     // A fetch body is a Web ReadableStream, so `.on('data')`/`.destroy()` on it
     // throws at runtime; evented consumption only exists on a native response.
     const evented = Boolean(consumer && /['"]data['"]/.test(consumer.header));
+    // ...and it has to be listening to the response this request produced:
+    // `audit.on('data', ...)` never consumes the remote report at all.
+    const consumesResponse = !evented || !consumer.receiver
+      || stream.includes(consumer.receiver.split('.')[0]);
     if (evented && requestTimeout && !nativeRequest)
       return { pass: false, reason: 'Uses Node stream methods on a Web ReadableStream fetch body.' };
     const chunk = (scope.match(/\{[^}]{0,40}\b(?!done\b)(\w+)\s*\}\s*=\s*await\s+\w+\s*\.\s*read\s*\(/)
@@ -1494,7 +1548,7 @@ const CHECKS = {
     const writeAfterLimit = stops && writesChunk
       && alwaysReaches(scope.slice(limitBranch.end), writesChunk)
       && !writesChunk.test(scope.slice(0, limitBranch.index));
-    return requestTimeout && writeAfterLimit && initialised && everyRequestTimed && !restarted
+    return requestTimeout && consumesResponse && writeAfterLimit && initialised && everyRequestTimed && !restarted
       ? { pass: true, reason: 'Bounds remote work by time and an enforced streaming byte ceiling.' }
       : { pass: false, reason: 'Remote work lacks a time limit or enforced streaming byte ceiling.' };
   },

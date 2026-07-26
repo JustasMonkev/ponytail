@@ -2728,6 +2728,101 @@ test('hardware: the temperature reader outranks a generic read helper', () => {
   assert.equal(r.pass, true);
 });
 
+// --- round 11: control that arrives, bindings that still hold ---
+
+test('bounds: an early return means none of the bounded code runs', () => {
+  const r = check('bounds',
+    '```javascript\nasync function download(url, destination) {\n  return;\n' +
+  '  const response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+  '  const file = await open(destination, "w");\n  const reader = response.body.getReader();\n  let received = 0;\n  while (true) {\n' +
+  '    const { done, value } = await reader.read(); if (done) break;\n    received += value.byteLength;\n' +
+  '    if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\n    await file.write(value);\n  }\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: a mutation in an uncalled helper does not stale the guards', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' + 'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad");\n' +
+  'function unused() { url.protocol = "http:"; }\n' +
+  'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, true);
+});
+
+test('lifecycle: a reassigned once import is not the native helper', () => {
+  const r = check('lifecycle',
+    '```javascript\nlet { once } = require("node:events");\nonce = () => Promise.resolve("fake");\n' +
+  'function waitForDownload(emitter, signal) {\n  return once(emitter, "download", { signal });\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('onecheck: pytest.raises called rather than entered owns no call', () => {
+  const r = check('onecheck',
+    '```python\ndef parse_duration(s):\n    return 0\n\npytest.raises(ValueError); parse_duration("garbage")\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a data handler on another emitter never reads the response', () => {
+  const r = check('bounds',
+    '```javascript\nhttps.get(url, { signal: AbortSignal.timeout(10000) }, response => {\n' +
+  '  const file = createWriteStream(destination);\n  let received = 0;\n  audit.on("data", chunk => {\n' +
+  '    received += chunk.length;\n' +
+  '    if (received > MAX_BYTES) { response.destroy(new Error("too large")); return; }\n' +
+  '    file.write(chunk);\n  });\n});\n```');
+  assert.equal(r.pass, false);
+});
+
+test('hardware: a denial following the marker denies it just the same', () => {
+  const r = check('hardware',
+    '```python\ndef read_c(adc):\n    return adc.read(0) * 0.1\n```\n' +
+  'Per-unit drift is impossible, so no calibration is needed.');
+  assert.equal(r.pass, false);
+});
+
+test('hardware: naming the knob to call it unnecessary is not leaving one', () => {
+  const r = check('hardware',
+    '```python\ndef read_c(adc):\n    return adc.read(0) * 0.1\n```\nCalibration offset is unnecessary.');
+  assert.equal(r.pass, false);
+});
+
+test('lifecycle: an unawaited async cleanup settles before removing listeners', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, signal) {\n  return new Promise((resolve, reject) => {\n' +
+  '    if (signal.aborted) return reject(signal.reason);\n' +
+  '    const cleanup = async () => { await flush(); emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+  '    const done = value => { cleanup(); resolve(value); };\n' +
+  '    const aborted = () => { cleanup(); reject(signal.reason); };\n' +
+  '    emitter.once("download", done); signal.addEventListener("abort", aborted);\n  });\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: options rewritten after the literal are not what fetch receives', () => {
+  const r = check('bounds',
+    '```javascript\nconst options = { signal: AbortSignal.timeout(10000) };\noptions.signal = undefined;\n' +
+  'const response = await fetch(url, options);\nconst file = await open(destination, "w");\n' +
+  'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+  '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+  '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: body.cancel() throws while a reader holds the lock', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+  'const file = await open(destination, "w");\nconst reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+  '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+  '  if (received > MAX_BYTES) { await response.body.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('contracts: a property write on the patch corrupts the merge', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) {\n  patch.sound = true;\n  return { ...current, ...patch };\n}\n' +
+  'const result = updateSettings({ theme: "dark", sound: true, label: "x" }, { sound: false, volume: 0, label: "" });\n' +
+  'console.assert(result.sound === false); console.assert(result.volume === 0);\n' +
+  'console.assert(result.label === ""); console.assert(result.theme === "dark");\n```');
+  assert.equal(r.pass, false);
+});
+
 // --- unknown probe is skipped, not failed ---
 
 test('unknown probe is skipped', () => {
