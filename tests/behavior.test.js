@@ -2916,6 +2916,123 @@ test('hardware: a type-annotated calibration parameter is still a knob', () => {
   assert.equal(r.pass, true);
 });
 
+// --- round 13: through the alias, through the callee, at the right value ---
+
+test('onecheck: `if (False):` is dead like its bare form', () => {
+  const r = check('onecheck',
+    '```python\ndef to_seconds(s):\n    return 0\n\nif (False):\n    try:\n        to_seconds("abc")\n    except ValueError:\n        pass\n    else:\n        assert False\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a fractional deadline throws before the request starts', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10000.5) });\n' + 'const file = await open(destination, "w");\nconst reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n' + '```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: an inner finally clears the timer before the body is read', () => {
+  const r = check('bounds',
+    '```javascript\nconst controller = new AbortController();\nconst timer = setTimeout(() => controller.abort(), 10000);\ntry {\n' +
+  'let response;\ntry { response = await fetch(url, { signal: controller.signal }); } finally { clearTimeout(timer); }\n' + 'const file = await open(destination, "w");\nconst reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n' +
+  '} finally { clearTimeout(timer); }\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: a helper aliasing before mutating still stales the guards', () => {
+  const r = check('revalidate',
+    '```javascript\nfunction downgrade(target) { const alias = target; alias.protocol = "http:"; }\n' +
+  'const saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' + 'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad");\n' +
+  'downgrade(url);\nawait fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('lifecycle: Object.assign rewrites the once options too', () => {
+  const r = check('lifecycle',
+    '```javascript\nconst { once } = require("node:events");\n' +
+  'function waitForDownload(emitter, signal) {\n  const options = { signal };\n' +
+  '  Object.assign(options, { signal: otherSignal });\n  return once(emitter, "download", options);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('lifecycle: a cleanup that settles takes the outcome from its handler', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, signal) {\n' +
+    '  return new Promise((resolve, reject) => {\n' +
+    '    if (signal.aborted) return reject(signal.reason);\n' +
+    '    const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); resolve("cleaned"); };\n' +
+    '    const done = value => { cleanup(); resolve(value); };\n' +
+    '    const aborted = () => { cleanup(); reject(signal.reason); };\n' +
+    '    emitter.once("download", done); signal.addEventListener("abort", aborted);\n  });\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('onecheck: a broad exception later in the tuple swallows the sentinel', () => {
+  const r = check('onecheck',
+    '```python\ndef to_seconds(s):\n    return 0\n\ntry:\n    to_seconds("bad")\n    assert False\nexcept (ValueError, Exception):\n    pass\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: preventCancel reached through a binding still locks the stream', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+  'const file = await open(destination, "w");\nconst iteratorOptions = { preventCancel: true };\nlet received = 0;\n' +
+  'for await (const chunk of response.body.values(iteratorOptions)) {\n  received += chunk.byteLength;\n' +
+  '  if (received > MAX_BYTES) { await response.body.cancel(); throw new Error("too large"); }\n' +
+  '  await file.write(chunk);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('hardware: a nested comma in the annotation does not hide the knob', () => {
+  const r = check('hardware',
+    '```python\ndef read_temperature(adc, beta: Annotated[float, "calibration"] = 3950):\n' +
+  '    return _steinhart(adc.read(0), beta)\n```\nReturns Celsius.');
+  assert.equal(r.pass, true);
+});
+
+test('contracts: an alias of an input corrupts it just as directly', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) {\n  const alias = current;\n  alias.theme = "light";\n' +
+  '  return { ...current, ...patch };\n}\n' +
+  'const result = updateSettings({ theme: "dark", sound: true, label: "x" }, { sound: false, volume: 0, label: "" });\n' +
+  'console.assert(result.sound === false); console.assert(result.volume === 0);\n' +
+  'console.assert(result.label === ""); console.assert(result.theme === "dark");\n```');
+  assert.equal(r.pass, false);
+});
+
+test('contracts: asserting the wrong value proves the opposite of preservation', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) { return { ...current, ...patch }; }\n' +
+  'const result = updateSettings({ theme: "dark", sound: true, label: "x" }, { sound: false, volume: 0, label: "" });\n' +
+  'console.assert(result.sound === false); console.assert(result.volume === 0);\n' +
+  'console.assert(result.label === ""); console.assert(result.theme === "light");\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a ceiling aliased to Infinity is still unbounded', () => {
+  const r = check('bounds',
+    '```javascript\nconst LIMIT = Infinity;\nconst MAX = LIMIT;\n' +
+  'const response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+  'const file = await open(destination, "w");\nconst reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+  '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+  '  if (received > MAX) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: an accumulator reset after the guard loses the total', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+  'const file = await open(destination, "w");\nconst reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+  '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+  '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\nreceived = 0;\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('hardware: a knob only on a diagnostic return does not tune the reading', () => {
+  const r = check('hardware',
+    '```python\ndef read_temperature(adc, beta=3950):\n    if debug:\n        return beta\n    return adc.read(0) * 0.1\n```\nReturns Celsius.');
+  assert.equal(r.pass, false);
+});
+
 // --- unknown probe is skipped, not failed ---
 
 test('unknown probe is skipped', () => {

@@ -171,27 +171,38 @@ function branches(text) {
 }
 
 // Conditions a compiler would fold away.
+// `if (False):` and `if ((0)):` fold exactly like their bare forms.
+function stripParens(condition) {
+  let text = String(condition || '').trim();
+  for (let depth = 0; depth < 4 && text.startsWith('('); depth += 1) {
+    const paren = parenAt(text, 0);
+    if (!paren || paren.close !== text.length - 1) break;
+    text = paren.inner.trim();
+  }
+  return text;
+}
+
 function alwaysFalse(condition) {
-  const text = String(condition || '').trim();
+  const text = stripParens(condition);
   return /^(?:false|0|!\s*true|!\s*1|1\s*===?\s*0|0\s*===?\s*1)$/.test(text)
     || (text.includes('&&') && text.split('&&').some(part => alwaysFalse(part)));
 }
 
 function alwaysTrue(condition) {
-  return /^\s*(?:true|1|!\s*false|!\s*0)\s*$/.test(String(condition || ''));
+  return /^(?:true|1|!\s*false|!\s*0)$/.test(stripParens(condition));
 }
 
 // The spans no execution can enter: a constant-false body, and the `else` of a
 // constant-true one.
 // The Python spellings, over an indentation-delimited suite rather than braces.
 function pythonAlwaysFalse(condition) {
-  const text = String(condition || '').trim();
+  const text = stripParens(condition);
   return /^(?:False|0|None|not\s+True|1\s*==\s*0|0\s*==\s*1)$/.test(text)
     || (/\band\b/.test(text) && text.split(/\band\b/).some(part => pythonAlwaysFalse(part)));
 }
 
 function deadRanges(text) {
-  const ranges = [...text.matchAll(/^[ \t]*(?:if|while)\s+([^:\n(][^:\n]*):/gm)]
+  const ranges = [...text.matchAll(/^[ \t]*(?:if|while)\s+([^:\n]+):/gm)]
     .filter(branch => pythonAlwaysFalse(branch[1]))
     .map(branch => ({ start: branch.index, end: branch.index + suiteAt(text, branch.index).length }));
   for (const branch of branches(text)) {
@@ -323,7 +334,8 @@ function callAt(text, from) {
     // ...unless something rewrote it in between: `options.signal = undefined`
     // means the call receives a different object than the literal shows.
     const rewritten = binding && [...text.matchAll(new RegExp(
-      String.raw`\b${second}\s*(?:\.\s*\w+|\[[^\]]*\])\s*=(?!=)`, 'g'))]
+      String.raw`\b${second}\s*(?:\.\s*\w+|\[[^\]]*\])\s*=(?!=)`
+      + String.raw`|Object\s*\.\s*assign\s*\(\s*${second}\b|delete\s+${second}\s*[.[]`, 'g'))]
       .some(write => write.index > binding.index && write.index < paren.open);
     if (binding && !rewritten) literal = blockAt(text, binding.index);
   }
@@ -494,7 +506,9 @@ const CHECKS = {
     // line still owns everything up to its closing paren.
     const returnedBy = body => {
       // The first return control can actually arrive at.
-      const at = [...body.matchAll(/\breturn\b/g)].find(hit => reachableAt(body, hit.index));
+      // The last live return: a conditional diagnostic `return beta` says
+      // nothing about the reading the function normally produces.
+      const at = [...body.matchAll(/\breturn\b/g)].filter(hit => reachableAt(body, hit.index)).pop();
       if (!at) return null;
       let text = '';
       let depth = 0;
@@ -525,7 +539,9 @@ const CHECKS = {
     const consumedByResult = (owner, name) => resultTokens(owner).has(name);
     const tunable = signatures.filter(onPath)
       // `beta: float = 3950` names the parameter before its annotation.
-      .flatMap(signature => [...signature.params.matchAll(/(\w+)\s*(?::\s*[^,=)]+?\s*)?=(?!=)/g)]
+      .flatMap(signature => splitArgs(signature.params)
+        .map(part => /^(\w+)\s*(?::[\s\S]*?)?=(?!=)/.exec(part))
+        .filter(Boolean)
         .map(parameter => ({ name: parameter[1], owner: signature.name })))
       .some(parameter => knob.test(parameter.name)
         && consumedByResult(parameter.owner, parameter.name))
@@ -560,7 +576,7 @@ const CHECKS = {
     // the try, and the try/except/else layout.
     // The sentinel `assert False` runs inside the try, so a broad `except` would
     // swallow its own AssertionError; only a named exception proves rejection.
-    const markers = /with\s+[\w.]*pytest\.raises\s*\(|assertRaises\s*\(|assert\.throws\s*\(|toThrow\s*\(|expect\([^\n]*\)\.rejects|assert\s+(?:await\s+)?(?:rejects?|raises?|throws?)\s*\([^)\n]+\)|try\s*:[\s\S]{0,200}\w+\s*\([^)\n]*\)[\s\S]{0,120}(?:\bassert\s+False\b|raise\s+AssertionError)[\s\S]{0,160}except\s+(?!\(?\s*(?:Exception|BaseException)\b)[\w(]|try\s*:[\s\S]{0,300}\w+\s*\([^)]*\)[\s\S]{0,240}except\b[\s\S]{0,160}else\s*:[\s\S]{0,120}(?:assert\s+False|raise\s+AssertionError)/gi;
+    const markers = /with\s+[\w.]*pytest\.raises\s*\(|assertRaises\s*\(|assert\.throws\s*\(|toThrow\s*\(|expect\([^\n]*\)\.rejects|assert\s+(?:await\s+)?(?:rejects?|raises?|throws?)\s*\([^)\n]+\)|try\s*:[\s\S]{0,200}\w+\s*\([^)\n]*\)[\s\S]{0,120}(?:\bassert\s+False\b|raise\s+AssertionError)[\s\S]{0,160}except\s+(?![^:\n]*\b(?:Exception|BaseException)\b)[\w(]|try\s*:[\s\S]{0,300}\w+\s*\([^)]*\)[\s\S]{0,240}except\b[\s\S]{0,160}else\s*:[\s\S]{0,120}(?:assert\s+False|raise\s+AssertionError)/gi;
     // Proving that some other call raises says nothing about this parser, so the
     // failure check has to reach the function under test — directly or one hop
     // through a helper it defines.
@@ -620,9 +636,8 @@ const CHECKS = {
       const lineStart = t.lastIndexOf('\n', index) + 1;
       const indent = t.slice(lineStart).search(/\S/);
       if (indent <= 0) return true;
-      // `if not True`, `if 1 == 0` and `if False or False` are all dead too.
-      const never = condition => condition.split(/\bor\b/).every(part => part.split(/\band\b/)
-        .some(operand => /^\s*(?:False|0|None|not\s+True|1\s*==\s*0|0\s*==\s*1)\s*$/.test(operand)));
+      // Shares the module's constant folding, so `if (False):` counts too.
+      const never = pythonAlwaysFalse;
       const owner = [...t.slice(0, lineStart)
         .matchAll(/^([ \t]*)(?:def\s+(\w+)\s*\(|(?:if|while)\s+([^:\n]+):)/gm)]
         .map(match => (match[3] !== undefined && !never(match[3]) ? null : match))
@@ -669,10 +684,22 @@ const CHECKS = {
       // `current = {}` before the merge empties what the spread preserves.
       // Rebinding it, writing through it, or deleting from it: all three make
       // the spread preserve something other than what the caller passed in.
+      // ...through either input or anything aliased to it.
+      const inputs = new Set([match[2], match[3]]);
+      for (let grew = true; grew;) {
+        grew = false;
+        for (const bound of body.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*(\w+)\s*[;,\n]/g)) {
+          if (inputs.has(bound[2]) && !inputs.has(bound[1])) {
+            inputs.add(bound[1]);
+            grew = true;
+          }
+        }
+      }
+      const named = [...inputs].join('|');
       const overwritten = new RegExp(
-        String.raw`\b(?:${match[2]}|${match[3]})\s*(?:\.\s*\w+|\[[^\]]*\])?\s*=(?!=)`
-        + String.raw`|delete\s+(?:${match[2]}|${match[3]})\s*[.[]`
-        + String.raw`|Object\s*\.\s*assign\s*\(\s*(?:${match[2]}|${match[3]})\b`, 'g');
+        String.raw`(?<!(?:const|let|var)\s{1,8})\b(?:${named})\s*(?:\.\s*\w+|\[[^\]]*\])?\s*=(?!=)`
+        + String.raw`|delete\s+(?:${named})\s*[.[]`
+        + String.raw`|Object\s*\.\s*assign\s*\(\s*(?:${named})\b`, 'g');
       if ([...body.matchAll(overwritten)].some(reset => reset.index < merge.index)) return false;
       // Any earlier return reaches the caller before the merge ever runs, so it
       // is only harmless when it hands the existing settings straight back.
@@ -798,8 +825,25 @@ const CHECKS = {
     const keysOf = object => [...String(object || '').matchAll(/["']?(\w+)["']?\s*:/g)].map(match => match[1]);
     const untouched = keysOf(args && (args.match(/\(?\s*(\{[\s\S]*?\})\s*,/) || [])[1])
       .filter(key => !keysOf(patch).includes(key));
-    const checksPreserved = untouched.some(key => new RegExp(String.raw`["']?\b${key}\b["']?\s*:`).test(expected)
-      || new RegExp(String.raw`\.${key}\b`).test(assertions));
+    // ...at the value it started with: asserting `result.theme === 'light'`
+    // for an original `theme: 'dark'` proves the opposite of preservation.
+    const settled = args && (args.match(/\(?\s*(\{[\s\S]*?\})\s*,/) || [])[1];
+    const escapeFor = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const originalOf = key => {
+      const found = new RegExp(String.raw`["']?\b${key}\b["']?\s*:\s*([^,}]+)`).exec(settled || '');
+      if (!found) return null;
+      const value = found[1].trim();
+      return /^['"]/.test(value)
+        ? String.raw`['"]${escapeFor(value.replace(/^['"]|['"]$/g, ''))}['"]`
+        : escapeFor(value);
+    };
+    const checksPreserved = untouched.some(key => {
+      const value = originalOf(key);
+      if (!value) return false;
+      return new RegExp(String.raw`["']?\b${key}\b["']?\s*:\s*${value}`).test(expected)
+        || new RegExp(String.raw`\.\s*${key}\s*===?\s*${value}`).test(assertions)
+        || new RegExp(String.raw`\(\s*\w+\s*\.\s*${key}\s*,\s*${value}\s*[,)]`).test(assertions);
+    });
     return updater && falsyPatch && checksFalsy && checksPreserved
       && (inlineCall || !assigned || runs(assigned.index))
       && (!onResult || (runs(structural.index)
@@ -876,7 +920,8 @@ const CHECKS = {
         .pop();
       // ...unless it was rewritten in between, as for any other call site.
       const rewritten = binding && [...t.matchAll(new RegExp(
-        String.raw`\b${argument}\s*(?:\.\s*\w+|\[[^\]]*\])\s*=(?!=)`, 'g'))]
+        String.raw`\b${argument}\s*(?:\.\s*\w+|\[[^\]]*\])\s*=(?!=)`
+        + String.raw`|Object\s*\.\s*assign\s*\(\s*${argument}\b|delete\s+${argument}\s*[.[]`, 'g'))]
         .some(write => write.index > binding.index && write.index < delegateAt.index);
       return binding && !rewritten ? blockAt(t, binding.index) : '';
     };
@@ -998,9 +1043,12 @@ const CHECKS = {
     // pending, however faithfully each handler calls it.
     // Any reachable throw, not just an unconditional one: on that path both
     // handlers exit before settling.
+    // A cleanup that throws leaves the promise pending; one that settles takes
+    // the outcome away from the handler that called it.
     const cleanupEscapes = cleanupHandler
-      && [...cleanupHandler.body.matchAll(/(?<![.\w])throw\b/g)]
-        .some(hit => reachableAt(cleanupHandler.body, hit.index));
+      && ([...cleanupHandler.body.matchAll(/(?<![.\w])throw\b/g)]
+        .some(hit => reachableAt(cleanupHandler.body, hit.index))
+        || /(?<![.\w])(?:resolve|reject)\s*\(/.test(cleanupHandler.body));
     // Removal has to happen on the object the listener was registered on;
     // otherEmitter.off(...) leaves the real listener installed.
     // A registration behind `if (false)` never installs: both have to run on the
@@ -1300,9 +1348,23 @@ const CHECKS = {
         const signature = declared && parenAt(t, declared.index + declared[0].length);
         const parameter = signature && splitArgs(signature.inner)[passed];
         if (!parameter || !/^\w+$/.test(parameter)) return false;
+        // ...through the helper's own aliases: `const alias = target;
+        // alias.protocol = 'http:'` never writes to `target` by name.
+        const helperBody = blockAt(t, declared.index);
+        const local = new Set([parameter]);
+        for (let grew = true; grew;) {
+          grew = false;
+          for (const bound of helperBody.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*(\w+)\s*[;,\n]/g)) {
+            if (local.has(bound[2]) && !local.has(bound[1])) {
+              local.add(bound[1]);
+              grew = true;
+            }
+          }
+        }
+        const written = [...local].join('|');
         return new RegExp(
-          String.raw`\b${parameter}\s*(?:\.\s*\w+|\[[^\]]*\])\s*=(?!=)`
-          + String.raw`|Object\s*\.\s*assign\s*\(\s*${parameter}\b`).test(blockAt(t, declared.index));
+          String.raw`\b(?:${written})\s*(?:\.\s*\w+|\[[^\]]*\])\s*=(?!=)`
+          + String.raw`|Object\s*\.\s*assign\s*\(\s*(?:${written})\b`).test(helperBody);
       }).map(call => call.index));
     // ...that can actually run on the way to the request: an uncalled helper
     // rewriting the URL never touches the one this request sends to.
@@ -1342,7 +1404,7 @@ const CHECKS = {
       if (/^[\d._\s*+()]+$/.test(text)) {
         const evaluated = Function(`"use strict";return (${text.replace(/_/g, '')})`)();
         // Node rejects anything past 2^31-1 before the request starts.
-        return Number.isFinite(evaluated) && evaluated > 0 && evaluated <= 2147483647;
+        return Number.isInteger(evaluated) && evaluated > 0 && evaluated <= 2147483647;
       }
       // NaN, nullish and booleans all throw at the call.
       if (/^(?:NaN|null|undefined|true|false)$/.test(text)) return false;
@@ -1431,12 +1493,16 @@ const CHECKS = {
         // right after the headers arrive leaves the stream able to stall.
         const consumerEnd = consumer
           ? consumer.index + consumer.header.length + consumer.body.length : t.length;
-        const finallys = blockRanges(t, /\bfinally\b/g);
+        // ...and only the finally whose try encloses the consumption is the
+        // cleanup one; an inner finally right after fetch clears it too soon.
+        const guarding = blockRanges(t, /\bfinally\b/g).filter(range => blockRanges(t, /\btry\b/g)
+          .some(guarded => guarded.end <= range.open && range.open - guarded.end < 24
+            && consumer && consumer.index > guarded.open && consumer.index < guarded.end));
         const clearedEarly = timer && timer[1] && [...t.matchAll(
           new RegExp(String.raw`clearTimeout\s*\(\s*${timer[1]}\s*\)`, 'g'))]
           .some(clear => clear.index > request.index && clear.index < consumerEnd
             && reachableAt(t, clear.index)
-            && !finallys.some(range => clear.index > range.open && clear.index < range.end));
+            && !guarding.some(range => clear.index > range.open && clear.index < range.end));
         if (clearedEarly) return false;
         // ...in the finally that guards this request's own try, not one in a
         // sibling helper that never runs.
@@ -1484,6 +1550,21 @@ const CHECKS = {
     }));
     // Teardown has to be on the stream this loop reads: `audit.cancel()` leaves
     // the locked reader and its fetch wide open.
+    // `values({ preventCancel: true })` keeps the source running when the
+    // iterator closes, however the options reached it.
+    const iteratorOptions = (() => {
+      if (!consumer) return '';
+      const values = /\.\s*values\s*(?=\()/.exec(consumer.header);
+      if (!values) return '';
+      const given = parenAt(consumer.header, values.index + values[0].length);
+      const argument = given && given.inner.trim();
+      if (!argument) return '';
+      if (argument.startsWith('{')) return argument;
+      const binding = new RegExp(String.raw`(?:const|let|var)\s+${argument}\s*=\s*\{`).exec(t);
+      return binding ? blockAt(t, binding.index) : '';
+    })();
+    const preventsCancel = /preventCancel\s*:\s*true/.test(
+      `${consumer ? consumer.header : ''}${iteratorOptions}`);
     // A fetch Response has no `cancel`: only its reader, its body, or the
     // controller that aborted the request can actually tear this down.
     const readers = [...t.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*([\w.$]+)\s*\.\s*getReader\s*\(/g)]
@@ -1500,7 +1581,7 @@ const CHECKS = {
       // throws; it only tears down an iterator-style consumer.
       // ...and an iterator asked not to cancel holds the lock without ever
       // releasing the source, so body.cancel() throws there too.
-      ...(readers.length || (consumer && /preventCancel\s*:\s*true/.test(consumer.header))
+      ...(readers.length || preventsCancel
         ? [] : stream.map(name => String.raw`\b${name}\s*\.\s*body\s*\.\s*cancel\s*\(`)),
       ...controllers.map(name => String.raw`\b${name}\s*\.\s*abort\s*\(`),
     ];
@@ -1553,15 +1634,24 @@ const CHECKS = {
       && sameScope(t, initAt.index, consumer.index)
       && dominates(t, initAt.index, consumer.index));
     // `received += n; received = 0; if (received > MAX)` counts nothing.
+    // ...anywhere later in the loop: counting, checking, writing and then
+    // `received = 0` lets any number of small chunks through.
     const restarted = counter && [...scope.matchAll(new RegExp(String.raw`\b${counter[1]}\s*=(?!=)`, 'g'))]
-      .some(reset => reset.index > counter.index
-        && (!limitBranch || reset.index < limitBranch.index));
+      .some(reset => reset.index > counter.index);
     const predictive = Boolean(limitBranch && limitBranch.predictive);
     const ceiling = limitBranch && limitBranch.ceiling;
     // `received > NaN` is false for every response.
-    const finite = Boolean(ceiling) && !/Infinity|NaN/.test(ceiling)
-      && !(/^[\w.$]+$/.test(ceiling)
-        && new RegExp(String.raw`\b${ceiling}\s*=\s*(?:Infinity|NaN|Number\s*\.\s*(?:MAX_VALUE|MAX_SAFE_INTEGER|POSITIVE_INFINITY|NaN))`).test(t));
+    // Followed through simple bindings: `const LIMIT = Infinity; const MAX = LIMIT`
+    // is the same unbounded ceiling written twice.
+    const unbounded = (value, seen = new Set()) => {
+      const text = String(value || '').trim();
+      if (!text) return false;
+      if (/Infinity|NaN|Number\s*\.\s*(?:MAX_VALUE|MAX_SAFE_INTEGER|POSITIVE_INFINITY)/.test(text)) return true;
+      if (!/^[A-Za-z_$][\w$]*$/.test(text) || seen.has(text)) return false;
+      const bound = new RegExp(String.raw`\b${text}\s*=\s*([^;\n,)]+)`).exec(t);
+      return Boolean(bound) && unbounded(bound[1], new Set([...seen, text]));
+    };
+    const finite = Boolean(ceiling) && !unbounded(ceiling);
     // `return` exits one data callback but leaves an evented stream flowing, so
     // the over-limit path has to tear the stream down too.
     // The chunk has to be counted before it is judged, or the last oversized one
