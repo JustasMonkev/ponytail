@@ -27,6 +27,13 @@ test("parsePonytailCommand rejects review as a default (session-only mode, #377)
   assert.deepEqual(parsePonytailCommand("default review", "full"), { type: "invalid", reason: "invalid-default-mode" });
 });
 
+test("parsePonytailCommand parses badge subcommand (#618)", () => {
+  assert.deepEqual(parsePonytailCommand("badge off", "full"), { type: "set-badge", hide: true });
+  assert.deepEqual(parsePonytailCommand("badge on", "full"), { type: "set-badge", hide: false });
+  assert.deepEqual(parsePonytailCommand("badge", "full"), { type: "invalid", reason: "invalid-badge-arg" });
+  assert.deepEqual(parsePonytailCommand("badge maybe", "full"), { type: "invalid", reason: "invalid-badge-arg" });
+});
+
 test("resolveSessionMode still honors review as a session mode (not a default)", () => {
   const entries = [{ type: "custom", customType: "ponytail-mode", data: { mode: "review" } }];
   assert.equal(resolveSessionMode(entries, "full"), "review");

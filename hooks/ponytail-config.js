@@ -150,6 +150,21 @@ function writeDefaultMode(mode) {
   return normalized;
 }
 
+// Persist the status-badge preference (#618). Mirrors writeDefaultMode; the
+// PONYTAIL_HIDE_STATUS env var still wins over the stored value on read.
+function writeHideStatus(hide) {
+  const configPath = getConfigPath();
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  let config = {};
+  try {
+    config = JSON.parse(fs.readFileSync(configPath, 'utf8').replace(/^\uFEFF/, ''));
+    if (!config || typeof config !== 'object' || Array.isArray(config)) config = {};
+  } catch (_) {}
+  config.hideStatus = hide === true;
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
+  return config.hideStatus;
+}
+
 module.exports = {
   DEFAULT_MODE,
   VALID_MODES,
@@ -166,4 +181,5 @@ module.exports = {
   normalizePersistedMode,
   isDeactivationCommand,
   writeDefaultMode,
+  writeHideStatus,
 };
