@@ -942,6 +942,7 @@ test('bounds: timeout and enforced streaming byte ceiling pass', () => {
   const r = check('bounds',
     '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
     'const maxBytes = 10 * 1024 * 1024;\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet receivedBytes = 0;\n' +
     'while (true) {\n  const { done, value } = await reader.read();\n  if (done) break;\n' +
     '  receivedBytes += value.byteLength;\n  if (receivedBytes > maxBytes) { await reader.cancel(); throw new Error("too large"); }\n' +
@@ -989,18 +990,21 @@ test('bounds: cancelling without stopping before write fails', () => {
 test('bounds: arbitrary accumulator and ceiling names pass', () => {
   const r = check('bounds',
     '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet downloaded = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\ndownloaded += value.byteLength;\n' +
-    '  if (downloaded > MAX_DOWNLOAD_SIZE) throw new Error("too large");\nawait file.write(value);\n}\n```');
+    '  if (downloaded > MAX_DOWNLOAD_SIZE) { await reader.cancel(); throw new Error("too large"); }\n' +
+    'await file.write(value);\n}\n```');
   assert.equal(r.pass, true);
 });
 
 test('bounds: multiline fetch options pass', () => {
   const r = check('bounds',
     '```javascript\nconst response = await fetch(url, {\n  method: "GET",\n  signal: AbortSignal.timeout(10_000),\n});\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
-    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+    '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, true);
 });
 
@@ -1024,9 +1028,10 @@ test('bounds: Node stream methods on a fetch body fail at runtime', () => {
 test('bounds: pre-created timeout signal passes', () => {
   const r = check('bounds',
     '```javascript\nconst signal = AbortSignal.timeout(10_000);\nconst response = await fetch(url, { signal });\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
-    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+    '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, true);
 });
 
@@ -1034,9 +1039,10 @@ test('bounds: nested fetch options still expose the timeout signal', () => {
   const r = check('bounds',
     '```javascript\nconst response = await fetch(url, {\n  headers: { Accept: "text/csv" },\n' +
     '  signal: AbortSignal.timeout(10_000),\n});\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
-    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+    '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, true);
 });
 
@@ -1055,15 +1061,17 @@ test('bounds: a timer aborting a different controller does not bound the fetch',
     '```javascript\nconst controller = new AbortController();\n' +
     'setTimeout(() => otherController.abort(), 10_000);\n' +
     'const response = await fetch(url, { signal: controller.signal });\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
-    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+    '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, false);
 });
 
 test('bounds: checking the ceiling before counting the chunk fails', () => {
   const r = check('bounds',
     '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\n' +
     '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n' +
@@ -1076,24 +1084,27 @@ test('bounds: a timer armed after the request does not bound it', () => {
     '```javascript\nconst controller = new AbortController();\n' +
     'const response = await fetch(url, { signal: controller.signal });\n' +
     'setTimeout(() => controller.abort(), 10_000);\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
-    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+    '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, false);
 });
 
 test('bounds: a literal byte ceiling passes', () => {
   const r = check('bounds',
     '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
-    '  if (received > 10 * 1024 * 1024) throw new Error("too large");\nawait file.write(value);\n}\n```');
+    '  if (received > 10 * 1024 * 1024) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, true);
 });
 
 test('bounds: a bounded native https download passes', () => {
   const r = check('bounds',
     '```javascript\nconst response = await https.get(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'const file = createWriteStream(destination);\n' +
     'let received = 0;\nresponse.on("data", chunk => {\n  received += chunk.length;\n' +
     '  if (received > MAX_BYTES) { response.destroy(new Error("too large")); return; }\n' +
     '  file.write(chunk);\n});\n```');
@@ -1104,15 +1115,17 @@ test('bounds: a signal assigned after the request does not bound it', () => {
   const r = check('bounds',
     '```javascript\nlet signal;\nconst response = await fetch(url, { signal });\n' +
     'signal = AbortSignal.timeout(10_000);\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
-    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+    '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, false);
 });
 
 test('bounds: writing the chunk before the guard fails', () => {
   const r = check('bounds',
     '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
     '  await file.write(value);\n  if (received > MAX_BYTES) throw new Error("too large");\n' +
@@ -1124,15 +1137,17 @@ test('bounds: a bounded probe does not bound the unbounded report request', () =
   const r = check('bounds',
     '```javascript\nawait fetch(metaUrl, { signal: AbortSignal.timeout(2_000) });\n' +
     'const response = await fetch(url);\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
-    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+    '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, false);
 });
 
 test('bounds: returning a truncated download instead of failing fails', () => {
   const r = check('bounds',
     '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
     '  if (received > MAX_BYTES) { await reader.cancel(); return; }\nawait file.write(value);\n}\n```');
@@ -1142,6 +1157,7 @@ test('bounds: returning a truncated download instead of failing fails', () => {
 test('bounds: a commented-out byte guard is not a ceiling', () => {
   const r = check('bounds',
     '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
     '  // if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
@@ -1151,6 +1167,7 @@ test('bounds: a commented-out byte guard is not a ceiling', () => {
 test('bounds: tearing down an unrelated object does not stop the stream', () => {
   const r = check('bounds',
     '```javascript\nconst response = await https.get(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'const file = createWriteStream(destination);\n' +
     'let received = 0;\nresponse.on("data", chunk => {\n  received += chunk.length;\n' +
     '  if (received > MAX_BYTES) { otherController.abort(new Error("too large")); return; }\n' +
     '  file.write(chunk);\n});\n```');
@@ -1161,18 +1178,20 @@ test('bounds: a timeout armed only in an uncalled helper fails', () => {
   const r = check('bounds',
     '```javascript\nlet signal;\nfunction unused() { signal = AbortSignal.timeout(10_000); }\n' +
     'const response = await fetch(url, { signal });\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
-    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+    '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, false);
 });
 
 test('bounds: an accumulator that never grows fails', () => {
   const r = check('bounds',
     '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += 0 * value.byteLength;\n' +
-    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+    '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, false);
 });
 
@@ -1180,27 +1199,30 @@ test('bounds: an Infinity ceiling is not a ceiling', () => {
   const r = check('bounds',
     '```javascript\nconst MAX_BYTES = Infinity;\n' +
     'const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
-    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+    '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, false);
 });
 
 test('bounds: counting an unrelated value is not counting the chunk', () => {
   const r = check('bounds',
     '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += destination.length;\n' +
-    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+    '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, false);
 });
 
 test('bounds: a predictive byte guard passes', () => {
   const r = check('bounds',
     '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\n' +
-    '  if (received + value.byteLength > MAX_BYTES) throw new Error("too large");\n' +
+    '  if (received + value.byteLength > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\n' +
     'received += value.byteLength;\n  await file.write(value);\n}\n```');
   assert.equal(r.pass, true);
 });
@@ -1208,8 +1230,10 @@ test('bounds: a predictive byte guard passes', () => {
 test('bounds: a for-await consumer links to its timed request', () => {
   const r = check('bounds',
     '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10_000) });\n' +
+    'const file = await open(destination, "w");\n' +
     'let received = 0;\nfor await (const chunk of response.body) {\n  received += chunk.byteLength;\n' +
-    '  if (received > MAX_BYTES) throw new Error("too large");\n  await file.write(chunk);\n}\n```');
+    '  if (received > MAX_BYTES) { await response.body.cancel(); throw new Error("too large"); }\n' +
+    '  await file.write(chunk);\n}\n```');
   assert.equal(r.pass, true);
 });
 
@@ -1218,15 +1242,17 @@ test('bounds: a timer cleared before the request bounds nothing', () => {
     '```javascript\nconst controller = new AbortController();\n' +
     'const timer = setTimeout(() => controller.abort(), 10_000);\nclearTimeout(timer);\n' +
     'const response = await fetch(url, { signal: controller.signal });\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
-    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+    '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, false);
 });
 
 test('bounds: a callback-style native https download passes', () => {
   const r = check('bounds',
-    '```javascript\nhttps.get(url, { signal: AbortSignal.timeout(10_000) }, response => {\n' +
+    '```javascript\nconst file = createWriteStream(destination);\n' +
+    'https.get(url, { signal: AbortSignal.timeout(10_000) }, response => {\n' +
     '  let received = 0;\n  response.on("data", chunk => {\n    received += chunk.length;\n' +
     '    if (received > MAX_BYTES) { response.destroy(new Error("too large")); return; }\n' +
     '    file.write(chunk);\n  });\n});\n```');
@@ -1236,10 +1262,11 @@ test('bounds: a callback-style native https download passes', () => {
 test('bounds: a timeout in an unrelated later block does not bound the request', () => {
   const r = check('bounds',
     '```javascript\nconst response = await fetch(url);\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const opts = { signal: AbortSignal.timeout(10_000) };\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
-    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+    '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, false);
 });
 
@@ -1272,6 +1299,7 @@ test('revalidate: a block-commented policy guard is not a guard', () => {
 test('bounds: a trailing-comment byte guard is not a ceiling', () => {
   const r = check('bounds',
     '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
     '  await file.write(value); // if (received > MAX_BYTES) throw new Error("too large");\n}\n```');
@@ -1375,9 +1403,10 @@ test('bounds: a timeout armed only in a branch does not bound the request', () =
     '```javascript\nlet controller;\nif (enforceDeadline) {\n' +
     '  controller = new AbortController();\n  setTimeout(() => controller.abort(), 10000);\n}\n' +
     'const response = await fetch(url, { signal: controller.signal });\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
-    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+    '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, false);
 });
 
@@ -1388,6 +1417,7 @@ test('bounds: a bounded request in another function does not bound this reader',
     '  return response.status;\n}\n' +
     'async function download(url, file) {\n' +
     '  const response = await fetch(url);\n' +
+    '  const file = await open(destination, "w");\n' +
     '  const reader = response.body.getReader();\n  let received = 0;\n  while (true) {\n' +
     '    const { done, value } = await reader.read(); if (done) break;\n    received += value.byteLength;\n' +
     '    if (received > MAX_BYTES) throw new Error("too large");\n    await file.write(value);\n  }\n}\n```');
@@ -1397,6 +1427,7 @@ test('bounds: a bounded request in another function does not bound this reader',
 test('bounds: a conjunction that disables the byte ceiling fails', () => {
   const r = check('bounds',
     '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
     '  if (received > MAX_BYTES && strictMode) throw new Error("too large");\nawait file.write(value);\n}\n```');
@@ -1430,6 +1461,7 @@ test('revalidate: a nested conditional throw does not reject the invalid path', 
 test('bounds: a conditional throw in the over-limit branch still writes', () => {
   const r = check('bounds',
     '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
     '  if (received > MAX_BYTES) { if (strict) throw new Error("too large"); }\nawait file.write(value);\n}\n```');
@@ -1530,9 +1562,10 @@ test('revalidate: an alias created by later assignment is still the same URL', (
 test('bounds: a signal nested in headers is not the request signal', () => {
   const r = check('bounds',
     '```javascript\nconst response = await fetch(url, { headers: { signal: AbortSignal.timeout(10000) } });\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
-    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+    '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, false);
 });
 
@@ -1568,9 +1601,10 @@ test('bounds: a timeout behind a call-shaped condition does not bound the reques
     '```javascript\nlet controller;\nif (config.get("strict")) {\n' +
     '  controller = new AbortController();\n  setTimeout(() => controller.abort(), 10000);\n}\n' +
     'const response = await fetch(url, { signal: controller.signal });\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
-    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+    '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, false);
 });
 
@@ -1628,9 +1662,10 @@ test('bounds: a manual abort timer that is never cleared leaks', () => {
     '```javascript\nconst controller = new AbortController();\n' +
     'const timer = setTimeout(() => controller.abort(), 10000);\n' +
     'const response = await fetch(url, { signal: controller.signal });\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
-    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+    '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, false);
 });
 
@@ -1639,9 +1674,10 @@ test('bounds: a manual abort timer cleared in finally passes', () => {
     '```javascript\nconst controller = new AbortController();\n' +
     'const timer = setTimeout(() => controller.abort(), 10000);\ntry {\n' +
     '  const response = await fetch(url, { signal: controller.signal });\n' +
+    '  const file = await open(destination, "w");\n' +
     '  const reader = response.body.getReader();\n  let received = 0;\n  while (true) {\n' +
     '    const { done, value } = await reader.read(); if (done) break;\n    received += value.byteLength;\n' +
-    '    if (received > MAX_BYTES) throw new Error("too large");\n    await file.write(value);\n  }\n' +
+    '    if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\n    await file.write(value);\n  }\n' +
     '} finally {\n  clearTimeout(timer);\n}\n```');
   assert.equal(r.pass, true);
 });
@@ -1685,9 +1721,10 @@ test('lifecycle: an unbalanced brace in an error message does not truncate', () 
 test('bounds: an unbalanced brace in an error message does not truncate', () => {
   const r = check('bounds',
     '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+    'const file = await open(destination, "w");\n' +
     'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
-    '  if (received > MAX_BYTES) throw new Error("too large {");\nawait file.write(value);\n}\n```');
+    '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large {"); }\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, true);
 });
 
@@ -1741,6 +1778,209 @@ test('contracts: a defaulted parameter does not make an uncalled helper run', ()
     '    { sound: false, volume: 0, label: "" });\n' +
     '  console.assert(result.sound === false); console.assert(result.volume === 0);\n' +
     '  console.assert(result.label === ""); console.assert(result.theme === "dark");\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+// --- round 4: escape hatches, scope, and syntax the answer may legally use ---
+
+test('revalidate: a catch that rethrows only sometimes still swallows', () => {
+  const r = check('revalidate',
+    '```javascript\nfunction validateWebhookUrl(candidate) {\n  try {\n' +
+    '    if (candidate.protocol !== "https:") throw new Error("insecure");\n' +
+    '    if (!allowedHosts.has(candidate.hostname)) throw new Error("bad host");\n' +
+    '  } catch (error) { if (debug) throw error; }\n}\n' +
+    'const saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\nvalidateWebhookUrl(url);\n' +
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a later helper’s options do not bound this request', () => {
+  const r = check('bounds',
+    '```javascript\nconst options = makeOptions();\n' +
+    'const response = await fetch(url, options);\n' +
+    'const file = await open(destination, "w");\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+    '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n' +
+    'function elsewhere() {\n  const options = { signal: AbortSignal.timeout(10000) };\n  return options;\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('hardware: a balanced parameter list still exposes the coefficient', () => {
+  const r = check('hardware',
+    '```python\ndef read_temperature(channel=default_channel(), beta=3950):\n' +
+    '    return _steinhart(channel, beta)\n```\nReturns degrees Celsius.');
+  assert.equal(r.pass, true);
+});
+
+test('hardware: a knob on a helper the reader never calls is not a knob', () => {
+  const r = check('hardware',
+    '```python\ndef read_temperature(adc):\n    return adc.read(0) * 0.1\n\n' +
+    'def helper(beta=3950):\n    return beta\n```\nReturns degrees Celsius.');
+  assert.equal(r.pass, false);
+});
+
+test('lifecycle: a brace in a multiline template literal does not truncate', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, signal) {\n' +
+    '  return new Promise((resolve, reject) => {\n' +
+    '    if (signal.aborted) return reject(signal.reason);\n' +
+    '    const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+    '    const done = value => { cleanup(); resolve(value); };\n' +
+    '    const aborted = () => { cleanup(); reject(new Error(`aborted\n{`)); };\n' +
+    '    emitter.once("download", done); signal.addEventListener("abort", aborted);\n' +
+    '  });\n}\n```');
+  assert.equal(r.pass, true);
+});
+
+test('bounds: a for-await header containing a call is still a consumer', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+    'const file = await open(destination, "w");\nlet received = 0;\n' +
+    'for await (const chunk of response.body.values()) {\n  received += chunk.byteLength;\n' +
+    '  if (received > MAX_BYTES) { await response.body.cancel(); throw new Error("too large"); }\n' +
+    '  await file.write(chunk);\n}\n```');
+  assert.equal(r.pass, true);
+});
+
+test('lifecycle: a pre-abort guard that only sometimes rejects falls through', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, signal) {\n' +
+    '  return new Promise((resolve, reject) => {\n' +
+    '    if (signal.aborted) { if (strict) return reject(signal.reason); }\n' +
+    '    const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+    '    const done = value => { cleanup(); resolve(value); };\n' +
+    '    const aborted = () => { cleanup(); reject(signal.reason); };\n' +
+    '    emitter.once("download", done); signal.addEventListener("abort", aborted);\n' +
+    '  });\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('lifecycle: a conditionally settling handler leaves the promise pending', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, signal) {\n' +
+    '  return new Promise((resolve, reject) => {\n' +
+    '    if (signal.aborted) return reject(signal.reason);\n' +
+    '    const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+    '    const done = value => { cleanup(); resolve(value); };\n' +
+    '    const aborted = () => { cleanup(); if (strict) { log(); reject(signal.reason); } };\n' +
+    '    emitter.once("download", done); signal.addEventListener("abort", aborted);\n' +
+    '  });\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('contracts: a negative assertion API proves the opposite contract', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) { return { ...current, ...patch }; }\n' +
+    'const result = updateSettings({ theme: "dark", sound: true, label: "x" },\n' +
+    '  { sound: false, volume: 0, label: "" });\n' +
+    'assert.notEqual(result.sound, false); assert.notEqual(result.volume, 0);\n' +
+    'assert.notEqual(result.label, ""); assert.notEqual(result.theme, "dark");\n```');
+  assert.equal(r.pass, false);
+});
+
+test('contracts: quoted property names are ordinary keys', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) { return { ...current, ...patch }; }\n' +
+    'const result = updateSettings({ "theme": "dark", "sound": true, "label": "x" },\n' +
+    '  { "sound": false, "volume": 0, "label": "" });\n' +
+    'console.assert(result.sound === false); console.assert(result.volume === 0);\n' +
+    'console.assert(result.label === ""); console.assert(result.theme === "dark");\n```');
+  assert.equal(r.pass, true);
+});
+
+test('onecheck: a helper that parses its own literal never tests the input', () => {
+  const r = check('onecheck',
+    '```python\ndef parse_duration(s):\n    return 0\n\ndef check_failure(s):\n    try:\n' +
+    '        parse_duration("1h")\n    except ValueError:\n        return True\n' +
+    '    raise ValueError("nope")\n\nwith pytest.raises(ValueError):\n    check_failure("malformed")\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: an unawaited async validator does not gate the request', () => {
+  const r = check('revalidate',
+    '```javascript\nasync function validateWebhookUrl(candidate) {\n' +
+    '  if (candidate.protocol !== "https:") throw new Error("insecure");\n' +
+    '  if (!allowedHosts.has(candidate.hostname)) throw new Error("bad host");\n}\n' +
+    'const saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\nvalidateWebhookUrl(url);\n' +
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: an awaited async validator does gate the request', () => {
+  const r = check('revalidate',
+    '```javascript\nasync function validateWebhookUrl(candidate) {\n' +
+    '  if (candidate.protocol !== "https:") throw new Error("insecure");\n' +
+    '  if (!allowedHosts.has(candidate.hostname)) throw new Error("bad host");\n}\n' +
+    'const saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\nawait validateWebhookUrl(url);\n' +
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, true);
+});
+
+test('revalidate: a positive allow condition is the same policy', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'if (!(url.protocol === "https:" && allowedHosts.has(url.hostname))) throw new Error("bad");\n' +
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, true);
+});
+
+test('revalidate: the validated URL’s href is the same destination', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad");\n' +
+    'await fetch(url.href, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, true);
+});
+
+test('bounds: an absent timeout argument is not a deadline', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout() });\n' +
+    'const file = await open(destination, "w");\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+    '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: an infinite timeout argument is not a deadline', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(Infinity) });\n' +
+    'const file = await open(destination, "w");\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+    '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: an explicit accumulator assignment counts the same bytes', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+    'const file = await open(destination, "w");\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\n' +
+    'received = received + value.byteLength;\n' +
+    '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, true);
+});
+
+test('bounds: throwing without cancelling leaves the stream open', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+    'const file = await open(destination, "w");\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: writing the chunk somewhere other than the destination fails', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+    'const file = await open(destination, "w");\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+    '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\naudit.write(value);\n}\n```');
   assert.equal(r.pass, false);
 });
 

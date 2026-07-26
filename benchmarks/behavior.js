@@ -94,8 +94,10 @@ function masked(text) {
   while (i < chars.length) {
     const quote = chars[i];
     if (quote === '"' || quote === "'" || quote === '`') {
+      // A template literal legally spans lines; a quoted string does not, so
+      // only backticks stay open past a newline.
       let j = i + 1;
-      while (j < chars.length && chars[j] !== quote && chars[j] !== '\n') {
+      while (j < chars.length && chars[j] !== quote && (quote === '`' || chars[j] !== '\n')) {
         const step = chars[j] === '\\' ? 2 : 1;
         for (let k = j; k < Math.min(j + step, chars.length); k += 1) chars[k] = ' ';
         j += step;
@@ -221,9 +223,9 @@ function escapesCatch(text, index) {
   return blockRanges(text, /\btry\b/g).every(range => {
     if (index < range.open || index > range.end) return true;
     if (!/^\s*catch\b/.test(text.slice(range.end))) return true;
-    // A catch that rethrows is not a swallow: the failure still leaves.
-    const handler = blockAt(text, range.end);
-    return /\bthrow\b|(?<![.\w])reject\s*\(/.test(handler);
+    // A catch that rethrows is not a swallow — but only when it rethrows on
+    // every path: `catch (error) { if (debug) throw error; }` still swallows.
+    return alwaysReaches(blockAt(text, range.end), /\bthrow\b|(?<![.\w])reject\s*\(/);
   });
 }
 
@@ -256,7 +258,11 @@ function callAt(text, from) {
   let literal = '';
   if (second.startsWith('{')) literal = second;
   else if (/^\w+$/.test(second)) {
-    const binding = new RegExp(String.raw`(?:const|let|var)\s+${second}\s*=\s*\{`).exec(text);
+    // The binding this call actually sees: declared before it and visible on
+    // its path. A later helper's own `const options = {...}` is not this one.
+    const binding = [...text.matchAll(new RegExp(String.raw`(?:const|let|var)\s+${second}\s*=\s*\{`, 'g'))]
+      .filter(match => match.index < paren.open && sameScope(text, match.index, paren.open))
+      .pop();
     if (binding) literal = blockAt(text, binding.index);
   }
   return { args, options: topLevelOf(literal) };
@@ -303,8 +309,27 @@ function sameScope(text, index, target) {
 // The loop or listener that actually consumes the response stream. Counting
 // bytes in a later pass over a buffered array is not a ceiling.
 function streamConsumer(text) {
-  return [...text.matchAll(/(?:while\s*\([^)]{0,80}\)|for\s+await\s*\([^)]{0,120}\)|\.on\s*\(\s*['"]data['"]\s*,[^{]{0,60})\s*\{/g)]
-    .map(match => ({ index: match.index, header: match[0], body: blockAt(text, match.index + match[0].length - 1) }))
+  // Paren-balanced headers, so `for await (const chunk of response.body.values())`
+  // is not cut short at the iterable's own closing paren.
+  const braced = [...text.matchAll(/\bwhile\s*(?=\()|\bfor\s+await\s*(?=\()/g)]
+    .map(match => {
+      const paren = parenAt(text, match.index + match[0].length);
+      if (!paren || !/^\s*\{/.test(text.slice(paren.close + 1))) return null;
+      return {
+        index: match.index,
+        header: text.slice(match.index, paren.close + 1),
+        body: blockAt(text, paren.close + 1),
+      };
+    })
+    .filter(Boolean);
+  const evented = [...text.matchAll(/\.on\s*\(\s*['"]data['"]\s*,[^{]{0,60}\{/g)]
+    .map(match => ({
+      index: match.index,
+      header: match[0],
+      body: blockAt(text, match.index + match[0].length - 1),
+    }));
+  return [...braced, ...evented]
+    .sort((a, b) => a.index - b.index)
     .find(loop => /\.read\s*\(/.test(loop.body) || /for\s+await|['"]data['"]/.test(loop.header));
 }
 
@@ -339,8 +364,27 @@ const CHECKS = {
     // a defaulted parameter, or a value read from the environment, does not.
     const code = codeOf(output);
     const knob = /^(?:r_?0|beta|b_?coefficient|series_resistor|r_?series|r_?fixed|t_?0|offset|calibration\w*|adc_?ref|v_?ref)$/i;
-    const tunable = [...code.matchAll(/(?:def|function)\s+\w+\s*\(([^)]*)\)/g)]
-      .flatMap(signature => [...signature[1].matchAll(/(\w+)\s*=/g)])
+    // Paren-balanced, so an earlier default containing a call does not hide the
+    // coefficient after it: `def read_c(channel=pick(), beta=3950)`.
+    const signatures = [...code.matchAll(/(?:def|function)\s+(\w+)\s*(?=\()/g)]
+      .map(match => {
+        const paren = parenAt(code, match.index + match[0].length);
+        return paren && { name: match[1], params: paren.inner };
+      })
+      .filter(Boolean);
+    const bodyOfName = name => {
+      const at = new RegExp(String.raw`(?:def|function)\s+${name}\s*\(`).exec(code);
+      if (!at) return '';
+      return at[0].startsWith('function') ? blockAt(code, at.index) : suiteAt(code, at.index);
+    };
+    // ...and it has to be on the path the task asked for. A parameter on a
+    // helper the reader never calls calibrates nothing.
+    const reader = signatures.find(signature => /read|temp|celsius|thermistor|sensor/i.test(signature.name))
+      || signatures[0];
+    const onPath = signature => !reader || signature.name === reader.name
+      || new RegExp(String.raw`\b${signature.name}\s*\(`).test(bodyOfName(reader.name));
+    const tunable = signatures.filter(onPath)
+      .flatMap(signature => [...signature.params.matchAll(/(\w+)\s*=/g)])
       .some(parameter => knob.test(parameter[1]))
       || [...code.matchAll(/\b([A-Za-z_]\w*)\s*=\s*([^\n;]+)/g)]
         .some(binding => knob.test(binding[1])
@@ -391,9 +435,23 @@ const CHECKS = {
       if (!at) return '';
       return at[0].startsWith('function') ? blockAt(t, at.index) : suiteAt(t, at.index);
     };
+    // ...and the value under test has to reach the parser. A helper that calls
+    // the parser with its own literal proves nothing about the argument the
+    // check handed in, so its parameter has to flow into the subject call.
+    const forwards = name => {
+      const at = new RegExp(String.raw`(?:def|function)\s+${name}\s*\(`).exec(t);
+      if (!at) return false;
+      const params = parenAt(t, at.index + at[0].length - 1);
+      const body = at[0].startsWith('function') ? blockAt(t, at.index) : suiteAt(t, at.index);
+      const call = new RegExp(String.raw`(?<!def\s|function\s)\b${subject}\s*\(([^)]*)\)`).exec(body);
+      if (!params || !call) return false;
+      return splitArgs(params.inner)
+        .map(part => part.split(/[=:]/)[0].trim())
+        .filter(Boolean)
+        .some(parameter => new RegExp(String.raw`\b${parameter}\b`).test(call[1]));
+    };
     const reaching = scope => [...scope.matchAll(/\b(\w+)\s*\(([^)]*)\)/g)]
-      .filter(call => call[1] === subject
-        || new RegExp(String.raw`(?<!def\s|function\s)\b${subject}\s*\(`).test(bodyOf(call[1])))
+      .filter(call => call[1] === subject || forwards(call[1]))
       .map(call => call[2].trim())
       .filter(Boolean);
     // '1h30m45s' is the task's own valid example: rejecting it is the bug, not
@@ -490,7 +548,7 @@ const CHECKS = {
     // Which key carries which falsy value matters: asserting that some other
     // field is still `false` would not fail if the updater stopped applying
     // the patch's own explicit `false`, so the check has to name that key.
-    const entries = [...String(patch || '').matchAll(/(\w+)\s*:\s*([^,}]+)/g)]
+    const entries = [...String(patch || '').matchAll(/["']?(\w+)["']?\s*:\s*([^,}]+)/g)]
       .map(entry => ({ key: entry[1], value: entry[2].trim() }));
     const kinds = [
       entry => entry.value === 'false',
@@ -501,20 +559,24 @@ const CHECKS = {
     const falsyPatch = Boolean(patch) && kinds.every(kind => entries.some(kind));
     const assertions = t.split('\n').map(line => line.match(/(?:console\.)?assert\b.*|\bexpect\(.*|\bit\(.*/)?.[0]).filter(Boolean).join('\n');
     // Infix comparison or a standard assert.equal(result.field, value) call.
+    // The call form has to be an equality assertion: `assert.notEqual(result.sound,
+    // false)` demands the opposite value and fails against a correct updater.
+    const equality = String.raw`(?<![\w$])(?:assert|equal|strictEqual|deepEqual|deepStrictEqual|toBe|toEqual|toStrictEqual)`;
     const perFieldOf = entry => new RegExp(
-      String.raw`${assigned[1]}\s*\.\s*${entry.key}\s*===?\s*${valueOf(entry)}|\(\s*${assigned[1]}\s*\.\s*${entry.key}\s*,\s*${valueOf(entry)}\s*[,)]`, 'i');
+      String.raw`${assigned[1]}\s*\.\s*${entry.key}\s*===?\s*${valueOf(entry)}|${equality}\s*\(\s*${assigned[1]}\s*\.\s*${entry.key}\s*,\s*${valueOf(entry)}\s*[,)]`);
     const perField = Boolean(assigned)
       && kinds.every(kind => entries.filter(kind).some(entry => perFieldOf(entry).test(assertions)));
     const expected = onResult ? structural[3] : '';
     const checksFalsy = perField
       || (onResult && kinds.every(kind => entries.filter(kind)
-        .some(entry => new RegExp(String.raw`\b${entry.key}\s*:\s*${valueOf(entry)}`).test(expected))));
+        .some(entry => new RegExp(String.raw`["']?\b${entry.key}\b["']?\s*:\s*${valueOf(entry)}`).test(expected))));
     // "without resetting existing settings" is half the contract: the check has
     // to prove a setting the patch never mentions is still there afterwards.
-    const keysOf = object => [...String(object || '').matchAll(/(\w+)\s*:/g)].map(match => match[1]);
+    // JSON-style quoted keys are ordinary object keys.
+    const keysOf = object => [...String(object || '').matchAll(/["']?(\w+)["']?\s*:/g)].map(match => match[1]);
     const untouched = keysOf(args && (args.match(/\(?\s*(\{[\s\S]*?\})\s*,/) || [])[1])
       .filter(key => !keysOf(patch).includes(key));
-    const checksPreserved = untouched.some(key => new RegExp(String.raw`\b${key}\s*:`).test(expected)
+    const checksPreserved = untouched.some(key => new RegExp(String.raw`["']?\b${key}\b["']?\s*:`).test(expected)
       || new RegExp(String.raw`\.${key}\b`).test(assertions));
     return updater && falsyPatch && checksFalsy && checksPreserved
       && (inlineCall || !assigned || runs(assigned.index))
@@ -565,12 +627,28 @@ const CHECKS = {
     // ...and the branch has to leave: rejecting without returning still falls
     // through and installs both listeners on an already-aborted signal.
     // `{ return reject(reason); }` is the same early exit as the unbraced form.
-    const rejects = String.raw`return\s+(?<![.\w])reject\s*\(`;
-    const guard = new RegExp(String.raw`${signalParam}\.throwIfAborted\s*\(|throwIfAborted\s*\(\s*${signalParam}|if\s*\(\s*${signalParam}\??\.aborted\s*\)\s*(?:\{[^}]{0,160}?(?:${rejects}|(?<![.\w])reject\s*\([^}]{0,80}\breturn\b|\bthrow\b)|${rejects}|throw\b)`).exec(t);
+    // ...and it has to leave on EVERY path through the guard: rejecting without
+    // returning falls through, and `if (strict) return reject(...)` nested
+    // inside it falls through on the other branch, installing both listeners.
+    const settlesEveryPath = body => alwaysReaches(body, /\bthrow\b/)
+      || alwaysReaches(body, /return\s+Promise\s*\.\s*reject\s*\(|return\s+(?<![.\w])reject\s*\(/)
+      || (alwaysReaches(body, /(?<![.\w])reject\s*\(/) && alwaysReaches(body, /(?<![.\w])return\b/));
+    const abortBranch = branches(t).find(branch =>
+      new RegExp(String.raw`^\s*${signalParam}\s*\??\.\s*aborted\s*$`).test(branch.condition));
+    const throwIfAborted = new RegExp(String.raw`${signalParam}\s*\.\s*throwIfAborted\s*\(|throwIfAborted\s*\(\s*${signalParam}`).exec(t);
+    const settled = abortBranch && settlesEveryPath(abortBranch.body)
+      ? { index: abortBranch.index, text: abortBranch.body } : null;
     // Returning an already-rejected promise is a valid termination — but only
     // outside the executor, where the return value is actually the result.
     const executorAt = t.search(/new\s+Promise\s*\(/);
-    const earlyReject = new RegExp(String.raw`if\s*\(\s*${signalParam}\??\.aborted\s*\)\s*(?:\{\s*)?return\s+Promise\s*\.\s*reject\s*\(`).exec(t);
+    const onlyReturnsRejected = settled
+      && /return\s+Promise\s*\.\s*reject\s*\(/.test(settled.text)
+      && !/\bthrow\b|return\s+(?<![.\w])reject\s*\(/.test(settled.text);
+    const guarded = settled && (!onlyReturnsRejected || executorAt < 0 || settled.index < executorAt)
+      ? settled : null;
+    const guard = throwIfAborted
+      ? { index: throwIfAborted.index, text: throwIfAborted[0] }
+      : guarded;
     // A guard that throws keeps the promise contract only inside the executor,
     // where the throw becomes a rejection, or in an async function. Thrown
     // synchronously from a plain function it bypasses the caller's `.catch`
@@ -579,11 +657,10 @@ const CHECKS = {
     // falls through and installs both listeners on an already-aborted signal.
     const isAsync = /async\s+function\s+waitForDownload\b|(?:const|let|var)\s+waitForDownload\s*=\s*async\b/.test(whole);
     const inExecutor = index => executorAt >= 0 && index > executorAt;
-    const throws = guard && /throwIfAborted|\bthrow\b/.test(guard[0]);
+    const throws = guard && /throwIfAborted|\bthrow\b/.test(guard.text);
     const keepsContract = Boolean(guard
       && (!throws || ((isAsync || inExecutor(guard.index)) && escapesCatch(t, guard.index))));
-    const terminates = (keepsContract ? guard : null)
-      || (earlyReject && (executorAt < 0 || earlyReject.index < executorAt) ? earlyReject : null);
+    const terminates = keepsContract ? guard : null;
     const firstListener = /addEventListener\s*\(\s*['"]abort['"]|\.(?:once|on|addListener)\s*\(\s*['"]download['"]/.exec(t);
     const preAborted = Boolean(terminates && firstListener && terminates.index < firstListener.index);
     const handlers = namedFunctionBodies(t);
@@ -595,15 +672,15 @@ const CHECKS = {
     // stays pending, so it has to be the executor's own reject callback.
     // ...and it has to run unconditionally: `if (false) reject(reason)` leaves
     // the promise pending on the one path that matters.
-    const settles = (body, call) => body.split(';')
-      .some(statement => new RegExp(String.raw`(?<![.\w])${call}\s*\(`).test(statement)
-        && !/\bif\s*\(|\?|&&|\|\|/.test(statement));
+    // Splitting on `;` loses the branch that governs the fragments after it, so
+    // `cleanup(); if (strict) { reject(reason); }` would read as settling.
+    const settles = (body, call) =>
+      alwaysReaches(body, new RegExp(String.raw`(?<![.\w])${call}\s*\(`));
     const abortHandler = aborts && handlers.find(handler => handler.name === aborts[2] && settles(handler.body, 'reject'));
     const downloadHandler = ownsDownload && handlers.find(handler => handler.name === ownsDownload[2] && settles(handler.body, 'resolve'));
     // Cleanup has to run on every settlement path, not behind `if (owned)`.
-    const callsCleanup = (body, cleanup) => body.split(';')
-      .some(statement => new RegExp(String.raw`(?<![.\w])${cleanup}\s*\(\s*\)`).test(statement)
-        && !/\bif\s*\(|\?|&&|\|\|/.test(statement));
+    const callsCleanup = (body, cleanup) =>
+      alwaysReaches(body, new RegExp(String.raw`(?<![.\w])${cleanup}\s*\(\s*\)`));
     const cleanupName = abortHandler && downloadHandler
       && [...abortHandler.body.matchAll(/\b(\w+)\s*\(\s*\)/g)]
         .map(match => match[1])
@@ -650,9 +727,15 @@ const CHECKS = {
     // accepting every https host leaves the destination unrestricted, and an
     // allowlist that still permits http leaves the transport unprotected.
     const policyOf = (clause, name) =>
-      (new RegExp(String.raw`${name}\.protocol\s*!==?\s*['"]https:['"]`, 'i').test(clause) ? 'transport'
-        : new RegExp(String.raw`!\s*(?:allowedHosts|allowlist)\s*\.\s*(?:has|includes)\s*\(\s*${name}\.hostname\s*\)`, 'i').test(clause) ? 'host'
+      (new RegExp(String.raw`${name}\.protocol\s*!==?\s*['"]https:['"]|!\s*\(?\s*${name}\.protocol\s*===?\s*['"]https:['"]`, 'i').test(clause) ? 'transport'
+        : new RegExp(String.raw`!\s*\(?\s*(?:allowedHosts|allowlist)\s*\.\s*(?:has|includes)\s*\(\s*${name}\.hostname\s*\)`, 'i').test(clause) ? 'host'
           : null);
+    // `if (!(https && allowed)) throw` is the same policy written positively:
+    // distribute the negation before splitting, or both halves are lost.
+    const clausesOf = condition => {
+      const negated = /^\s*!\s*\(([\s\S]*)\)\s*$/.exec(condition.trim());
+      return negated ? negated[1].split('&&').map(clause => `!(${clause})`) : condition.split('||');
+    };
     // Each policy must reject on its own. An `&&` clause only rejects when every
     // condition fails, so an allowed host still reaches the network over http.
     const enforcing = (text, name) => branches(text)
@@ -665,15 +748,20 @@ const CHECKS = {
           && escapesCatch(branch.body, stop.index)
           && escapesCatch(text, branch.start + stop.index));
       })
-      .flatMap(branch => branch.condition.split('||').map(clause => ({ index: branch.index, clause })))
+      .flatMap(branch => clausesOf(branch.condition).map(clause => ({ index: branch.index, clause })))
       .filter(guard => !guard.clause.includes('&&'))
       .map(guard => ({ ...guard, policy: policyOf(guard.clause, name) }))
       .filter(guard => guard.policy);
     // A named validator counts only if its own body rejects on the same policy,
     // with the same polarity an inline guard would need.
-    const validates = new RegExp(String.raw`(?:^|[;}\n])\s*(?:await\s+)?((?:validate|assert|ensure|checkNetwork)\w*Url)\s*\(\s*${url}\b`, 'im').exec(t);
-    const definition = validates
-      && new RegExp(String.raw`(?:function\s+${validates[1]}\s*\(\s*(\w+)|(?:const|let|var)\s+${validates[1]}\s*=\s*(?:async\s*)?\(?\s*(\w+))`).exec(t);
+    const validates = new RegExp(String.raw`(?:^|[;}\n])\s*((?:await|return)\s+)?((?:validate|assert|ensure|checkNetwork)\w*Url)\s*\(\s*${url}\b`, 'im').exec(t);
+    // An async validator that is not awaited only produces a rejected promise:
+    // the request fires before the policy has said anything.
+    const validatorAsync = validates
+      && new RegExp(String.raw`async\s+function\s+${validates[2]}\b|(?:const|let|var)\s+${validates[2]}\s*=\s*async\b`).test(t);
+    const validatorSettled = Boolean(validates) && (!validatorAsync || Boolean(validates[1]));
+    const definition = validatorSettled
+      && new RegExp(String.raw`(?:function\s+${validates[2]}\s*\(\s*(\w+)|(?:const|let|var)\s+${validates[2]}\s*=\s*(?:async\s*)?\(?\s*(\w+))`).exec(t);
     // Only the invoked validator's own body counts — not whatever follows it.
     // And a validator that returns false is ignorable, as these callers do
     // ignore it; requiring it to throw is what actually stops the request.
@@ -686,6 +774,11 @@ const CHECKS = {
       && validatorPolicies.size > 0);
     // Every request to the persisted destination has to be guarded, not just the
     // first one: a safe HEAD probe followed by an unguarded POST is a bypass.
+    // `fetch(url.href, ...)` is the same destination the policy cleared, so a
+    // direct serialisation of the validated URL resolves back to its binding.
+    const baseOf = argument => (/^(\w+)$/.exec(argument) || /^(\w+)\s*\.\s*href$/.exec(argument)
+      || /^(\w+)\s*\.\s*toString\s*\(\s*\)$/.exec(argument)
+      || /^String\s*\(\s*(\w+)\s*\)$/.exec(argument) || [])[1];
     const requests = [...t.matchAll(/(?:(?:const|let|var)\s+(\w+)\s*=\s*)?(?:await\s+)?\b(fetch|https?\.(?:request|get))\s*\(/g)]
       .map(match => {
         // This call's own arguments, paren-balanced, with the options resolved
@@ -697,7 +790,7 @@ const CHECKS = {
           index: match.index,
           handle: match[1],
           native: match[2] !== 'fetch',
-          target: call.args[0],
+          target: baseOf(call.args[0]),
           options: call.options,
         };
       })
@@ -773,6 +866,15 @@ const CHECKS = {
   // A remote response needs both a deadline and an enforced streaming byte ceiling.
   bounds(output) {
     const t = codeOf(output);
+    // A deadline has to be a number that can actually elapse: absent, Infinity
+    // or a constant bound to Infinity is no deadline at all.
+    const finiteDeadline = value => {
+      const text = String(value == null ? '' : value).trim();
+      if (!text) return false;
+      if (/Infinity|Number\s*\.\s*MAX/.test(text)) return false;
+      return !(/^[A-Za-z_$][\w$]*$/.test(text)
+        && new RegExp(String.raw`\b${text}\s*=\s*(?:Infinity|Number\s*\.\s*MAX)`).test(t));
+    };
     // Everything below is graded inside the loop that consumes the stream:
     // buffering the whole body first and counting afterwards is no ceiling.
     const consumer = streamConsumer(t);
@@ -789,8 +891,12 @@ const CHECKS = {
         // proof, and `{ headers: { signal: ... } }` hands fetch no signal.
         const call = callAt(t, request.index + request[0].length - 1);
         const options = call ? call.options : '';
-        const signalRef = /\bsignal\s*:\s*AbortSignal\.timeout\s*\(/.test(options)
-          ? 'inline'
+        // `AbortSignal.timeout()` and `AbortSignal.timeout(Infinity)` bound
+        // nothing — the first throws before the download even starts.
+        const inlineAt = /\bsignal\s*:\s*AbortSignal\s*\.\s*timeout\s*(?=\()/.exec(options);
+        const inlineDeadline = inlineAt && parenAt(options, inlineAt.index + inlineAt[0].length);
+        const signalRef = inlineAt
+          ? (finiteDeadline(inlineDeadline && inlineDeadline.inner) ? 'inline' : null)
           : (/\bsignal\s*:\s*(\w+)\s*\.\s*signal\b/.exec(options)
             || /\bsignal\s*:\s*(\w+)/.exec(options)
             || /\b(signal)\s*[,}]/.exec(options) || [])[1];
@@ -806,7 +912,11 @@ const CHECKS = {
         };
         if (signalRef === 'inline') return true;
         if (!signalRef) return false;
-        if (armedBefore(String.raw`\b${signalRef}\s*=\s*AbortSignal\.timeout\s*\(`)) return true;
+        const preset = armedBefore(String.raw`\b${signalRef}\s*=\s*AbortSignal\s*\.\s*timeout\s*(?=\()`);
+        if (preset) {
+          const deadline = parenAt(t, preset.index + preset[0].length);
+          if (finiteDeadline(deadline && deadline.inner)) return true;
+        }
         // A hand-rolled deadline is a resource this function now owns: the
         // timer outlives a download that finishes early, holding the process
         // open and firing a stale abort later. Only a `finally` clears it on
@@ -850,8 +960,10 @@ const CHECKS = {
       || (consumer && consumer.header.match(/['"]data['"]\s*,\s*(?:async\s*)?\(?\s*(\w+)/)) || [])[1];
     // The accumulator has to add THIS chunk's actual size: `+= 0 * n`, `+= -n`
     // and `+= destination.length` all count bytes that never reach the ceiling.
-    const counter = chunk
-      && scope.match(new RegExp(String.raw`\b([A-Za-z_$]\w*)\s*\+=\s*${chunk}\s*\.\s*(?:byteLength|length)\s*[;\n]`));
+    const counter = chunk && (
+      scope.match(new RegExp(String.raw`\b([A-Za-z_$]\w*)\s*\+=\s*${chunk}\s*\.\s*(?:byteLength|length)\s*[;\n]`))
+      // `received = received + chunk.byteLength` is the same accumulation.
+      || scope.match(new RegExp(String.raw`\b([A-Za-z_$]\w*)\s*=\s*\1\s*\+\s*${chunk}\s*\.\s*(?:byteLength|length)\s*[;\n]`)));
     // `received + value.byteLength > MAX` rejects the chunk before it is counted
     // or written, which is the same ceiling one statement earlier.
     // The over-limit comparison has to be the whole condition: conjoined with
@@ -892,10 +1004,28 @@ const CHECKS = {
         ? (stream.length > 0
           && alwaysReaches(limitBranch.body,
             new RegExp(String.raw`\b(?:${stream.join('|')})[\w.$]*\s*\.\s*(?:destroy|abort|cancel)\s*\(\s*new\s+\w*Error`)))
-        : alwaysReaches(limitBranch.body, /\bthrow\b|(?<![.\w])reject\s*\(/));
+        // A reader loop holds the ReadableStream locked and the fetch open;
+        // throwing out of it leaves both alive, so the ceiling has to cancel
+        // the stream or abort the request as well as fail.
+        : alwaysReaches(limitBranch.body, /\bthrow\b|(?<![.\w])reject\s*\(/)
+          && alwaysReaches(limitBranch.body, /\.\s*(?:cancel|abort|destroy)\s*\(/));
     // The write has to be of the chunk just counted, and only after the guard:
     // an unrelated log write past the branch is not the destination write.
-    const writesChunk = chunk && new RegExp(String.raw`write\w*\s*\([^)]*\b${chunk}\b`);
+    // ...to the destination the task named. `audit.write(chunk)` after the
+    // guard is not the report landing in the file it was asked for.
+    const signatureAt = /(?:async\s+)?function\s+\w+\s*(?=\()/.exec(t);
+    const parameters = signatureAt
+      ? splitArgs((parenAt(t, signatureAt.index + signatureAt[0].length) || { inner: '' }).inner)
+      : [];
+    const handles = [...new Set([
+      ...parameters.map(part => part.split('=')[0].trim())
+        .filter(name => /dest|file|path|out|target|sink/i.test(name)),
+      ...[...t.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*(?:await\s+)?[\w.]*\b(?:open|createWriteStream)\s*\(/g)]
+        .map(match => match[1]),
+    ])].filter(Boolean);
+    const writesChunk = chunk && handles.length > 0 && new RegExp(
+      String.raw`\b(?:${handles.join('|')})\s*\.\s*write\w*\s*\([^)]*\b${chunk}\b`
+      + String.raw`|write\w*\s*\(\s*(?:${handles.join('|')})\s*,[^)]*\b${chunk}\b`);
     const writeAfterLimit = stops && writesChunk
       && writesChunk.test(scope.slice(limitBranch.end))
       && !writesChunk.test(scope.slice(0, limitBranch.index));
