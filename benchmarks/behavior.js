@@ -170,6 +170,48 @@ function blockRanges(text, keywords) {
     .filter(Boolean);
 }
 
+// True when a throw at `index` actually leaves `text`. One wrapped in a try
+// whose catch swallows it terminates nothing: execution simply carries on.
+function escapesCatch(text, index) {
+  return blockRanges(text, /\btry\b/g)
+    .every(range => index < range.open || index > range.end
+      || !/^\s*catch\b/.test(text.slice(range.end)));
+}
+
+// A call's arguments, split on its own top-level commas.
+function splitArgs(inner) {
+  const parts = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < inner.length; i += 1) {
+    if ('([{'.includes(inner[i])) depth += 1;
+    else if (')]}'.includes(inner[i])) depth -= 1;
+    else if (inner[i] === ',' && depth === 0) {
+      parts.push(inner.slice(start, i));
+      start = i + 1;
+    }
+  }
+  return [...parts, inner.slice(start)].map(part => part.trim());
+}
+
+// The arguments of the call whose name ends at `from`, with the options
+// argument resolved to the literal a local binding holds when it was not
+// written inline — `const options = {...}; fetch(url, options)` is the same
+// request as writing the object at the call site.
+function callAt(text, from) {
+  const paren = parenAt(text, from);
+  if (!paren) return null;
+  const args = splitArgs(paren.inner);
+  const second = args[1] || '';
+  let literal = '';
+  if (second.startsWith('{')) literal = second;
+  else if (/^\w+$/.test(second)) {
+    const binding = new RegExp(String.raw`(?:const|let|var)\s+${second}\s*=\s*\{`).exec(text);
+    if (binding) literal = blockAt(text, binding.index);
+  }
+  return { args, options: topLevelOf(literal) };
+}
+
 const FUNCTIONS = /\bfunction\s*\w*|=>/g;
 const SKIPPABLE = /\bfunction\s*\w*|=>|\bif\b|\belse\b|\btry\b|\bcatch\b|\bfor\b|\bwhile\b/g;
 
@@ -240,13 +282,17 @@ const CHECKS = {
     };
     // The thermistor coefficients are the knob: exposing r0/beta/the series
     // resistor as a tunable default is leaving one, whatever the prose says.
+    // ...but only where the caller can reach it. A hard-coded `beta = 3950`
+    // buried in the conversion still assumes every unit matches the datasheet;
+    // a defaulted parameter, or a value read from the environment, does not.
     const code = codeOf(output);
     const knob = /^(?:r_?0|beta|b_?coefficient|series_resistor|r_?series|r_?fixed|t_?0|offset|calibration\w*|adc_?ref|v_?ref)$/i;
     const tunable = [...code.matchAll(/(?:def|function)\s+\w+\s*\(([^)]*)\)/g)]
       .flatMap(signature => [...signature[1].matchAll(/(\w+)\s*=/g)])
       .some(parameter => knob.test(parameter[1]))
-      || [...code.matchAll(/^[ \t]*(?:const|let|var)?[ \t]*([A-Za-z_]\w*)\s*=\s*[-\d(]/gm)]
-        .some(binding => knob.test(binding[1]));
+      || [...code.matchAll(/\b([A-Za-z_]\w*)\s*=\s*([^\n;]+)/g)]
+        .some(binding => knob.test(binding[1])
+          && /environ|getenv|process\.env|\bconfig\b|argparse|args\.|settings\./i.test(binding[2]));
     const drift = tunable || [...t.matchAll(markers)].some(asserted);
     return drift
       ? { pass: true, reason: 'Leaves a calibration knob / flags per-unit drift.' }
@@ -387,16 +433,28 @@ const CHECKS = {
     // The falsy values have to be in the patch: that is the argument whose
     // explicit false/0/"" must override truthy existing settings.
     const patch = args && (args.match(/,\s*(\{[\s\S]*\})\s*\)?\s*$/) || [])[1];
-    const falsyPatch = patch && [/\bfalse\b/, /(?:^|\D)0(?:\D|$)/, /['"]{2}/].every(pattern => pattern.test(patch));
+    // Which key carries which falsy value matters: asserting that some other
+    // field is still `false` would not fail if the updater stopped applying
+    // the patch's own explicit `false`, so the check has to name that key.
+    const entries = [...String(patch || '').matchAll(/(\w+)\s*:\s*([^,}]+)/g)]
+      .map(entry => ({ key: entry[1], value: entry[2].trim() }));
+    const kinds = [
+      entry => entry.value === 'false',
+      entry => /^0$/.test(entry.value),
+      entry => /^(?:''|"")$/.test(entry.value),
+    ];
+    const valueOf = entry => (/^(?:''|"")$/.test(entry.value) ? String.raw`(?:''|"")` : entry.value);
+    const falsyPatch = Boolean(patch) && kinds.every(kind => entries.some(kind));
     const assertions = t.split('\n').map(line => line.match(/(?:console\.)?assert\b.*|\bexpect\(.*|\bit\(.*/)?.[0]).filter(Boolean).join('\n');
     // Infix comparison or a standard assert.equal(result.field, value) call.
-    const perFieldOf = value => new RegExp(
-      String.raw`${assigned[1]}\.\w+\s*===?\s*${value}|\(\s*${assigned[1]}\.\w+\s*,\s*${value}\s*[,)]`, 'i');
-    const perField = assigned
-      && [String.raw`false\b`, String.raw`0(?!\d)`, String.raw`['"]{2}`].every(value => perFieldOf(value).test(assertions));
+    const perFieldOf = entry => new RegExp(
+      String.raw`${assigned[1]}\s*\.\s*${entry.key}\s*===?\s*${valueOf(entry)}|\(\s*${assigned[1]}\s*\.\s*${entry.key}\s*,\s*${valueOf(entry)}\s*[,)]`, 'i');
+    const perField = Boolean(assigned)
+      && kinds.every(kind => entries.filter(kind).some(entry => perFieldOf(entry).test(assertions)));
     const expected = onResult ? structural[3] : '';
     const checksFalsy = perField
-      || (onResult && [/:\s*false\b/, /:\s*0\b/, /:\s*(?:''|"")/].every(pattern => pattern.test(expected)));
+      || (onResult && kinds.every(kind => entries.filter(kind)
+        .some(entry => new RegExp(String.raw`\b${entry.key}\s*:\s*${valueOf(entry)}`).test(expected))));
     // "without resetting existing settings" is half the contract: the check has
     // to prove a setting the patch never mentions is still there afterwards.
     const keysOf = object => [...String(object || '').matchAll(/(\w+)\s*:/g)].map(match => match[1]);
@@ -463,10 +521,13 @@ const CHECKS = {
     // where the throw becomes a rejection, or in an async function. Thrown
     // synchronously from a plain function it bypasses the caller's `.catch`
     // on exactly the cancellation path under test.
+    // ...and a throw the function catches itself terminates nothing: execution
+    // falls through and installs both listeners on an already-aborted signal.
     const isAsync = /async\s+function\s+waitForDownload\b|(?:const|let|var)\s+waitForDownload\s*=\s*async\b/.test(whole);
     const inExecutor = index => executorAt >= 0 && index > executorAt;
+    const throws = guard && /throwIfAborted|\bthrow\b/.test(guard[0]);
     const keepsContract = Boolean(guard
-      && (!/throwIfAborted|\bthrow\b/.test(guard[0]) || isAsync || inExecutor(guard.index)));
+      && (!throws || ((isAsync || inExecutor(guard.index)) && escapesCatch(t, guard.index))));
     const terminates = (keepsContract ? guard : null)
       || (earlyReject && (executorAt < 0 || earlyReject.index < executorAt) ? earlyReject : null);
     const firstListener = /addEventListener\s*\(\s*['"]abort['"]|\.(?:once|on|addListener)\s*\(\s*['"]download['"]/.exec(t);
@@ -541,9 +602,15 @@ const CHECKS = {
     // Each policy must reject on its own. An `&&` clause only rejects when every
     // condition fails, so an allowed host still reaches the network over http.
     const enforcing = (text, name) => branches(text)
-      // A throw the branch catches itself falls through to the request, and one
-      // nested behind `if (strict)` does not run on the invalid-input path.
-      .filter(branch => !/\btry\b/.test(branch.body) && alwaysReaches(branch.body, rejection))
+      // The rejection has to run on the invalid-input path — not nested behind
+      // `if (strict)` — and it has to leave: a `try { ... } catch {}` around
+      // the guards, inside or outside them, returns normally to the request.
+      .filter(branch => {
+        const stop = rejection.exec(branch.body);
+        return Boolean(stop && dominates(branch.body, stop.index, branch.body.length)
+          && escapesCatch(branch.body, stop.index)
+          && escapesCatch(text, branch.start + stop.index));
+      })
       .flatMap(branch => branch.condition.split('||').map(clause => ({ index: branch.index, clause })))
       .filter(guard => !guard.clause.includes('&&'))
       .map(guard => ({ ...guard, policy: policyOf(guard.clause, name) }))
@@ -565,18 +632,22 @@ const CHECKS = {
       && validatorPolicies.size > 0);
     // Every request to the persisted destination has to be guarded, not just the
     // first one: a safe HEAD probe followed by an unguarded POST is a bypass.
-    const requests = [...t.matchAll(/(?:(?:const|let|var)\s+(\w+)\s*=\s*)?(?:await\s+)?\b(fetch|https?\.(?:request|get))\s*\(\s*([^,)]{0,80}?)\s*(?:(,\s*\{)|[,)])/g)]
-      .map(match => ({
-        index: match.index,
-        handle: match[1],
-        native: match[2] !== 'fetch',
-        target: match[3],
-        // Only an object literal written at the call site, and only its own
-        // properties: a named options variable is not proof, the next `{` in
-        // the file is not this call's, and a `method` nested inside `headers`
-        // is not this request's method.
-        options: match[4] ? topLevelOf(blockAt(t, match.index + match[0].length - 1)) : '',
-      }));
+    const requests = [...t.matchAll(/(?:(?:const|let|var)\s+(\w+)\s*=\s*)?(?:await\s+)?\b(fetch|https?\.(?:request|get))\s*\(/g)]
+      .map(match => {
+        // This call's own arguments, paren-balanced, with the options resolved
+        // through a local binding when they were not written inline — and read
+        // at their top level, since a `method` nested inside `headers` is not
+        // this request's method.
+        const call = callAt(t, match.index + match[0].length - 1);
+        return call && {
+          index: match.index,
+          handle: match[1],
+          native: match[2] !== 'fetch',
+          target: call.args[0],
+          options: call.options,
+        };
+      })
+      .filter(Boolean);
     // Every destination reached has to be one that was parsed and cleared —
     // including one replayed from a manual redirect's Location header.
     const approved = new Map([...t.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*new URL\s*\(/g)]
@@ -657,12 +728,13 @@ const CHECKS = {
     // before the request: a timer set afterwards bounds nothing.
     const reads = consumer && t.slice(Math.max(0, consumer.index - 80), consumer.index)
       + consumer.header + consumer.body;
-    const timed = [...t.matchAll(/(?:(?:const|let|var)\s+(\w+)\s*=\s*)?(?:await\s+)?\b(fetch|https?\.(?:get|request))\s*\(\s*[^,()]{0,80}?\s*(?:(,\s*\{)|[,)])/g)]
+    const timed = [...t.matchAll(/(?:(?:const|let|var)\s+(\w+)\s*=\s*)?(?:await\s+)?\b(fetch|https?\.(?:get|request))\s*\(/g)]
       .filter(request => {
-        // Only this call's own literal, and only its top level: an unrelated
-        // later block is not proof, and `{ headers: { signal: ... } }` hands
-        // fetch no signal at all.
-        const options = request[3] ? topLevelOf(blockAt(t, request.index + request[0].length - 1)) : '';
+        // Only this call's own arguments, resolved through a local options
+        // binding, and only their top level: an unrelated later block is not
+        // proof, and `{ headers: { signal: ... } }` hands fetch no signal.
+        const call = callAt(t, request.index + request[0].length - 1);
+        const options = call ? call.options : '';
         const signalRef = /\bsignal\s*:\s*AbortSignal\.timeout\s*\(/.test(options)
           ? 'inline'
           : (/\bsignal\s*:\s*(\w+)\s*\.\s*signal\b/.exec(options)
@@ -673,13 +745,23 @@ const CHECKS = {
         // leaves `signal` undefined, or the request unarmed, when it fires.
         const armedBefore = pattern => {
           const match = new RegExp(pattern).exec(t);
-          return Boolean(match && match.index < request.index
+          return match && match.index < request.index
             && dominates(t, match.index, request.index)
-            && !/clearTimeout\s*\(/.test(t.slice(match.index, request.index)));
+            && !/clearTimeout\s*\(/.test(t.slice(match.index, request.index))
+            ? match : null;
         };
-        return signalRef === 'inline'
-          || Boolean(signalRef && (armedBefore(String.raw`\b${signalRef}\s*=\s*AbortSignal\.timeout\s*\(`)
-            || armedBefore(String.raw`setTimeout\s*\([\s\S]{0,240}\b${signalRef}\s*\.\s*abort\s*\(`)));
+        if (signalRef === 'inline') return true;
+        if (!signalRef) return false;
+        if (armedBefore(String.raw`\b${signalRef}\s*=\s*AbortSignal\.timeout\s*\(`)) return true;
+        // A hand-rolled deadline is a resource this function now owns: the
+        // timer outlives a download that finishes early, holding the process
+        // open and firing a stale abort later. Only a `finally` clears it on
+        // success, failure and abort alike — and an unbound handle never can.
+        const timer = armedBefore(
+          String.raw`(?:(?:const|let|var)\s+(\w+)\s*=\s*)?setTimeout\s*\([\s\S]{0,240}\b${signalRef}\s*\.\s*abort\s*\(`);
+        return Boolean(timer && timer[1] && blockRanges(t, /\bfinally\b/g)
+          .some(range => new RegExp(String.raw`clearTimeout\s*\(\s*${timer[1]}\s*\)`)
+            .test(t.slice(range.open, range.end))));
       });
     let stream = [];
     let nativeRequest = false;

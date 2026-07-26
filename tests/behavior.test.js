@@ -1587,6 +1587,86 @@ test('lifecycle: cleanup behind a call-shaped condition still leaks', () => {
   assert.equal(r.pass, false);
 });
 
+// --- a rejection the answer catches itself rejects nothing ---
+
+test('lifecycle: a pre-abort throw the function catches terminates nothing', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, signal) {\n' +
+    '  return new Promise((resolve, reject) => {\n' +
+    '    try { if (signal.aborted) throw signal.reason; } catch {}\n' +
+    '    const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+    '    const done = value => { cleanup(); resolve(value); };\n' +
+    '    const aborted = () => { cleanup(); reject(signal.reason); };\n' +
+    '    emitter.once("download", done); signal.addEventListener("abort", aborted);\n' +
+    '  });\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: a validator that catches its own policy failures fails', () => {
+  const r = check('revalidate',
+    '```javascript\nfunction validateWebhookUrl(candidate) {\n  try {\n' +
+    '    if (candidate.protocol !== "https:") throw new Error("insecure");\n' +
+    '    if (!allowedHosts.has(candidate.hostname)) throw new Error("bad host");\n' +
+    '  } catch {}\n}\n' +
+    'const saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\nvalidateWebhookUrl(url);\n' +
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+// --- the knob has to be reachable, the timer has to be released ---
+
+test('hardware: hard-coded coefficients inside the conversion are not a knob', () => {
+  const r = check('hardware',
+    '```python\ndef read_c(adc):\n    beta = 3950\n    r0 = 10000\n' +
+    '    return _steinhart(adc.read(0), r0, beta)\n```\n' +
+    'Returns degrees Celsius.');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a manual abort timer that is never cleared leaks', () => {
+  const r = check('bounds',
+    '```javascript\nconst controller = new AbortController();\n' +
+    'const timer = setTimeout(() => controller.abort(), 10000);\n' +
+    'const response = await fetch(url, { signal: controller.signal });\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a manual abort timer cleared in finally passes', () => {
+  const r = check('bounds',
+    '```javascript\nconst controller = new AbortController();\n' +
+    'const timer = setTimeout(() => controller.abort(), 10000);\ntry {\n' +
+    '  const response = await fetch(url, { signal: controller.signal });\n' +
+    '  const reader = response.body.getReader();\n  let received = 0;\n  while (true) {\n' +
+    '    const { done, value } = await reader.read(); if (done) break;\n    received += value.byteLength;\n' +
+    '    if (received > MAX_BYTES) throw new Error("too large");\n    await file.write(value);\n  }\n' +
+    '} finally {\n  clearTimeout(timer);\n}\n```');
+  assert.equal(r.pass, true);
+});
+
+// --- options and assertions have to name what they claim ---
+
+test('revalidate: request options held by a local binding still count', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad");\n' +
+    'const options = { method: "POST", body: JSON.stringify(payload), redirect: "error" };\n' +
+    'await fetch(url, options);\n```');
+  assert.equal(r.pass, true);
+});
+
+test('contracts: asserting falsy fields the patch never supplied proves nothing', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) { return { ...current, ...patch }; }\n' +
+    'const result = updateSettings({ theme: "dark", muted: false, retries: 0, note: "" },\n' +
+    '  { sound: false, volume: 0, label: "" });\n' +
+    'console.assert(result.muted === false); console.assert(result.retries === 0);\n' +
+    'console.assert(result.note === ""); console.assert(result.theme === "dark");\n```');
+  assert.equal(r.pass, false);
+});
+
 // --- unknown probe is skipped, not failed ---
 
 test('unknown probe is skipped', () => {
