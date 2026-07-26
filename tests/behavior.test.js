@@ -1101,14 +1101,14 @@ test('bounds: a literal byte ceiling passes', () => {
   assert.equal(r.pass, true);
 });
 
-test('bounds: a bounded native https download passes', () => {
+test('bounds: awaiting https.get yields a ClientRequest, not the body', () => {
   const r = check('bounds',
     '```javascript\nconst response = await https.get(url, { signal: AbortSignal.timeout(10_000) });\n' +
     'const file = createWriteStream(destination);\n' +
     'let received = 0;\nresponse.on("data", chunk => {\n  received += chunk.length;\n' +
     '  if (received > MAX_BYTES) { response.destroy(new Error("too large")); return; }\n' +
     '  file.write(chunk);\n});\n```');
-  assert.equal(r.pass, true);
+  assert.equal(r.pass, false);
 });
 
 test('bounds: a signal assigned after the request does not bound it', () => {
@@ -2634,6 +2634,98 @@ test('bounds: a timer callback that never aborts bounds nothing', () => {
   'const response = await fetch(url, { signal: controller.signal });\n' + 'const file = await open(destination, "w");\nconst reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n' +
   '} finally { clearTimeout(timer); }\n```');
   assert.equal(r.pass, false);
+});
+
+// --- round 10: the exact binding, the top level, and the freshest guard ---
+
+test('revalidate: a mutation between the guards leaves one stale', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+  'if (url.protocol !== "https:") throw new Error("bad");\nurl.protocol = "http:";\n' +
+  'if (!allowedHosts.has(url.hostname)) throw new Error("bad host");\n' +
+  'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('lifecycle: a nested signal is not the once option Node reads', () => {
+  const r = check('lifecycle',
+    '```javascript\nconst { once } = require("node:events");\n' +
+  'function waitForDownload(emitter, signal) {\n  return once(emitter, "download", { metadata: { signal } });\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: tearing down a name the stream merely prefixes stops nothing', () => {
+  const r = check('bounds',
+    '```javascript\nhttps.get(url, { signal: AbortSignal.timeout(10000) }, response => {\n' +
+  '  const file = createWriteStream(destination);\n  let received = 0;\n  response.on("data", chunk => {\n' +
+  '    received += chunk.length;\n' +
+  '    if (received > MAX_BYTES) { responseAudit.destroy(new Error("too large")); return; }\n' +
+  '    file.write(chunk);\n  });\n});\n```');
+  assert.equal(r.pass, false);
+});
+
+test('lifecycle: a cleanup that can throw leaves the promise pending', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, signal) {\n  return new Promise((resolve, reject) => {\n' +
+  '    if (signal.aborted) return reject(signal.reason);\n' +
+  '    const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); if (debug) throw new Error("x"); };\n' +
+  '    const done = value => { cleanup(); resolve(value); };\n' +
+  '    const aborted = () => { cleanup(); reject(signal.reason); };\n' +
+  '    emitter.once("download", done); signal.addEventListener("abort", aborted);\n  });\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: a bare reject settles but does not stop the request', () => {
+  const r = check('revalidate',
+    '```javascript\nreturn new Promise((resolve, reject) => {\n' +
+  '  const saved = JSON.parse(text);\n  const url = new URL(saved.webhook);\n' +
+  '  if (url.protocol !== "https:") reject(new Error("bad"));\n' +
+  '  if (!allowedHosts.has(url.hostname)) reject(new Error("bad host"));\n' +
+  '  fetch(url, { method: "POST", body, redirect: "error" }).then(resolve);\n});\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a NaN ceiling can never be exceeded', () => {
+  const r = check('bounds',
+    '```javascript\nconst MAX = NaN;\nconst response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+  'const file = await open(destination, "w");\nconst reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+  '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+  '  if (received > MAX) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: a serialised URL handed to a helper is the same destination', () => {
+  const r = check('revalidate',
+    '```javascript\nfunction sendAgain(target) { return fetch(target, { method: "POST", body }); }\n' +
+  'const saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' + 'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad");\n' +
+  'await fetch(url, { method: "POST", body, redirect: "error" });\nsendAgain(url.toString());\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: a validator that rebinds its parameter checks something else', () => {
+  const r = check('revalidate',
+    '```javascript\nfunction validateWebhookUrl(candidate) {\n  candidate = new URL("https://allowed.example");\n' +
+  '  if (candidate.protocol !== "https:") throw new Error("x");\n' +
+  '  if (!allowedHosts.has(candidate.hostname)) throw new Error("y");\n}\n' +
+  'const saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\nvalidateWebhookUrl(url);\n' +
+  'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: awaiting https.get yields a request, not the body', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await https.get(url, { signal: AbortSignal.timeout(10000) });\n' +
+  'const file = createWriteStream(destination);\nlet received = 0;\nresponse.on("data", chunk => {\n' +
+  '  received += chunk.length;\n' +
+  '  if (received > MAX_BYTES) { response.destroy(new Error("too large")); return; }\n  file.write(chunk);\n});\n```');
+  assert.equal(r.pass, false);
+});
+
+test('hardware: the temperature reader outranks a generic read helper', () => {
+  const r = check('hardware',
+    '```python\ndef read_adc(channel):\n    return channel\n\ndef read_temperature(adc, beta=3950):\n' +
+  '    return _steinhart(read_adc(0), beta)\n```\nReturns Celsius.');
+  assert.equal(r.pass, true);
 });
 
 // --- unknown probe is skipped, not failed ---

@@ -430,7 +430,9 @@ const CHECKS = {
     };
     // ...and it has to be on the path the task asked for. A parameter on a
     // helper the reader never calls calibrates nothing.
-    const reader = signatures.find(signature => /read|temp|celsius|thermistor|sensor/i.test(signature.name))
+    // The entry point the task asked for, not whichever `read_*` came first.
+    const reader = signatures.find(signature => /temp|celsius|thermistor/i.test(signature.name))
+      || signatures.find(signature => /read|sensor/i.test(signature.name))
       || signatures[0];
     const readerBody = reader ? bodyOfName(reader.name) : '';
     const readerAt = readerBody ? code.indexOf(readerBody) : -1;
@@ -825,11 +827,18 @@ const CHECKS = {
         .pop();
       return binding ? blockAt(t, binding.index) : '';
     };
+    // Node reads `signal` off the options object itself; one nested inside
+    // `{ metadata: { signal } }` is ignored.
+    const topLevelOptionsOf = argument => {
+      if (!argument) return '';
+      if (argument.startsWith('{')) return topLevelOf(argument);
+      return topLevelOf(optionsOf(argument));
+    };
     const delegated = delegateArgs && splitArgs(delegateArgs.inner);
     const delegates = delegated
       && delegated[0] === emitterParam
       && /^['"]download['"]$/.test(delegated[1] || '')
-      && new RegExp(signalOption).test(optionsOf(delegated[2]))
+      && new RegExp(signalOption).test(topLevelOptionsOf(delegated[2]))
       ? delegateAt : null;
     // ...on every path out of the function that delegates, not of the file.
     // ...on this function's own return path. A nested helper that delegates
@@ -922,7 +931,11 @@ const CHECKS = {
     const cleanupHandler = cleanupName && handlers.find(handler => handler.name === cleanupName);
     // A cleanup that removes both listeners and then throws leaves the promise
     // pending, however faithfully each handler calls it.
-    const cleanupEscapes = cleanupHandler && alwaysReaches(cleanupHandler.body, /\bthrow\b/);
+    // Any reachable throw, not just an unconditional one: on that path both
+    // handlers exit before settling.
+    const cleanupEscapes = cleanupHandler
+      && [...cleanupHandler.body.matchAll(/(?<![.\w])throw\b/g)]
+        .some(hit => reachableAt(cleanupHandler.body, hit.index));
     // Removal has to happen on the object the listener was registered on;
     // otherEmitter.off(...) leaves the real listener installed.
     // A registration behind `if (false)` never installs: both have to run on the
@@ -1008,7 +1021,10 @@ const CHECKS = {
       // the guards, inside or outside them, returns normally to the request.
       .filter(branch => {
         const stop = terminator.exec(branch.body);
+        // ...and control has to leave: a bare `reject(...)` inside an executor
+        // settles the promise and then carries straight on to the request.
         return Boolean(stop && dominates(branch.body, stop.index, branch.body.length)
+          && alwaysReaches(branch.body, /\bthrow\b|(?<![.\w])return\b/)
           && escapesCatch(branch.body, stop.index)
           && escapesCatch(text, branch.start + stop.index));
       })
@@ -1039,7 +1055,11 @@ const CHECKS = {
       ? new Set(enforcing(validatorBody, definition[1] || definition[2], /\bthrow\b|(?<![.\w])reject\s*\(/)
         .map(guard => guard.policy))
       : new Set();
-    const enforcingValidator = Boolean(definition
+    // ...and it has to inspect the argument it received: `candidate = new
+    // URL('https://allowed.example')` validates something else entirely.
+    const rebinds = definition
+      && new RegExp(String.raw`(?<![.\w])${definition[1] || definition[2]}\s*=(?!=)`).test(validatorBody);
+    const enforcingValidator = Boolean(definition && !rebinds
       && /\bthrow\b|\breject\s*\(/.test(validatorBody)
       && validatorPolicies.size > 0);
     // Every request to the persisted destination has to be guarded, not just the
@@ -1086,8 +1106,10 @@ const CHECKS = {
       }
       // ...and into a helper that takes it: `sendAgain(url)` puts the persisted
       // destination behind whatever that helper's own request does with it.
-      for (const call of t.matchAll(/\b(\w+)\s*\(([^()]*)\)/g)) {
-        const passed = splitArgs(call[2]).findIndex(argument => derived.has(baseOf(argument)));
+      for (const call of t.matchAll(/\b(\w+)\s*(?=\()/g)) {
+        const handed = parenAt(t, call.index + call[0].length);
+        if (!handed) continue;
+        const passed = splitArgs(handed.inner).findIndex(argument => derived.has(baseOf(argument)));
         if (passed < 0) continue;
         const declared = new RegExp(
           String.raw`(?:function\s+${call[1]}\s*|(?:const|let|var)\s+${call[1]}\s*=\s*(?:async\s*)?)(?=\()`).exec(t);
@@ -1188,17 +1210,26 @@ const CHECKS = {
     // A property write through any of them rewrites the destination the policy
     // cleared; rebinding `url` itself replaces it outright. Checked per request:
     // a guarded POST, a mutation, then a second POST reuses the stale guards.
-    const mutatedBefore = request => {
-      const last = lastGuardFor(request);
-      if (!last) return true;
-      const between = change => change.index > last.index && change.index < request.index;
-      return [...aliases].some(name =>
-        [...t.matchAll(new RegExp(
-          String.raw`\b${name}\s*(?:\.\s*\w+|\[\s*['"]\w+['"]\s*\])\s*=(?!=)`
-          + String.raw`|Object\s*\.\s*assign\s*\(\s*${name}\b`, 'g'))].some(between))
-        || [...t.matchAll(new RegExp(String.raw`(?<!(?:const|let|var)\s{1,8})\b${url}\s*=(?!=)`, 'g'))].some(between);
+    // Every write that could change the destination, wherever it comes from.
+    const mutations = [
+      ...[...aliases].flatMap(name => [...t.matchAll(new RegExp(
+        String.raw`\b${name}\s*(?:\.\s*\w+|\[\s*['"]\w+['"]\s*\])\s*=(?!=)`
+        + String.raw`|Object\s*\.\s*assign\s*\(\s*${name}\b`, 'g'))]),
+      ...[...t.matchAll(new RegExp(String.raw`(?<!(?:const|let|var)\s{1,8})\b${url}\s*=(?!=)`, 'g'))],
+    ].map(change => change.index);
+    // Each policy has to hold at the moment of the request, so each needs a
+    // guard after the last mutation — a later host check does not re-clear a
+    // protocol that was rewritten after the transport check ran.
+    const freshPolicies = request => {
+      const latest = Math.max(-1, ...mutations.filter(at => at < request.index));
+      return new Set(guardsFor(request)
+        .filter(guard => guard.index < request.index && guard.index > latest)
+        .map(guard => guard.policy));
     };
-    const mutated = requests.some(mutatedBefore);
+    const mutated = requests.some(request => {
+      const fresh = freshPolicies(request);
+      return !(fresh.has('transport') && fresh.has('host'));
+    });
     // ...and every other request must clear its own destination the same way.
     return fetchCall && boundsRedirects && !mutated && cleared && allGuarded
       ? { pass: true, reason: 'Revalidates persisted URL against a network policy before use.' }
@@ -1328,7 +1359,9 @@ const CHECKS = {
       // function reads: an unrelated bounded probe elsewhere in the answer must
       // not lend its deadline to this consumer's own unbounded request.
       if (!sameScope(t, request.index, consumer.index)) return false;
-      const names = new Set([request[1]].filter(Boolean));
+      // The assigned value of a native request is a ClientRequest; only the
+      // response callback's parameter carries the body.
+      const names = new Set(request[2] === 'fetch' ? [request[1]].filter(Boolean) : []);
       // https.get(url, options, response => ...) hands the response to a
       // callback rather than binding it, so take the parameter name too.
       const callback = /,\s*(?:async\s*)?\(?\s*(\w+)\s*\)?\s*=>|,\s*function\s*\(\s*(\w+)/
@@ -1412,9 +1445,10 @@ const CHECKS = {
         && (!limitBranch || reset.index < limitBranch.index));
     const predictive = Boolean(limitBranch && limitBranch.predictive);
     const ceiling = limitBranch && limitBranch.ceiling;
-    const finite = Boolean(ceiling) && !/Infinity/.test(ceiling)
+    // `received > NaN` is false for every response.
+    const finite = Boolean(ceiling) && !/Infinity|NaN/.test(ceiling)
       && !(/^[\w.$]+$/.test(ceiling)
-        && new RegExp(String.raw`\b${ceiling}\s*=\s*(?:Infinity|Number\s*\.\s*(?:MAX_VALUE|MAX_SAFE_INTEGER|POSITIVE_INFINITY))`).test(t));
+        && new RegExp(String.raw`\b${ceiling}\s*=\s*(?:Infinity|NaN|Number\s*\.\s*(?:MAX_VALUE|MAX_SAFE_INTEGER|POSITIVE_INFINITY|NaN))`).test(t));
     // `return` exits one data callback but leaves an evented stream flowing, so
     // the over-limit path has to tear the stream down too.
     // The chunk has to be counted before it is judged, or the last oversized one
@@ -1429,7 +1463,7 @@ const CHECKS = {
         // carries straight on into the write without a return.
         ? (stream.length > 0
           && alwaysReaches(limitBranch.body,
-            new RegExp(String.raw`\b(?:${stream.join('|')})[\w.$]*\s*\.\s*(?:destroy|abort|cancel)\s*\(\s*new\s+\w*Error`))
+            new RegExp(String.raw`\b(?:${stream.join('|')})(?![\w$])(?:\s*\.\s*\w+)*\s*\.\s*(?:destroy|abort|cancel)\s*\(\s*new\s+\w*Error`))
           && alwaysReaches(limitBranch.body, /(?<![.\w])return\b|\bthrow\b/))
         // A reader loop holds the ReadableStream locked and the fetch open;
         // throwing out of it leaves both alive, so the ceiling has to cancel
