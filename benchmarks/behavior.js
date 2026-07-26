@@ -183,8 +183,17 @@ function alwaysTrue(condition) {
 
 // The spans no execution can enter: a constant-false body, and the `else` of a
 // constant-true one.
+// The Python spellings, over an indentation-delimited suite rather than braces.
+function pythonAlwaysFalse(condition) {
+  const text = String(condition || '').trim();
+  return /^(?:False|0|None|not\s+True|1\s*==\s*0|0\s*==\s*1)$/.test(text)
+    || (/\band\b/.test(text) && text.split(/\band\b/).some(part => pythonAlwaysFalse(part)));
+}
+
 function deadRanges(text) {
-  const ranges = [];
+  const ranges = [...text.matchAll(/^[ \t]*(?:if|while)\s+([^:\n(][^:\n]*):/gm)]
+    .filter(branch => pythonAlwaysFalse(branch[1]))
+    .map(branch => ({ start: branch.index, end: branch.index + suiteAt(text, branch.index).length }));
   for (const branch of branches(text)) {
     if (alwaysFalse(branch.condition)) ranges.push({ start: branch.start, end: branch.end });
     if (!alwaysTrue(branch.condition)) continue;
@@ -484,7 +493,8 @@ const CHECKS = {
     // The return expression, however it is formatted: `return (` on its own
     // line still owns everything up to its closing paren.
     const returnedBy = body => {
-      const at = /\breturn\b/.exec(body);
+      // The first return control can actually arrive at.
+      const at = [...body.matchAll(/\breturn\b/g)].find(hit => reachableAt(body, hit.index));
       if (!at) return null;
       let text = '';
       let depth = 0;
@@ -514,7 +524,8 @@ const CHECKS = {
     };
     const consumedByResult = (owner, name) => resultTokens(owner).has(name);
     const tunable = signatures.filter(onPath)
-      .flatMap(signature => [...signature.params.matchAll(/(\w+)\s*=/g)]
+      // `beta: float = 3950` names the parameter before its annotation.
+      .flatMap(signature => [...signature.params.matchAll(/(\w+)\s*(?::\s*[^,=)]+?\s*)?=(?!=)/g)]
         .map(parameter => ({ name: parameter[1], owner: signature.name })))
       .some(parameter => knob.test(parameter.name)
         && consumedByResult(parameter.owner, parameter.name))
@@ -549,7 +560,7 @@ const CHECKS = {
     // the try, and the try/except/else layout.
     // The sentinel `assert False` runs inside the try, so a broad `except` would
     // swallow its own AssertionError; only a named exception proves rejection.
-    const markers = /with\s+[\w.]*pytest\.raises\s*\(|assertRaises\s*\(|assert\.throws\s*\(|toThrow\s*\(|expect\([^\n]*\)\.rejects|assert\s+(?:await\s+)?(?:rejects?|raises?|throws?)\s*\([^)\n]+\)|try\s*:[\s\S]{0,200}\w+\s*\([^)\n]*\)[\s\S]{0,120}(?:\bassert\s+False\b|raise\s+AssertionError)[\s\S]{0,160}except\s+(?!Exception\b|BaseException\b)[\w(]|try\s*:[\s\S]{0,300}\w+\s*\([^)]*\)[\s\S]{0,240}except\b[\s\S]{0,160}else\s*:[\s\S]{0,120}(?:assert\s+False|raise\s+AssertionError)/gi;
+    const markers = /with\s+[\w.]*pytest\.raises\s*\(|assertRaises\s*\(|assert\.throws\s*\(|toThrow\s*\(|expect\([^\n]*\)\.rejects|assert\s+(?:await\s+)?(?:rejects?|raises?|throws?)\s*\([^)\n]+\)|try\s*:[\s\S]{0,200}\w+\s*\([^)\n]*\)[\s\S]{0,120}(?:\bassert\s+False\b|raise\s+AssertionError)[\s\S]{0,160}except\s+(?!\(?\s*(?:Exception|BaseException)\b)[\w(]|try\s*:[\s\S]{0,300}\w+\s*\([^)]*\)[\s\S]{0,240}except\b[\s\S]{0,160}else\s*:[\s\S]{0,120}(?:assert\s+False|raise\s+AssertionError)/gi;
     // Proving that some other call raises says nothing about this parser, so the
     // failure check has to reach the function under test — directly or one hop
     // through a helper it defines.
@@ -660,7 +671,8 @@ const CHECKS = {
       // the spread preserve something other than what the caller passed in.
       const overwritten = new RegExp(
         String.raw`\b(?:${match[2]}|${match[3]})\s*(?:\.\s*\w+|\[[^\]]*\])?\s*=(?!=)`
-        + String.raw`|delete\s+(?:${match[2]}|${match[3]})\s*[.[]`, 'g');
+        + String.raw`|delete\s+(?:${match[2]}|${match[3]})\s*[.[]`
+        + String.raw`|Object\s*\.\s*assign\s*\(\s*(?:${match[2]}|${match[3]})\b`, 'g');
       if ([...body.matchAll(overwritten)].some(reset => reset.index < merge.index)) return false;
       // Any earlier return reaches the caller before the merge ever runs, so it
       // is only harmless when it hands the existing settings straight back.
@@ -862,7 +874,11 @@ const CHECKS = {
       const binding = [...t.matchAll(new RegExp(String.raw`(?:const|let|var)\s+${argument}\s*=\s*\{`, 'g'))]
         .filter(match => match.index < delegateAt.index && dominates(t, match.index, delegateAt.index))
         .pop();
-      return binding ? blockAt(t, binding.index) : '';
+      // ...unless it was rewritten in between, as for any other call site.
+      const rewritten = binding && [...t.matchAll(new RegExp(
+        String.raw`\b${argument}\s*(?:\.\s*\w+|\[[^\]]*\])\s*=(?!=)`, 'g'))]
+        .some(write => write.index > binding.index && write.index < delegateAt.index);
+      return binding && !rewritten ? blockAt(t, binding.index) : '';
     };
     // Node reads `signal` off the options object itself; one nested inside
     // `{ metadata: { signal } }` is ignored.
@@ -954,10 +970,17 @@ const CHECKS = {
     // the promise pending on the one path that matters.
     // Splitting on `;` loses the branch that governs the fragments after it, so
     // `cleanup(); if (strict) { reject(reason); }` would read as settling.
-    const settles = (body, call) =>
-      alwaysReaches(body, new RegExp(String.raw`(?<![.\w])${call}\s*\(`));
-    const abortHandler = aborts && handlers.find(handler => handler.name === aborts[2] && settles(handler.body, 'reject'));
-    const downloadHandler = ownsDownload && handlers.find(handler => handler.name === ownsDownload[2] && settles(handler.body, 'resolve'));
+    // ...and it has to settle first: `resolve('cancelled'); reject(reason)`
+    // claims the promise for the wrong outcome, since settlement is
+    // first-call-wins.
+    const settles = (body, call, other) => {
+      const wanted = new RegExp(String.raw`(?<![.\w])${call}\s*\(`);
+      if (!alwaysReaches(body, wanted)) return false;
+      const opposite = new RegExp(String.raw`(?<![.\w])${other}\s*\(`).exec(body);
+      return !opposite || opposite.index > wanted.exec(body).index;
+    };
+    const abortHandler = aborts && handlers.find(handler => handler.name === aborts[2] && settles(handler.body, 'reject', 'resolve'));
+    const downloadHandler = ownsDownload && handlers.find(handler => handler.name === ownsDownload[2] && settles(handler.body, 'resolve', 'reject'));
     // Cleanup has to run on every settlement path, not behind `if (owned)`.
     const callsCleanup = (body, cleanup) =>
       alwaysReaches(body, new RegExp(String.raw`(?<![.\w])${cleanup}\s*\(\s*\)`));
@@ -1203,8 +1226,12 @@ const CHECKS = {
           const write = new RegExp(
             String.raw`\b${request.handle}\s*\.\s*(?:write|end)\s*\(\s*\w`).exec(t);
           // ...on the sender's own reachable path, not in an uncalled helper.
+          const enclosing = write && blockRanges(t, FUNCTIONS)
+            .filter(range => write.index > range.open && write.index < range.end)
+            .sort((first, second) => (first.end - first.open) - (second.end - second.open))[0];
           return Boolean(write && write.index > request.index
-            && reachableAt(t, write.index) && sameScope(t, write.index, request.index));
+            && reachableAt(t, write.index) && sameScope(t, write.index, request.index)
+            && dominates(t, write.index, enclosing ? enclosing.end - 1 : t.length));
         })())));
     // An inline guard only protects the request if it runs on the way to it: a
     // guard sitting in a helper the answer never calls protects nothing.
@@ -1260,7 +1287,23 @@ const CHECKS = {
         String.raw`\b${name}\s*(?:\.\s*\w+|\[\s*['"]\w+['"]\s*\])\s*=(?!=)`
         + String.raw`|Object\s*\.\s*assign\s*\(\s*${name}\b`, 'g'))]),
       ...[...t.matchAll(new RegExp(String.raw`(?<!(?:const|let|var)\s{1,8})\b${url}\s*=(?!=)`, 'g'))],
-    ].map(change => change.index);
+    ].map(change => change.index).concat(
+      // A helper handed the URL can rewrite it through its own parameter:
+      // `downgrade(url)` where downgrade sets `target.protocol`.
+      [...t.matchAll(/\b(\w+)\s*(?=\()/g)].filter(call => {
+        const handed = parenAt(t, call.index + call[0].length);
+        if (!handed) return false;
+        const passed = splitArgs(handed.inner).findIndex(argument => aliases.has(baseOf(argument)));
+        if (passed < 0) return false;
+        const declared = new RegExp(
+          String.raw`(?:function\s+${call[1]}\s*|(?:const|let|var)\s+${call[1]}\s*=\s*(?:async\s*)?)(?=\()`).exec(t);
+        const signature = declared && parenAt(t, declared.index + declared[0].length);
+        const parameter = signature && splitArgs(signature.inner)[passed];
+        if (!parameter || !/^\w+$/.test(parameter)) return false;
+        return new RegExp(
+          String.raw`\b${parameter}\s*(?:\.\s*\w+|\[[^\]]*\])\s*=(?!=)`
+          + String.raw`|Object\s*\.\s*assign\s*\(\s*${parameter}\b`).test(blockAt(t, declared.index));
+      }).map(call => call.index));
     // ...that can actually run on the way to the request: an uncalled helper
     // rewriting the URL never touches the one this request sends to.
     const mutationsFor = request => mutationSites.filter(at => at < request.index
@@ -1296,11 +1339,13 @@ const CHECKS = {
       // `AbortSignal.timeout(-1)` and `timeout(0)` throw or expire immediately.
       if (/^-/.test(text)) return false;
       // `AbortSignal.timeout(0 * 1000)` is `timeout(0)` written longhand.
-      if (/^[\d_\s*+()]+$/.test(text)) {
+      if (/^[\d._\s*+()]+$/.test(text)) {
         const evaluated = Function(`"use strict";return (${text.replace(/_/g, '')})`)();
-        return Number.isFinite(evaluated) && evaluated > 0;
+        // Node rejects anything past 2^31-1 before the request starts.
+        return Number.isFinite(evaluated) && evaluated > 0 && evaluated <= 2147483647;
       }
-      if (/^[\d.]+$/.test(text) && Number(text) <= 0) return false;
+      // NaN, nullish and booleans all throw at the call.
+      if (/^(?:NaN|null|undefined|true|false)$/.test(text)) return false;
       // ...and a constant bound to one of those is the same value by another
       // name, so resolve simple bindings and ask again.
       if (/^[A-Za-z_$][\w$]*$/.test(text)) {
@@ -1382,6 +1427,17 @@ const CHECKS = {
           new RegExp(String.raw`\b${signalRef}\s*\.\s*abort\s*\(`))) return false;
         // ...unconditionally: `finally { if (debug) clearTimeout(timer) }`
         // still leaks the timer on the path that matters.
+        // ...and it must stay armed until the body is consumed: clearing it
+        // right after the headers arrive leaves the stream able to stall.
+        const consumerEnd = consumer
+          ? consumer.index + consumer.header.length + consumer.body.length : t.length;
+        const finallys = blockRanges(t, /\bfinally\b/g);
+        const clearedEarly = timer && timer[1] && [...t.matchAll(
+          new RegExp(String.raw`clearTimeout\s*\(\s*${timer[1]}\s*\)`, 'g'))]
+          .some(clear => clear.index > request.index && clear.index < consumerEnd
+            && reachableAt(t, clear.index)
+            && !finallys.some(range => clear.index > range.open && clear.index < range.end));
+        if (clearedEarly) return false;
         // ...in the finally that guards this request's own try, not one in a
         // sibling helper that never runs.
         const tries = blockRanges(t, /\btry\b/g);
@@ -1442,7 +1498,10 @@ const CHECKS = {
       ...readers.map(name => String.raw`\b${name}\s*\.\s*cancel\s*\(`),
       // A ReadableStream is locked while a reader exists, so body.cancel()
       // throws; it only tears down an iterator-style consumer.
-      ...(readers.length ? [] : stream.map(name => String.raw`\b${name}\s*\.\s*body\s*\.\s*cancel\s*\(`)),
+      // ...and an iterator asked not to cancel holds the lock without ever
+      // releasing the source, so body.cancel() throws there too.
+      ...(readers.length || (consumer && /preventCancel\s*:\s*true/.test(consumer.header))
+        ? [] : stream.map(name => String.raw`\b${name}\s*\.\s*body\s*\.\s*cancel\s*\(`)),
       ...controllers.map(name => String.raw`\b${name}\s*\.\s*abort\s*\(`),
     ];
     // A fetch body is a Web ReadableStream, so `.on('data')`/`.destroy()` on it

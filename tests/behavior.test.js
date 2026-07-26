@@ -2823,6 +2823,99 @@ test('contracts: a property write on the patch corrupts the merge', () => {
   assert.equal(r.pass, false);
 });
 
+// --- round 12: what the callee does, what the runtime accepts ---
+
+test('revalidate: a helper that rewrites the URL stales the guards', () => {
+  const r = check('revalidate',
+    '```javascript\nfunction downgrade(target) { target.protocol = "http:"; }\n' +
+  'const saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' + 'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad");\n' +
+  'downgrade(url);\nawait fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('lifecycle: once options rewritten before delegation carry another signal', () => {
+  const r = check('lifecycle',
+    '```javascript\nconst { once } = require("node:events");\n' +
+  'function waitForDownload(emitter, signal) {\n  const options = { signal };\n  options.signal = otherSignal;\n' +
+  '  return once(emitter, "download", options);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a NaN deadline throws before the request starts', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(NaN) });\n' + 'const file = await open(destination, "w");\nconst reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n' + '```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a deadline past the supported range throws', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(9999999999) });\n' + 'const file = await open(destination, "w");\nconst reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n' + '```');
+  assert.equal(r.pass, false);
+});
+
+test('hardware: a knob only in an unreachable return calibrates nothing', () => {
+  const r = check('hardware',
+    '```python\ndef read_temperature(adc, beta=3950):\n    if False:\n        return beta\n    return adc.read(0) * 0.1\n```\nReturns Celsius.');
+  assert.equal(r.pass, false);
+});
+
+test('contracts: Object.assign on an input corrupts the merge', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) {\n  Object.assign(current, { metadata: null });\n  return { ...current, ...patch };\n}\n' +
+  'const result = updateSettings({ theme: "dark", sound: true, label: "x" }, { sound: false, volume: 0, label: "" });\n' +
+  'console.assert(result.sound === false); console.assert(result.volume === 0);\n' +
+  'console.assert(result.label === ""); console.assert(result.theme === "dark");\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: preventCancel leaves body.cancel throwing on a locked stream', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+  'const file = await open(destination, "w");\nlet received = 0;\n' +
+  'for await (const chunk of response.body.values({ preventCancel: true })) {\n  received += chunk.byteLength;\n' +
+  '  if (received > MAX_BYTES) { await response.body.cancel(); throw new Error("too large"); }\n' +
+  '  await file.write(chunk);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('onecheck: a broad exception inside a tuple swallows the sentinel', () => {
+  const r = check('onecheck',
+    '```python\ndef to_seconds(s):\n    return 0\n\ntry:\n    to_seconds("bad")\n    assert False\nexcept (Exception,):\n    pass\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a timer cleared before the body is read bounds only the headers', () => {
+  const r = check('bounds',
+    '```javascript\nconst controller = new AbortController();\nconst timer = setTimeout(() => controller.abort(), 10000);\ntry {\n' +
+  'const response = await fetch(url, { signal: controller.signal });\nclearTimeout(timer);\n' + 'const file = await open(destination, "w");\nconst reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n' +
+  '} finally { clearTimeout(timer); }\n```');
+  assert.equal(r.pass, false);
+});
+
+test('lifecycle: settling with the wrong outcome first claims the promise', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, signal) {\n  return new Promise((resolve, reject) => {\n' +
+  '    if (signal.aborted) return reject(signal.reason);\n' +
+  '    const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+  '    const done = value => { cleanup(); resolve(value); };\n' +
+  '    const aborted = () => { cleanup(); resolve("cancelled"); reject(signal.reason); };\n' +
+  '    emitter.once("download", done); signal.addEventListener("abort", aborted);\n  });\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: a payload write after an exit never sends anything', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' + 'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad");\n' +
+  'const request = https.request(url, { method: "POST" });\nreturn;\nrequest.end(payload);\n```');
+  assert.equal(r.pass, false);
+});
+
+test('hardware: a type-annotated calibration parameter is still a knob', () => {
+  const r = check('hardware',
+    '```python\ndef read_temperature(adc, beta: float = 3950):\n    return _steinhart(adc.read(0), beta)\n```\nReturns Celsius.');
+  assert.equal(r.pass, true);
+});
+
 // --- unknown probe is skipped, not failed ---
 
 test('unknown probe is skipped', () => {
