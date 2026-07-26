@@ -150,42 +150,60 @@ function suiteAt(text, index) {
   return lines.slice(0, end < 0 ? lines.length : end + 1).join('\n');
 }
 
+// The `{...}` each keyword owns. The condition or parameter list is skipped
+// paren-balanced rather than matched with `[^)]*`, so an ordinary nested call
+// — `if (allowed.has(url.hostname)) {` — is still recognised as a branch
+// instead of vanishing from the analysis that depends on seeing it.
+function blockRanges(text, keywords) {
+  return [...text.matchAll(keywords)]
+    .map(match => {
+      let cursor = match.index + match[0].length;
+      if (/^\s*\(/.test(text.slice(cursor))) {
+        const paren = parenAt(text, cursor);
+        if (!paren) return null;
+        cursor = paren.close + 1;
+      }
+      if (!/^\s*\{/.test(text.slice(cursor))) return null;
+      const open = text.indexOf('{', cursor);
+      return { open, end: open + blockAt(text, open).length };
+    })
+    .filter(Boolean);
+}
+
+const FUNCTIONS = /\bfunction\s*\w*|=>/g;
+const SKIPPABLE = /\bfunction\s*\w*|=>|\bif\b|\belse\b|\btry\b|\bcatch\b|\bfor\b|\bwhile\b/g;
+
 // The text with every nested function body blanked out, leaving only what runs
 // when the enclosing function itself is called.
 function reachable(text) {
   const chars = [...text];
-  for (const match of text.matchAll(/(?:function\s*\w*\s*\([^)]*\)|=>)\s*\{/g)) {
-    const open = text.indexOf('{', match.index + match[0].length - 1);
-    const block = blockAt(text, open);
-    for (let i = open; i < open + block.length; i += 1) chars[i] = ' ';
+  for (const range of blockRanges(text, FUNCTIONS)) {
+    for (let i = range.open; i < range.end; i += 1) chars[i] = ' ';
   }
   return chars.join('');
+}
+
+function inside(ranges, index, target) {
+  return ranges.every(range => index < range.open || index > range.end
+    || (target >= range.open && target <= range.end));
 }
 
 // True when `index` sits on a statement that runs unconditionally on the way to
 // `target`: not in a sibling function, and not behind a branch target skips.
 function dominates(text, index, target) {
-  const encloses = [...text.matchAll(/(?:function\s*\w*\s*\([^)]*\)|=>|\bif\s*\([^)]{0,200}\)|\belse\b|\btry\b|\bcatch\s*\([^)]*\)|\bfor\s*\([^)]*\)|\bwhile\s*\([^)]*\))\s*\{/g)]
-    .map(match => text.indexOf('{', match.index + match[0].length - 1))
-    .map(open => ({ open, end: open + blockAt(text, open).length }))
-    .every(range => index < range.open || index > range.end
-      || (target >= range.open && target <= range.end));
   const statement = text.slice(1 + Math.max(
     text.lastIndexOf(';', index), text.lastIndexOf('{', index),
     text.lastIndexOf('}', index), text.lastIndexOf('\n', index),
   ), index);
-  return encloses && !/\bif\s*\(|\?/.test(statement);
+  return inside(blockRanges(text, SKIPPABLE), index, target)
+    && !/\bif\s*\(|\?/.test(statement);
 }
 
 // True when nothing but a function body containing `target` also contains
 // `index` — i.e. the two are on the same execution path, not stranded in an
 // uncalled helper.
 function sameScope(text, index, target) {
-  return [...text.matchAll(/(?:function\s*\w*\s*\([^)]*\)|=>)\s*\{/g)]
-    .map(match => text.indexOf('{', match.index + match[0].length - 1))
-    .map(open => ({ open, end: open + blockAt(text, open).length }))
-    .every(range => index < range.open || index > range.end
-      || (target >= range.open && target <= range.end));
+  return inside(blockRanges(text, FUNCTIONS), index, target);
 }
 
 // The loop or listener that actually consumes the response stream. Counting

@@ -1551,6 +1551,42 @@ test('hardware: exposed thermistor coefficients are the knob', () => {
   assert.equal(r.pass, true);
 });
 
+// --- a branch is a branch even when its condition contains a call ---
+
+test('revalidate: policy checks behind a call-shaped condition do not dominate', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'if (opts.get("strict")) {\n' +
+    '  if (url.protocol !== "https:") throw new Error("bad");\n' +
+    '  if (!allowedHosts.has(url.hostname)) throw new Error("bad host");\n}\n' +
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a timeout behind a call-shaped condition does not bound the request', () => {
+  const r = check('bounds',
+    '```javascript\nlet controller;\nif (config.get("strict")) {\n' +
+    '  controller = new AbortController();\n  setTimeout(() => controller.abort(), 10000);\n}\n' +
+    'const response = await fetch(url, { signal: controller.signal });\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('lifecycle: cleanup behind a call-shaped condition still leaks', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, signal) {\n' +
+    '  return new Promise((resolve, reject) => {\n' +
+    '    if (signal.aborted) return reject(signal.reason);\n' +
+    '    const cleanup = () => { if (owners.has(emitter)) { emitter.off("download", done); signal.removeEventListener("abort", aborted); } };\n' +
+    '    const done = value => { cleanup(); resolve(value); };\n' +
+    '    const aborted = () => { cleanup(); reject(signal.reason); };\n' +
+    '    emitter.once("download", done); signal.addEventListener("abort", aborted);\n' +
+    '  });\n}\n```');
+  assert.equal(r.pass, false);
+});
+
 // --- unknown probe is skipped, not failed ---
 
 test('unknown probe is skipped', () => {
