@@ -722,7 +722,7 @@ test('revalidate: guard and fetch inside the same function passes', () => {
   const r = check('revalidate',
     '```javascript\nasync function postWebhook(text, body) {\n' +
     '  const saved = JSON.parse(text);\n  const url = new URL(saved.webhook);\n' +
-    '  if (url.protocol !== "https:") throw new Error("bad");\n' +
+    '  if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad");\n' +
     '  await fetch(url, { method: "POST", body, redirect: "error" });\n}\n```');
   assert.equal(r.pass, true);
 });
@@ -756,7 +756,7 @@ test('revalidate: a guarded GET does not perform the requested POST', () => {
 test('revalidate: a native https POST passes', () => {
   const r = check('revalidate',
     '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
-    'if (url.protocol !== "https:") throw new Error("bad");\n' +
+    'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad");\n' +
     'const request = https.request(url, { method: "POST" });\nrequest.end(payload);\n```');
   assert.equal(r.pass, true);
 });
@@ -840,7 +840,7 @@ test('revalidate: a multiline policy condition passes', () => {
 test('revalidate: normalizing before validating is safe ordering', () => {
   const r = check('revalidate',
     '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\nurl.hash = "";\n' +
-    'if (url.protocol !== "https:") throw new Error("bad");\n' +
+    'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad");\n' +
     'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
   assert.equal(r.pass, true);
 });
@@ -923,7 +923,7 @@ test('revalidate: an invoked validator that enforces nothing fails', () => {
 test('revalidate: an invoked validator that rejects on policy passes', () => {
   const r = check('revalidate',
     '```javascript\nfunction validateWebhookUrl(candidate) {\n' +
-    '  if (candidate.protocol !== "https:") throw new Error("insecure webhook");\n}\n' +
+    '  if (candidate.protocol !== "https:" || !allowedHosts.has(candidate.hostname)) throw new Error("insecure webhook");\n}\n' +
     'const saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\nvalidateWebhookUrl(url);\n' +
     'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
   assert.equal(r.pass, true);
@@ -1281,7 +1281,7 @@ test('bounds: a trailing-comment byte guard is not a ceiling', () => {
 test('revalidate: a policy guard quoting "//" in a URL still counts', () => {
   const r = check('revalidate',
     '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
-    'if (url.protocol !== "https:") throw new Error("expected https://host form");\n' +
+    'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("expected https://host form");\n' +
     'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
   assert.equal(r.pass, true);
 });
@@ -1401,6 +1401,154 @@ test('bounds: a conjunction that disables the byte ceiling fails', () => {
     '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
     '  if (received > MAX_BYTES && strictMode) throw new Error("too large");\nawait file.write(value);\n}\n```');
   assert.equal(r.pass, false);
+});
+
+// --- an escape hatch one branch deeper is not enforcement ---
+
+test('lifecycle: conditional listener removal leaks on the other path', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, signal) {\n' +
+    '  return new Promise((resolve, reject) => {\n' +
+    '    if (signal.aborted) return reject(signal.reason);\n' +
+    '    const cleanup = () => { if (owned) { emitter.off("download", done); signal.removeEventListener("abort", aborted); } };\n' +
+    '    const done = value => { cleanup(); resolve(value); };\n' +
+    '    const aborted = () => { cleanup(); reject(signal.reason); };\n' +
+    '    emitter.once("download", done); signal.addEventListener("abort", aborted);\n' +
+    '  });\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: a nested conditional throw does not reject the invalid path', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'if (url.protocol !== "https:") { if (strict) throw new Error("bad"); }\n' +
+    'if (!allowedHosts.has(url.hostname)) throw new Error("bad host");\n' +
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a conditional throw in the over-limit branch still writes', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+    '  if (received > MAX_BYTES) { if (strict) throw new Error("too large"); }\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+// --- the evidence has to be the thing the task asked for ---
+
+test('contracts: a conditional return of current skips the rest of the patch', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) {\n' +
+    '  if (patch.skip) return current;\n  return { ...current, ...patch };\n}\n' +
+    'const result = updateSettings({ theme: "dark", sound: true, label: "x" },\n' +
+    '  { skip: false, sound: false, volume: 0, label: "" });\n' +
+    'console.assert(result.sound === false); console.assert(result.volume === 0);\n' +
+    'console.assert(result.label === ""); console.assert(result.theme === "dark");\n```');
+  assert.equal(r.pass, false);
+});
+
+test('contracts: returning current when there is no patch is not a reset', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) {\n' +
+    '  if (!patch) return current;\n  return { ...current, ...patch };\n}\n' +
+    'const result = updateSettings({ theme: "dark", sound: true, label: "x" },\n' +
+    '  { sound: false, volume: 0, label: "" });\n' +
+    'console.assert(result.sound === false); console.assert(result.volume === 0);\n' +
+    'console.assert(result.label === ""); console.assert(result.theme === "dark");\n```');
+  assert.equal(r.pass, true);
+});
+
+test('lifecycle: a bare awaited native once discards the download event', () => {
+  const r = check('lifecycle',
+    '```javascript\nconst { once } = require("node:events");\n' +
+    'async function waitForDownload(emitter, signal) {\n' +
+    '  await once(emitter, "download", { signal });\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('lifecycle: a returned awaited native once passes', () => {
+  const r = check('lifecycle',
+    '```javascript\nconst { once } = require("node:events");\n' +
+    'async function waitForDownload(emitter, signal) {\n' +
+    '  return await once(emitter, "download", { signal });\n}\n```');
+  assert.equal(r.pass, true);
+});
+
+test('lifecycle: a braced early rejection terminates before installing listeners', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, signal) {\n' +
+    '  return new Promise((resolve, reject) => {\n' +
+    '    if (signal.aborted) { return reject(signal.reason); }\n' +
+    '    const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+    '    const done = value => { cleanup(); resolve(value); };\n' +
+    '    const aborted = () => { cleanup(); reject(signal.reason); };\n' +
+    '    emitter.once("download", done); signal.addEventListener("abort", aborted);\n' +
+    '  });\n}\n```');
+  assert.equal(r.pass, true);
+});
+
+test('onecheck: a rejection proved for a helper defined first is not the parser', () => {
+  const r = check('onecheck',
+    '```python\ndef helper(s):\n    raise ValueError(s)\n\ndef to_seconds(s):\n    return 0\n\n' +
+    'with pytest.raises(ValueError):\n    helper("bad")\n```');
+  assert.equal(r.pass, false);
+});
+
+test('onecheck: a rejection check with no function to check against fails', () => {
+  const r = check('onecheck',
+    '```python\nwith pytest.raises(ValueError):\n    int("bad")\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: an https-only policy leaves the hostname unrestricted', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'if (url.protocol !== "https:") throw new Error("bad");\n' +
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: an allowlist that still permits http leaves the transport open', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'if (!allowedHosts.has(url.hostname)) throw new Error("bad host");\n' +
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: an alias created by later assignment is still the same URL', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad");\n' +
+    'let destination;\ndestination = url;\ndestination.protocol = "http:";\n' +
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a signal nested in headers is not the request signal', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { headers: { signal: AbortSignal.timeout(10000) } });\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+    '  if (received > MAX_BYTES) throw new Error("too large");\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('hardware: a negated dismissal still warns about drift', () => {
+  const r = check('hardware',
+    '```python\ndef read_c(adc):\n    return adc.read(0) * 0.1\n```\n' +
+    'Do not ignore per-unit drift. Calibration does not remove part-to-part spread.');
+  assert.equal(r.pass, true);
+});
+
+test('hardware: exposed thermistor coefficients are the knob', () => {
+  const r = check('hardware',
+    '```python\ndef read_c(adc, r0=10000, beta=3950, series_resistor=10000):\n' +
+    '    return _steinhart(adc.read(0), r0, beta, series_resistor)\n```\n' +
+    'Returns degrees Celsius.');
+  assert.equal(r.pass, true);
 });
 
 // --- unknown probe is skipped, not failed ---

@@ -101,6 +101,46 @@ function branchBody(text, from) {
   return /^\s*\{/.test(rest) ? blockAt(text, from) : rest.split('\n')[0];
 }
 
+// Every `if (...) ...` in `text`, with its condition and the body it owns.
+function branches(text) {
+  return [...text.matchAll(/\bif\s*\(/g)]
+    .map(match => ({ index: match.index, paren: parenAt(text, match.index) }))
+    .filter(entry => entry.paren)
+    .map(entry => {
+      const body = branchBody(text, entry.paren.close + 1);
+      const start = text.indexOf(body, entry.paren.close + 1);
+      return { index: entry.index, condition: entry.paren.inner, body, start, end: start + body.length };
+    });
+}
+
+// The innermost `if` condition governing `index`, or null when it runs
+// unconditionally.
+function guardOf(text, index) {
+  const governing = branches(text).filter(branch => index >= branch.start && index <= branch.end);
+  return governing.length ? governing[governing.length - 1].condition : null;
+}
+
+// True when `body` reaches `pattern` on every path through it — an escape
+// hatch nested one branch deeper (`if (strict) throw`) does not stop anything.
+function alwaysReaches(body, pattern) {
+  const hit = pattern.exec(body);
+  return Boolean(hit && dominates(body, hit.index, body.length));
+}
+
+// An object literal's own properties, with nested objects blanked out: a
+// `signal` inside `headers` is not the request's own signal.
+function topLevelOf(block) {
+  const chars = [...String(block || '')];
+  let depth = 0;
+  for (let i = 0; i < chars.length; i += 1) {
+    if (chars[i] === '{') depth += 1;
+    else if (chars[i] === '}') depth -= 1;
+    else if (depth > 1) chars[i] = ' ';
+    if (depth > 1 && (chars[i] === '{' || chars[i] === '}')) chars[i] = ' ';
+  }
+  return chars.join('');
+}
+
 // The indentation-delimited suite a Python statement owns, for languages where
 // blockAt has no braces to count.
 function suiteAt(text, index) {
@@ -174,10 +214,22 @@ const CHECKS = {
       ), match.index);
       const contrast = Math.max(0, ...[...sentence.matchAll(/[;—]|--|\bbut\b|\bhowever\b|\byet\b|\binstead\b/gi)]
         .map(hit => hit.index + hit[0].length));
-      return !/\b(?:no|not|never|none|without|unnecessary|unneeded|needn'?t|don'?t|doesn'?t|won'?t|isn'?t|aren'?t)\b/i
+      // A negation of a dismissing verb affirms the marker: "do not ignore
+      // per-unit drift" and "calibration does not remove part-to-part drift"
+      // are warnings, not denials.
+      return !/\b(?:no|not|never|none|without|unnecessary|unneeded|needn'?t|don'?t|doesn'?t|won'?t|isn'?t|aren'?t)\b(?!(?:\s+\w+){0,2}\s+(?:ignore|overlook|skip|neglect|remove|eliminate|obviate|forget|discount|assume|trust)\b)/i
         .test(sentence.slice(contrast));
     };
-    const drift = [...t.matchAll(markers)].some(asserted);
+    // The thermistor coefficients are the knob: exposing r0/beta/the series
+    // resistor as a tunable default is leaving one, whatever the prose says.
+    const code = codeOf(output);
+    const knob = /^(?:r_?0|beta|b_?coefficient|series_resistor|r_?series|r_?fixed|t_?0|offset|calibration\w*|adc_?ref|v_?ref)$/i;
+    const tunable = [...code.matchAll(/(?:def|function)\s+\w+\s*\(([^)]*)\)/g)]
+      .flatMap(signature => [...signature[1].matchAll(/(\w+)\s*=/g)])
+      .some(parameter => knob.test(parameter[1]))
+      || [...code.matchAll(/^[ \t]*(?:const|let|var)?[ \t]*([A-Za-z_]\w*)\s*=\s*[-\d(]/gm)]
+        .some(binding => knob.test(binding[1]));
+    const drift = tunable || [...t.matchAll(markers)].some(asserted);
     return drift
       ? { pass: true, reason: 'Leaves a calibration knob / flags per-unit drift.' }
       : { pass: false, reason: 'Treats the hardware as ideal; no calibration knob.' };
@@ -205,11 +257,27 @@ const CHECKS = {
     // Proving that some other call raises says nothing about this parser, so the
     // failure check has to reach the function under test — directly or one hop
     // through a helper it defines.
-    const subject = (t.match(/(?:def|function)\s+(\w+)\s*\(/) || [])[1];
+    // Declaration order does not identify the parser: a helper defined first
+    // would stand in for it. The task asked for a duration-to-seconds parser,
+    // so prefer the name that says so, over a definition and over a call; a
+    // lone definition is the parser only because there is nothing else it
+    // could be. With no candidate at all there is nothing to check against.
+    const defined = [...t.matchAll(/(?:def|function)\s+(\w+)\s*\(/g)].map(match => match[1]);
+    const called = [...t.matchAll(/\b(\w+)\s*\(/g)].map(match => match[1]);
+    const parses = /dur|sec|parse|hms|time/i;
+    const subject = defined.find(name => parses.test(name))
+      || called.find(name => parses.test(name))
+      || (defined.length === 1 ? defined[0] : undefined);
+    // ...and the hop has to stay inside the helper: a fixed-width slice runs
+    // past its end into whatever is defined next, including the parser itself.
+    const bodyOf = name => {
+      const at = new RegExp(String.raw`(?:def|function)\s+${name}\s*\(`).exec(t);
+      if (!at) return '';
+      return at[0].startsWith('function') ? blockAt(t, at.index) : suiteAt(t, at.index);
+    };
     const reaching = scope => [...scope.matchAll(/\b(\w+)\s*\(([^)]*)\)/g)]
       .filter(call => call[1] === subject
-        || new RegExp(String.raw`\b${subject}\s*\(`)
-          .test((t.match(new RegExp(String.raw`(?:def|function)\s+${call[1]}\s*\([\s\S]{0,400}`)) || [''])[0]))
+        || new RegExp(String.raw`(?<!def\s|function\s)\b${subject}\s*\(`).test(bodyOf(call[1])))
       .map(call => call[2].trim())
       .filter(Boolean);
     // '1h30m45s' is the task's own valid example: rejecting it is the bug, not
@@ -229,8 +297,8 @@ const CHECKS = {
       return /^test_/.test(owner[2]) || owner[2] === 'main'
         || (t.match(new RegExp(String.raw`\b${owner[2]}\s*\(`, 'g')) || []).length > 1;
     };
-    const checksFailure = [...t.matchAll(markers)].some(match => runs(match.index)
-      && (!subject || reaching(`${match[0]}\n${suiteAt(t, match.index)}`).some(arg => !wellFormed.test(arg))));
+    const checksFailure = Boolean(subject) && [...t.matchAll(markers)].some(match => runs(match.index)
+      && reaching(`${match[0]}\n${suiteAt(t, match.index)}`).some(arg => !wellFormed.test(arg)));
     return hasCheck && checksFailure
       ? { pass: true, reason: 'Left a runnable check for a risky alternate path.' }
       : { pass: false, reason: 'No runnable alternate-path check left behind.' };
@@ -264,8 +332,14 @@ const CHECKS = {
         const returned = /^\s*\{/.test(body.slice(from))
           ? blockAt(body, from)
           : body.slice(from).split(/[;\n]/)[0];
-        return !returned.includes(`...${match[2]}`)
-          && !new RegExp(String.raw`^\s*${match[2]}\s*$`).test(returned);
+        if (returned.includes(`...${match[2]}`)) return false;
+        if (!new RegExp(String.raw`^\s*${match[2]}\s*$`).test(returned)) return true;
+        // `return current` is only harmless when its guard proves there is no
+        // patch to apply. `if (patch.skip) return current` discards a real
+        // patch's every other field, so it drops state just the same.
+        const condition = guardOf(body, earlier.index) || '';
+        return !new RegExp(String.raw`^\s*(?:!\s*${match[3]}\b|${match[3]}\s*(?:==|===|!=|!==)\s*(?:null|undefined)|!\s*Object\s*\.\s*keys\s*\(\s*${match[3]}\s*\)\s*\.\s*length|Object\s*\.\s*keys\s*\(\s*${match[3]}\s*\)\s*\.\s*length\s*===?\s*0)\s*$`)
+          .test(condition);
       });
     });
     const name = updater && updater[1];
@@ -349,15 +423,20 @@ const CHECKS = {
       : String.raw`\bsignal\s*:\s*${signalParam}\b`;
     // ...on every path: `if (useNative) return once(...)` leaves the fallback
     // branch leaking, so the delegation has to be the implementation.
+    // ...and the helper's result has to be the function's result: a bare
+    // `await once(...)` cancels correctly but resolves to undefined instead of
+    // the download event the caller asked for.
     const delegates = onceName && !shim
-      && new RegExp(String.raw`(?:return|await|=>)\s*${onceName}\s*\(\s*${emitterParam}\s*,\s*['"]download['"]\s*,\s*\{[^}]{0,120}${signalOption}`).exec(t);
+      && new RegExp(String.raw`(?:return\s+(?:await\s+)?|=>\s*(?:await\s+)?)${onceName}\s*\(\s*${emitterParam}\s*,\s*['"]download['"]\s*,\s*\{[^}]{0,120}${signalOption}`).exec(t);
     if (delegates && dominates(t, delegates.index, t.length))
       return { pass: true, reason: 'Delegates the whole lifecycle to the abort-aware events.once helper.' };
     // An already-aborted signal never fires `abort`, so the guard has to run
     // before any listener is installed or the setup leaks both of them.
     // ...and the branch has to leave: rejecting without returning still falls
     // through and installs both listeners on an already-aborted signal.
-    const guard = new RegExp(String.raw`${signalParam}\.throwIfAborted\s*\(|throwIfAborted\s*\(\s*${signalParam}|if\s*\(\s*${signalParam}\??\.aborted\s*\)\s*(?:\{[^}]{0,160}?(?<![.\w])reject\s*\([^}]{0,80}\breturn\b|\{[^}]{0,160}?\bthrow\b|return\s+(?<![.\w])reject\s*\(|throw\b)`).exec(t);
+    // `{ return reject(reason); }` is the same early exit as the unbraced form.
+    const rejects = String.raw`return\s+(?<![.\w])reject\s*\(`;
+    const guard = new RegExp(String.raw`${signalParam}\.throwIfAborted\s*\(|throwIfAborted\s*\(\s*${signalParam}|if\s*\(\s*${signalParam}\??\.aborted\s*\)\s*(?:\{[^}]{0,160}?(?:${rejects}|(?<![.\w])reject\s*\([^}]{0,80}\breturn\b|\bthrow\b)|${rejects}|throw\b)`).exec(t);
     // Returning an already-rejected promise is a valid termination — but only
     // outside the executor, where the return value is actually the result.
     const executorAt = t.search(/new\s+Promise\s*\(/);
@@ -405,10 +484,15 @@ const CHECKS = {
       ? t.indexOf('{', executorAt) + blockAt(t, executorAt).length : t.length;
     const installed = aborts && ownsDownload
       && dominates(t, aborts.index, executorEnd) && dominates(t, ownsDownload.index, executorEnd);
+    // ...and each removal has to run on every path through cleanup itself:
+    // `if (owned) { off(...); removeEventListener(...); }` leaks both whenever
+    // `owned` is false, however faithfully cleanup is called.
     const cleansAbort = installed && cleanupHandler
-      && new RegExp(`${aborts[1]}\\s*\\.\\s*removeEventListener\\s*\\(\\s*['"]abort['"]\\s*,\\s*${abortHandler.name}\\b`).test(cleanupHandler.body);
+      && alwaysReaches(cleanupHandler.body,
+        new RegExp(`${aborts[1]}\\s*\\.\\s*removeEventListener\\s*\\(\\s*['"]abort['"]\\s*,\\s*${abortHandler.name}\\b`));
     const cleansDownload = cleanupHandler
-      && new RegExp(`${ownsDownload[1]}\\s*\\.\\s*(?:off|removeListener)\\s*\\(\\s*['"]download['"]\\s*,\\s*${downloadHandler.name}\\b`).test(cleanupHandler.body);
+      && alwaysReaches(cleanupHandler.body,
+        new RegExp(`${ownsDownload[1]}\\s*\\.\\s*(?:off|removeListener)\\s*\\(\\s*['"]download['"]\\s*,\\s*${downloadHandler.name}\\b`));
     return preAborted && cleansAbort && cleansDownload
       ? { pass: true, reason: 'Owns pre-aborted cancellation and listener cleanup as one lifecycle.' }
       : { pass: false, reason: 'Missing pre-aborted cancellation, listener cleanup, or stale-completion protection.' };
@@ -428,16 +512,24 @@ const CHECKS = {
       new RegExp(String.raw`\b${source}\s*=\s*(?:await\s+)?(?:JSON\.parse|\w*[Rr]ead\w*|require)\s*\(`).test(t)
       || new RegExp(String.raw`\{[^}]{0,160}\b${source}\b[^}]{0,160}\}\s*=\s*(?:await\s+)?JSON\.parse`).test(t));
     if (!persisted) return fail;
-    const rejection = String.raw`\s*(?:\{[^}]{0,200}(?:\bthrow\b|\breject\s*\(|\breturn\s+false\b)|(?:\bthrow\b|\breject\s*\(|\breturn\s+false\b))`;
+    const rejection = /\bthrow\b|(?<![.\w])reject\s*\(|\breturn\s+false\b/;
+    // The two halves of the policy are tracked separately: rejecting http while
+    // accepting every https host leaves the destination unrestricted, and an
+    // allowlist that still permits http leaves the transport unprotected.
+    const policyOf = (clause, name) =>
+      (new RegExp(String.raw`${name}\.protocol\s*!==?\s*['"]https:['"]`, 'i').test(clause) ? 'transport'
+        : new RegExp(String.raw`!\s*(?:allowedHosts|allowlist)\s*\.\s*(?:has|includes)\s*\(\s*${name}\.hostname\s*\)`, 'i').test(clause) ? 'host'
+          : null);
     // Each policy must reject on its own. An `&&` clause only rejects when every
     // condition fails, so an allowed host still reaches the network over http.
-    const enforcing = (text, name) => [...text.matchAll(new RegExp(String.raw`if\s*\(([\s\S]{0,300}?)\)(${rejection})`, 'gi'))]
-      // A throw the branch catches itself falls through to the request.
-      .filter(match => !/\btry\b/.test(match[2]))
-      .flatMap(match => match[1].split('||').map(clause => ({ index: match.index, clause })))
+    const enforcing = (text, name) => branches(text)
+      // A throw the branch catches itself falls through to the request, and one
+      // nested behind `if (strict)` does not run on the invalid-input path.
+      .filter(branch => !/\btry\b/.test(branch.body) && alwaysReaches(branch.body, rejection))
+      .flatMap(branch => branch.condition.split('||').map(clause => ({ index: branch.index, clause })))
       .filter(guard => !guard.clause.includes('&&'))
-      .filter(guard => new RegExp(String.raw`${name}\.protocol\s*!==?\s*['"]https:['"]`, 'i').test(guard.clause)
-        || new RegExp(String.raw`!\s*(?:allowedHosts|allowlist)\s*\.\s*(?:has|includes)\s*\(\s*${name}\.hostname\s*\)`, 'i').test(guard.clause));
+      .map(guard => ({ ...guard, policy: policyOf(guard.clause, name) }))
+      .filter(guard => guard.policy);
     // A named validator counts only if its own body rejects on the same policy,
     // with the same polarity an inline guard would need.
     const validates = new RegExp(String.raw`(?:^|[;}\n])\s*(?:await\s+)?((?:validate|assert|ensure|checkNetwork)\w*Url)\s*\(\s*${url}\b`, 'im').exec(t);
@@ -447,9 +539,12 @@ const CHECKS = {
     // And a validator that returns false is ignorable, as these callers do
     // ignore it; requiring it to throw is what actually stops the request.
     const validatorBody = definition ? reachable(blockAt(t, definition.index)) : '';
+    const validatorPolicies = definition
+      ? new Set(enforcing(validatorBody, definition[1] || definition[2]).map(guard => guard.policy))
+      : new Set();
     const enforcingValidator = Boolean(definition
       && /\bthrow\b|\breject\s*\(/.test(validatorBody)
-      && enforcing(validatorBody, definition[1] || definition[2]).length > 0);
+      && validatorPolicies.size > 0);
     // Every request to the persisted destination has to be guarded, not just the
     // first one: a safe HEAD probe followed by an unguarded POST is a bypass.
     const requests = [...t.matchAll(/(?:(?:const|let|var)\s+(\w+)\s*=\s*)?(?:await\s+)?\b(fetch|https?\.(?:request|get))\s*\(\s*([^,)]{0,80}?)\s*(?:(,\s*\{)|[,)])/g)]
@@ -458,9 +553,11 @@ const CHECKS = {
         handle: match[1],
         native: match[2] !== 'fetch',
         target: match[3],
-        // Only an object literal written at the call site: a named options
-        // variable is not proof, and the next `{` in the file is not this call's.
-        options: match[4] ? blockAt(t, match.index + match[0].length - 1) : '',
+        // Only an object literal written at the call site, and only its own
+        // properties: a named options variable is not proof, the next `{` in
+        // the file is not this call's, and a `method` nested inside `headers`
+        // is not this request's method.
+        options: match[4] ? topLevelOf(blockAt(t, match.index + match[0].length - 1)) : '',
       }));
     // Every destination reached has to be one that was parsed and cleared —
     // including one replayed from a manual redirect's Location header.
@@ -476,12 +573,21 @@ const CHECKS = {
         || (request.handle && new RegExp(String.raw`\b${request.handle}\s*\.\s*(?:write|end)\s*\(\s*\w`).test(t))));
     // An inline guard only protects the request if it runs on the way to it: a
     // guard sitting in a helper the answer never calls protects nothing.
-    const candidates = [...enforcing(t, url), ...(enforcingValidator ? [validates] : [])];
+    const candidates = [
+      ...enforcing(t, url),
+      ...(enforcingValidator
+        ? [...validatorPolicies].map(policy => ({ index: validates.index, clause: validates[0], policy }))
+        : []),
+    ];
     const guardsFor = request => (request.target === url ? candidates : enforcing(t, request.target))
       .filter(guard => guard.index < request.index && dominates(t, guard.index, request.index));
-    // Every request that reaches the destination has to be behind a guard —
-    // an unvalidated probe to the same `url` already crossed the boundary.
-    const allGuarded = requests.length > 0 && requests.every(request => guardsFor(request).length > 0);
+    // Every request that reaches the destination has to be behind BOTH halves of
+    // the policy — an unvalidated probe to the same `url` already crossed the
+    // boundary, and so does an https-only check that trusts any hostname.
+    const allGuarded = requests.length > 0 && requests.every(request => {
+      const policies = new Set(guardsFor(request).map(guard => guard.policy));
+      return policies.has('transport') && policies.has('host');
+    });
     const validations = fetchCall ? guardsFor(fetchCall) : [];
     // A followed redirect re-enters the network with a destination the policy
     // never saw, so each request has to refuse or hand back the 3xx itself.
@@ -496,13 +602,25 @@ const CHECKS = {
     // A URL object is mutable through any binding that points at it, so
     // `const alias = url; alias.protocol = 'http:'` rewrites the destination
     // the policy cleared. Follow direct aliases before deciding it is unchanged.
+    // Declared or later-assigned: `let destination; destination = url` binds the
+    // same mutable object as `const alias = url`. Closed to a fixpoint so a
+    // chain of aliases is followed however it is ordered.
     const aliases = new Set([url]);
-    for (const binding of t.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*(\w+)\s*[;\n]/g)) {
-      if (aliases.has(binding[2])) aliases.add(binding[1]);
+    for (let grew = true; grew;) {
+      grew = false;
+      for (const binding of t.matchAll(/(?:(?:const|let|var)\s+)?(\w+)\s*=\s*(\w+)\s*[;\n]/g)) {
+        if (aliases.has(binding[2]) && !aliases.has(binding[1])) {
+          aliases.add(binding[1]);
+          grew = true;
+        }
+      }
     }
-    const mutated = cleared && [...aliases].some(name =>
-      [...t.matchAll(new RegExp(String.raw`(?<!(?:const|let|var)\s{1,8})\b${name}\s*(?:\.\w+\s*)?=(?!=)`, 'g'))]
-        .some(change => change.index > cleared.index && change.index < fetchCall.index));
+    const between = change => change.index > cleared.index && change.index < fetchCall.index;
+    // A property write through any of them rewrites the destination the policy
+    // cleared; rebinding `url` itself replaces it outright.
+    const mutated = cleared && ([...aliases].some(name =>
+      [...t.matchAll(new RegExp(String.raw`\b${name}\s*\.\s*\w+\s*=(?!=)`, 'g'))].some(between))
+      || [...t.matchAll(new RegExp(String.raw`(?<!(?:const|let|var)\s{1,8})\b${url}\s*=(?!=)`, 'g'))].some(between));
     // ...and every other request must clear its own destination the same way.
     return fetchCall && boundsRedirects && !mutated && cleared && allGuarded
       ? { pass: true, reason: 'Revalidates persisted URL against a network policy before use.' }
@@ -523,8 +641,10 @@ const CHECKS = {
       + consumer.header + consumer.body;
     const timed = [...t.matchAll(/(?:(?:const|let|var)\s+(\w+)\s*=\s*)?(?:await\s+)?\b(fetch|https?\.(?:get|request))\s*\(\s*[^,()]{0,80}?\s*(?:(,\s*\{)|[,)])/g)]
       .filter(request => {
-        // Only this call's own literal: an unrelated later block is not proof.
-        const options = request[3] ? blockAt(t, request.index + request[0].length - 1) : '';
+        // Only this call's own literal, and only its top level: an unrelated
+        // later block is not proof, and `{ headers: { signal: ... } }` hands
+        // fetch no signal at all.
+        const options = request[3] ? topLevelOf(blockAt(t, request.index + request[0].length - 1)) : '';
         const signalRef = /\bsignal\s*:\s*AbortSignal\.timeout\s*\(/.test(options)
           ? 'inline'
           : (/\bsignal\s*:\s*(\w+)\s*\.\s*signal\b/.exec(options)
@@ -611,11 +731,14 @@ const CHECKS = {
     // slips through and the stream ends without ever tripping the limit.
     // An oversized response is a failure, not a short file: a bare `return`
     // resolves with a truncated download. Evented streams fail by destroy(err).
+    // ...and the teardown has to run on every path through that branch: an
+    // `if (strict) throw` inside it still writes the oversized chunk otherwise.
     const stops = limitBranch && finite && (predictive || counter.index < limitBranch.index)
       && (evented
         ? (stream.length > 0
-          && new RegExp(String.raw`\b(?:${stream.join('|')})[\w.$]*\s*\.\s*(?:destroy|abort|cancel)\s*\(\s*new\s+\w*Error`).test(limitBranch.body))
-        : /\bthrow\b|(?<![.\w])reject\s*\(/.test(limitBranch.body));
+          && alwaysReaches(limitBranch.body,
+            new RegExp(String.raw`\b(?:${stream.join('|')})[\w.$]*\s*\.\s*(?:destroy|abort|cancel)\s*\(\s*new\s+\w*Error`)))
+        : alwaysReaches(limitBranch.body, /\bthrow\b|(?<![.\w])reject\s*\(/));
     // The write has to be of the chunk just counted, and only after the guard:
     // an unrelated log write past the branch is not the destination write.
     const writesChunk = chunk && new RegExp(String.raw`write\w*\s*\([^)]*\b${chunk}\b`);
