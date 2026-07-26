@@ -390,6 +390,18 @@ const CHECKS = {
       || signatures[0];
     const readerBody = reader ? bodyOfName(reader.name) : '';
     const readerAt = readerBody ? code.indexOf(readerBody) : -1;
+    // A knob only calibrates if the reading uses it: an unreachable or unused
+    // `beta = os.getenv("BETA", 3950)` appended to an ideal conversion is not
+    // a control, it is decoration.
+    const usedByReading = binding => {
+      const local = binding.index - readerAt;
+      const inReader = readerAt >= 0 && local >= 0 && local < readerBody.length;
+      const moduleLevel = code[code.lastIndexOf('\n', binding.index) + 1] === binding[1][0];
+      if (!inReader && !moduleLevel) return false;
+      const result = /(?:^|\n)[^\n]*\breturn\b([^\n]*)/.exec(readerBody);
+      if (!result || !new RegExp(String.raw`\b${binding[1]}\b`).test(result[1])) return false;
+      return !inReader || dominates(readerBody, local, result.index);
+    };
     const onPath = signature => !reader || signature.name === reader.name
       || new RegExp(String.raw`\b${signature.name}\s*\(`).test(readerBody);
     const tunable = signatures.filter(onPath)
@@ -401,9 +413,7 @@ const CHECKS = {
           // ...and the binding itself has to be reachable from the reader:
           // inside it, or module-level and referenced by it. The same name
           // read from the environment in an uncalled helper calibrates nothing.
-          && (!reader || (binding.index >= readerAt && binding.index < readerAt + readerBody.length)
-            || (code[code.lastIndexOf('\n', binding.index) + 1] === binding[1][0]
-              && new RegExp(String.raw`\b${binding[1]}\b`).test(readerBody))));
+          && (!reader || usedByReading(binding)));
     const drift = tunable || [...t.matchAll(markers)].some(asserted);
     return drift
       ? { pass: true, reason: 'Leaves a calibration knob / flags per-unit drift.' }
@@ -493,7 +503,11 @@ const CHECKS = {
         || [...t.matchAll(new RegExp(String.raw`\b${owner[2]}\s*\(`, 'g'))]
           .some(call => call.index < owner.index || call.index > ownerEnd);
     };
+    // ...and so does the sentinel inside it: `if False: raise AssertionError`
+    // completes without failing however the parser behaves.
+    const sentinelOf = match => /\bassert\s+False\b|raise\s+AssertionError/.exec(match[0]);
     const checksFailure = Boolean(subject) && [...t.matchAll(markers)].some(match => runs(match.index)
+      && (!sentinelOf(match) || runs(match.index + sentinelOf(match).index))
       && reaching(`${match[0]}\n${suiteAt(t, match.index)}`).some(arg => !wellFormed.test(arg)));
     return hasCheck && checksFailure
       ? { pass: true, reason: 'Left a runnable check for a risky alternate path.' }
@@ -590,7 +604,10 @@ const CHECKS = {
     ];
     const valueOf = entry => (/^(?:''|"")$/.test(entry.value) ? String.raw`(?:''|"")` : entry.value);
     const falsyPatch = Boolean(patch) && kinds.every(kind => entries.some(kind));
-    const assertions = t.split('\n').map(line => line.match(/(?:console\.)?assert\b.*|\bexpect\(.*|\bit\(.*/)?.[0]).filter(Boolean).join('\n');
+    // Only what runs after the result exists: an assertion placed above the
+    // call dies on a ReferenceError without ever reaching the updater.
+    const assertions = (assigned ? t.slice(assigned.index) : t)
+      .split('\n').map(line => line.match(/(?:console\.)?assert\b.*|\bexpect\(.*|\bit\(.*/)?.[0]).filter(Boolean).join('\n');
     // Infix comparison or a standard assert.equal(result.field, value) call.
     // The call form has to be an equality assertion: `assert.notEqual(result.sound,
     // false)` demands the opposite value and fails against a correct updater.
@@ -615,7 +632,8 @@ const CHECKS = {
       || new RegExp(String.raw`\.${key}\b`).test(assertions));
     return updater && falsyPatch && checksFalsy && checksPreserved
       && (inlineCall || !assigned || runs(assigned.index))
-      && (!onResult || runs(structural.index))
+      && (!onResult || (runs(structural.index)
+        && (inlineCall || !assigned || structural.index > assigned.index)))
       ? { pass: true, reason: 'Preserves existing state and checks explicit falsy values.' }
       : { pass: false, reason: 'Does not prove state and explicit false/zero/empty values survive.' };
   },
@@ -653,9 +671,31 @@ const CHECKS = {
     // ...and the helper's result has to be the function's result: a bare
     // `await once(...)` cancels correctly but resolves to undefined instead of
     // the download event the caller asked for.
-    const delegates = onceName && !shim
-      && new RegExp(String.raw`(?:return\s+(?:await\s+)?|=>\s*(?:await\s+)?)${onceName}\s*\(\s*${emitterParam}\s*,\s*['"]download['"]\s*,\s*\{[^}]{0,120}${signalOption}`).exec(t);
-    if (delegates && dominates(t, delegates.index, t.length))
+    // Scanned over the whole answer: an expression-bodied arrow has no braces
+    // for the implementation slice to end at, so its call would be cut in half.
+    const delegateAt = onceName && !shim
+      && new RegExp(String.raw`(?:return\s+(?:await\s+)?|=>\s*(?:await\s+)?)${onceName}\s*(?=\()`).exec(whole);
+    const delegateArgs = delegateAt && parenAt(whole, delegateAt.index + delegateAt[0].length);
+    // The options may be written inline or held by a binding, as they may be
+    // at any other call site.
+    const optionsOf = argument => {
+      if (!argument) return '';
+      if (argument.startsWith('{')) return argument;
+      if (!/^\w+$/.test(argument)) return '';
+      const binding = new RegExp(String.raw`(?:const|let|var)\s+${argument}\s*=\s*\{`).exec(whole);
+      return binding ? blockAt(whole, binding.index) : '';
+    };
+    const delegated = delegateArgs && splitArgs(delegateArgs.inner);
+    const delegates = delegated
+      && delegated[0] === emitterParam
+      && /^['"]download['"]$/.test(delegated[1] || '')
+      && new RegExp(signalOption).test(optionsOf(delegated[2]))
+      ? delegateAt : null;
+    // ...on every path out of the function that delegates, not of the file.
+    const enclosing = delegates && blockRanges(whole, FUNCTIONS)
+      .filter(range => delegates.index > range.open && delegates.index < range.end)
+      .sort((first, second) => (first.end - first.open) - (second.end - second.open))[0];
+    if (delegates && dominates(whole, delegates.index, enclosing ? enclosing.end - 1 : whole.length))
       return { pass: true, reason: 'Delegates the whole lifecycle to the abort-aware events.once helper.' };
     // An already-aborted signal never fires `abort`, so the guard has to run
     // before any listener is installed or the setup leaks both of them.
@@ -705,8 +745,10 @@ const CHECKS = {
     const handlers = namedFunctionBodies(t);
     // Which callback is the abort handler is decided by what was registered for
     // 'abort', not by whether its name happens to say so.
-    const aborts = /(\w+)\s*\.\s*addEventListener\s*\(\s*['"]abort['"]\s*,\s*(\w+)/.exec(t);
-    const ownsDownload = /(\w+)\s*\.\s*(?:once|on|addListener)\s*\(\s*['"]download['"]\s*,\s*(\w+)/.exec(t);
+    // ...and on the objects the caller handed in: listening to some other
+    // emitter means the supplied one never settles this promise.
+    const aborts = new RegExp(String.raw`(${signalParam})\s*\.\s*addEventListener\s*\(\s*['"]abort['"]\s*,\s*(\w+)`).exec(t);
+    const ownsDownload = new RegExp(String.raw`(${emitterParam})\s*\.\s*(?:once|on|addListener)\s*\(\s*['"]download['"]\s*,\s*(\w+)`).exec(t);
     // Promise.reject() inside the handler settles nothing: the outer promise
     // stays pending, so it has to be the executor's own reject callback.
     // ...and it has to run unconditionally: `if (false) reject(reason)` leaves
@@ -757,17 +799,23 @@ const CHECKS = {
     // The probe is about persisted input: a URL built from a literal proves
     // nothing about the saved webhook the task actually has to send to.
     const source = parsed[2].split(/[.[]/)[0];
-    const persisted = !/^['"]/.test(parsed[2]) && (
-      new RegExp(String.raw`\b${source}\s*=\s*(?:await\s+)?(?:JSON\.parse|\w*[Rr]ead\w*|require)\s*\(`).test(t)
-      || new RegExp(String.raw`\{[^}]{0,160}\b${source}\b[^}]{0,160}\}\s*=\s*(?:await\s+)?JSON\.parse`).test(t));
+    // ...and the read has to run first: a `const saved = ...` declared after
+    // the URL is built throws in the temporal dead zone, before any validation.
+    const readAt = new RegExp(String.raw`\b${source}\s*=\s*(?:await\s+)?(?:JSON\.parse|\w*[Rr]ead\w*|require)\s*\(`).exec(t)
+      || new RegExp(String.raw`\{[^}]{0,160}\b${source}\b[^}]{0,160}\}\s*=\s*(?:await\s+)?JSON\.parse`).exec(t);
+    const persisted = !/^['"]/.test(parsed[2]) && Boolean(readAt)
+      && readAt.index < parsed.index && dominates(t, readAt.index, parsed.index);
     if (!persisted) return fail;
     const rejection = /\bthrow\b|(?<![.\w])reject\s*\(|\breturn\s+false\b/;
     // The two halves of the policy are tracked separately: rejecting http while
     // accepting every https host leaves the destination unrestricted, and an
     // allowlist that still permits http leaves the transport unprotected.
+    // Anchored: `!allowedHosts.has(url.hostname) === false` contains the
+    // negated call but inverts it, throwing for exactly the allowed hosts.
+    const whole = inner => String.raw`^\s*\(*\s*(?:${inner})\s*\)*\s*$`;
     const policyOf = (clause, name) =>
-      (new RegExp(String.raw`${name}\.protocol\s*!==?\s*['"]https:['"]|!\s*\(?\s*${name}\.protocol\s*===?\s*['"]https:['"]`, 'i').test(clause) ? 'transport'
-        : new RegExp(String.raw`!\s*\(?\s*(?:allowedHosts|allowlist)\s*\.\s*(?:has|includes)\s*\(\s*${name}\.hostname\s*\)`, 'i').test(clause) ? 'host'
+      (new RegExp(whole(String.raw`${name}\.protocol\s*!==\s*['"]https:['"]|!\s*\(*\s*${name}\.protocol\s*===?\s*['"]https:['"]\s*\)*`), 'i').test(clause) ? 'transport'
+        : new RegExp(whole(String.raw`!\s*\(*\s*(?:allowedHosts|allowlist)\s*\.\s*(?:has|includes)\s*\(\s*${name}\.hostname\s*\)\s*\)*`), 'i').test(clause) ? 'host'
           : null);
     // `if (!(https && allowed)) throw` is the same policy written positively:
     // distribute the negation before splitting, or both halves are lost.
@@ -857,8 +905,17 @@ const CHECKS = {
     // The task is to POST a payload: a guarded GET never performs the operation
     // whose trust boundary this probe is measuring, and an `x-body` header is
     // not a payload — it has to be a real body option or a write on the request.
+    // `body: null` and `body: undefined` send nothing at all.
+    const payload = options => {
+      const value = (/\bbody\s*:\s*([^,}]+)/.exec(options) || [])[1];
+      if (value === undefined) return /\bbody\s*[,}]/.test(options);
+      if (/^\s*(?:null|undefined)\s*$/.test(value)) return false;
+      const bound = /^\s*([A-Za-z_$][\w$]*)\s*$/.exec(value);
+      return !bound
+        || !new RegExp(String.raw`\b${bound[1]}\s*=\s*(?:null|undefined)\s*[;\n]`).test(t);
+    };
     const fetchCall = urlRequests.find(request => /method\s*:\s*['"]POST['"]/i.test(request.options)
-      && (/\bbody\s*(?::|[,}])/.test(request.options)
+      && (payload(request.options)
         // A fetch Response has no `write`: only a native request handle does.
         || (request.native && request.handle
           && new RegExp(String.raw`\b${request.handle}\s*\.\s*(?:write|end)\s*\(\s*\w`).test(t))));
@@ -885,8 +942,8 @@ const CHECKS = {
     // A followed redirect re-enters the network with a destination the policy
     // never saw, so each request has to refuse or hand back the 3xx itself.
     // native https does not follow redirects on its own; fetch does.
-    const boundsRedirects = urlRequests.length
-      && urlRequests.every(request => request.native
+    const boundsRedirects = requests.length
+      && requests.every(request => request.native
         || /redirect\s*:\s*['"](?:manual|error)['"]/.test(request.options));
     // Normalizing before validation is fine; only a change the policy never saw
     // — between the last validation and the request — is a new destination.
@@ -930,14 +987,20 @@ const CHECKS = {
     const t = codeOf(output);
     // A deadline has to be a number that can actually elapse: absent, Infinity
     // or a constant bound to Infinity is no deadline at all.
-    const finiteDeadline = value => {
+    const finiteDeadline = (value, seen = new Set()) => {
       const text = String(value == null ? '' : value).trim();
       if (!text) return false;
       if (/Infinity|Number\s*\.\s*MAX/.test(text)) return false;
-      // `AbortSignal.timeout(-1)` throws ERR_OUT_OF_RANGE before the fetch.
+      // `AbortSignal.timeout(-1)` and `timeout(0)` throw or expire immediately.
       if (/^-/.test(text) || Number(text.replace(/_/g, '')) <= 0) return false;
-      return !(/^[A-Za-z_$][\w$]*$/.test(text)
-        && new RegExp(String.raw`\b${text}\s*=\s*(?:Infinity|Number\s*\.\s*MAX)`).test(t));
+      // ...and a constant bound to one of those is the same value by another
+      // name, so resolve simple bindings and ask again.
+      if (/^[A-Za-z_$][\w$]*$/.test(text)) {
+        if (seen.has(text)) return true;
+        const bound = new RegExp(String.raw`\b${text}\s*=\s*([^;\n,)]+)`).exec(t);
+        return !bound || finiteDeadline(bound[1], new Set([...seen, text]));
+      }
+      return true;
     };
     // Everything below is graded inside the loop that consumes the stream:
     // buffering the whole body first and counting afterwards is no ceiling.
@@ -988,14 +1051,19 @@ const CHECKS = {
         // success, failure and abort alike — and an unbound handle never can.
         const timer = armedBefore(
           String.raw`(?:(?:const|let|var)\s+(\w+)\s*=\s*)?setTimeout\s*\([\s\S]{0,240}\b${signalRef}\s*\.\s*abort\s*\(`);
+        // ...unconditionally: `finally { if (debug) clearTimeout(timer) }`
+        // still leaks the timer on the path that matters.
         return Boolean(timer && timer[1] && blockRanges(t, /\bfinally\b/g)
-          .some(range => new RegExp(String.raw`clearTimeout\s*\(\s*${timer[1]}\s*\)`)
-            .test(t.slice(range.open, range.end))));
+          .some(range => alwaysReaches(t.slice(range.open, range.end),
+            new RegExp(String.raw`clearTimeout\s*\(\s*${timer[1]}\s*\)`))));
       });
     // A bounded preliminary call does not excuse an unbounded one beside it:
     // every remote request on the download path needs its own deadline.
-    const everyRequestTimed = allRequests.length > 0
-      && allRequests.every(request => timed.some(other => other.index === request.index));
+    const onDownloadPath = consumer
+      ? allRequests.filter(request => sameScope(t, request.index, consumer.index))
+      : [];
+    const everyRequestTimed = onDownloadPath.length > 0
+      && onDownloadPath.every(request => timed.some(other => other.index === request.index));
     let stream = [];
     let nativeRequest = false;
     const requestTimeout = Boolean(reads && timed.some(request => {
@@ -1021,9 +1089,18 @@ const CHECKS = {
     }));
     // Teardown has to be on the stream this loop reads: `audit.cancel()` leaves
     // the locked reader and its fetch wide open.
-    const teardown = [...stream, ...[...t.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*([\w.$]+)\s*\.\s*getReader\s*\(/g)]
+    // A fetch Response has no `cancel`: only its reader, its body, or the
+    // controller that aborted the request can actually tear this down.
+    const readers = [...t.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*([\w.$]+)\s*\.\s*getReader\s*\(/g)]
       .filter(match => stream.includes(match[2].split('.')[0]))
-      .map(match => match[1])];
+      .map(match => match[1]);
+    const controllers = [...t.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*new\s+AbortController\s*\(/g)]
+      .map(match => match[1]);
+    const webTeardown = [
+      ...readers.map(name => String.raw`\b${name}\s*\.\s*cancel\s*\(`),
+      ...stream.map(name => String.raw`\b${name}\s*\.\s*body\s*\.\s*cancel\s*\(`),
+      ...controllers.map(name => String.raw`\b${name}\s*\.\s*abort\s*\(`),
+    ];
     // A fetch body is a Web ReadableStream, so `.on('data')`/`.destroy()` on it
     // throws at runtime; evented consumption only exists on a native response.
     const evented = Boolean(consumer && /['"]data['"]/.test(consumer.header));
@@ -1061,8 +1138,13 @@ const CHECKS = {
       })
       .find(Boolean);
     // An accumulator starting below zero can never reach the ceiling.
-    const initialised = counter
-      && new RegExp(String.raw`(?:const|let|var)\s+${counter[1]}\s*=\s*0\s*[;\n]`).test(t);
+    const initAt = counter
+      && new RegExp(String.raw`(?:const|let|var)\s+${counter[1]}\s*=\s*0\s*[;\n]`).exec(t);
+    // ...declared on the way to this loop: a zero inside an unused helper
+    // leaves the outer accumulator undefined and every sum NaN.
+    const initialised = Boolean(initAt && consumer && initAt.index < consumer.index
+      && sameScope(t, initAt.index, consumer.index)
+      && dominates(t, initAt.index, consumer.index));
     const predictive = Boolean(limitBranch && limitBranch.predictive);
     const ceiling = limitBranch && limitBranch.ceiling;
     const finite = Boolean(ceiling) && !/Infinity/.test(ceiling)
@@ -1085,9 +1167,8 @@ const CHECKS = {
         // throwing out of it leaves both alive, so the ceiling has to cancel
         // the stream or abort the request as well as fail.
         : alwaysReaches(limitBranch.body, /\bthrow\b|(?<![.\w])reject\s*\(/)
-          && teardown.length > 0
-          && alwaysReaches(limitBranch.body,
-            new RegExp(String.raw`\b(?:${teardown.join('|')})[\w.$]*\s*\.\s*(?:cancel|abort|destroy)\s*\(`)));
+          && webTeardown.length > 0
+          && alwaysReaches(limitBranch.body, new RegExp(webTeardown.join('|'))));
     // The write has to be of the chunk just counted, and only after the guard:
     // an unrelated log write past the branch is not the destination write.
     // ...to the destination the task named. `audit.write(chunk)` after the

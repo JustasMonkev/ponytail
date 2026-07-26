@@ -2133,6 +2133,133 @@ test('onecheck: a helper forwarding a ternary never passes the input on', () => 
   assert.equal(r.pass, false);
 });
 
+// --- round 6: the right receiver, the right order, the right value ---
+
+test('bounds: a conditional clearTimeout in finally still leaks the timer', () => {
+  const r = check('bounds',
+    '```javascript\nconst controller = new AbortController();\nconst timer = setTimeout(() => controller.abort(), 10000);\ntry {\n' +
+  'const response = await fetch(url, { signal: controller.signal });\n' + 'const file = await open(destination, "w");\nconst reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n' +
+  '} finally { if (debug) clearTimeout(timer); }\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a deadline bound to zero is not a deadline', () => {
+  const r = check('bounds',
+    '```javascript\nconst deadline = 0;\nconst response = await fetch(url, { signal: AbortSignal.timeout(deadline) });\n' + 'const file = await open(destination, "w");\nconst reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n' + '```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: an accumulator zeroed in an unused helper leaves NaN', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+  'const file = await open(destination, "w");\nconst reader = response.body.getReader();\nlet received;\nwhile (true) {\n' +
+  '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+  '  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n' +
+  'function unused() { let received = 0; return received; }\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a fetch Response has no cancel, so nothing is torn down', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+  'const file = await open(destination, "w");\nconst reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+  '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+  '  if (received > MAX_BYTES) { await response.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('contracts: an assertion above the call dies on a ReferenceError', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) { return { ...current, ...patch }; }\n' +
+  'console.assert(result.sound === false); console.assert(result.volume === 0);\n' +
+  'console.assert(result.label === ""); console.assert(result.theme === "dark");\n' +
+  'const result = updateSettings({ theme: "dark", sound: true, label: "x" }, { sound: false, volume: 0, label: "" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('hardware: an unreachable env knob after return calibrates nothing', () => {
+  const r = check('hardware',
+    '```python\ndef read_temperature(adc):\n    return adc.read(0) * 0.1\n    beta = os.getenv("BETA", 3950)\n```\nReturns Celsius.');
+  assert.equal(r.pass, false);
+});
+
+test('hardware: an env knob the reading consumes is a real knob', () => {
+  const r = check('hardware',
+    '```python\ndef read_temperature(adc):\n    beta = os.getenv("BETA", 3950)\n    return _steinhart(adc.read(0), beta)\n```\nReturns Celsius.');
+  assert.equal(r.pass, true);
+});
+
+test('revalidate: a replayed request must refuse redirects too', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+  'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad");\n' +
+  'const first = await fetch(url, { method: "POST", body, redirect: "manual" });\n' +
+  'const redirected = new URL(first.headers.get("location"));\n' +
+  'if (redirected.protocol !== "https:" || !allowedHosts.has(redirected.hostname)) throw new Error("bad");\n' +
+  'await fetch(redirected, { method: "POST", body });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: an inverted host clause throws for the allowed hosts', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+  'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname) === false) throw new Error("bad");\n' +
+  'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: a null body sends no payload at all', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+  'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad");\n' +
+  'await fetch(url, { method: "POST", body: null, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('lifecycle: native once options held by a binding still delegate', () => {
+  const r = check('lifecycle',
+    '```javascript\nconst { once } = require("node:events");\n' +
+  'function waitForDownload(emitter, signal) {\n  const options = { signal };\n  return once(emitter, "download", options);\n}\n```');
+  assert.equal(r.pass, true);
+});
+
+test('bounds: an unbounded fetch in a sibling helper is not this download', () => {
+  const r = check('bounds',
+    '```javascript\nasync function download(url, destination) {\n' +
+  '  const response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+  '  const file = await open(destination, "w");\n  const reader = response.body.getReader();\n  let received = 0;\n  while (true) {\n' +
+  '    const { done, value } = await reader.read(); if (done) break;\n    received += value.byteLength;\n' +
+  '    if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\n    await file.write(value);\n  }\n}\n' +
+  'async function unrelated(u) { return fetch(u); }\n```');
+  assert.equal(r.pass, true);
+});
+
+test('lifecycle: listeners on another emitter never settle this promise', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, signal) {\n  return new Promise((resolve, reject) => {\n' +
+  '    if (signal.aborted) return reject(signal.reason);\n' +
+  '    const cleanup = () => { other.off("download", done); otherSignal.removeEventListener("abort", aborted); };\n' +
+  '    const done = value => { cleanup(); resolve(value); };\n' +
+  '    const aborted = () => { cleanup(); reject(signal.reason); };\n' +
+  '    other.once("download", done); otherSignal.addEventListener("abort", aborted);\n  });\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('onecheck: a sentinel under a dead branch never fails', () => {
+  const r = check('onecheck',
+    '```python\ndef to_seconds(s):\n    return 0\n\ntry:\n    to_seconds("abc")\n    if False:\n        raise AssertionError\nexcept AssertionError:\n    pass\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: a read declared after the URL throws before validating', () => {
+  const r = check('revalidate',
+    '```javascript\nconst url = new URL(saved.webhook);\n' +
+  'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad");\n' +
+  'await fetch(url, { method: "POST", body, redirect: "error" });\n' +
+  'const saved = JSON.parse(text);\n```');
+  assert.equal(r.pass, false);
+});
+
 // --- unknown probe is skipped, not failed ---
 
 test('unknown probe is skipped', () => {
