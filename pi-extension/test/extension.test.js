@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -225,6 +225,72 @@ test("config.hideStatus hides the indicator but keeps ponytail active (#324)", a
 
   assert.deepEqual(statusWrites, [], "config.hideStatus must suppress the status bar");
   assert.match(injected.systemPrompt, /PONYTAIL MODE ACTIVE/, "ruleset must still inject while status is hidden");
+}));
+
+test("/ponytail badge off clears the badge, keeps the ruleset, and persists (#618)", async () => withTempConfig(async () => {
+  const { commands, events } = createPiHarness();
+  const statusWrites = [];
+  const ctx = createCommandContext({
+    ui: { notify() {}, setStatus: (key, text) => statusWrites.push({ key, text }), theme: { fg: (_c, t) => t } },
+  });
+
+  await events.get("session_start")({ reason: "startup" }, ctx);
+  assert.ok(statusWrites.length > 0, "badge is drawn before hiding");
+
+  await commands.get("ponytail").handler("badge off", ctx);
+  assert.deepEqual(statusWrites.at(-1), { key: "ponytail", text: "" }, "an already-drawn badge must be cleared at runtime");
+
+  statusWrites.length = 0;
+  await events.get("agent_start")({}, ctx);
+  assert.deepEqual(statusWrites, [], "badge stays hidden on later events");
+
+  const injected = await events.get("before_agent_start")({ systemPrompt: "BASE" }, ctx);
+  assert.match(injected.systemPrompt, /PONYTAIL MODE ACTIVE/, "ruleset must still inject while the badge is hidden");
+
+  const config = JSON.parse(readFileSync(join(process.env.XDG_CONFIG_HOME, "ponytail", "config.json"), "utf8"));
+  assert.equal(config.hideStatus, true, "preference must persist to config.json");
+
+  // A fresh session picks the persisted preference up.
+  const second = createPiHarness();
+  const secondWrites = [];
+  const ctx2 = createCommandContext({
+    ui: { notify() {}, setStatus: (key, text) => secondWrites.push({ key, text }), theme: { fg: (_c, t) => t } },
+  });
+  await second.events.get("session_start")({ reason: "startup" }, ctx2);
+  assert.deepEqual(secondWrites, [], "next session must start with the badge hidden");
+}));
+
+test("/ponytail badge on redraws the badge (#618)", async () => withTempConfig(async () => {
+  mkdirSync(join(process.env.XDG_CONFIG_HOME, "ponytail"), { recursive: true });
+  writeFileSync(join(process.env.XDG_CONFIG_HOME, "ponytail", "config.json"), JSON.stringify({ hideStatus: true }));
+  const { commands, events } = createPiHarness();
+  const statusWrites = [];
+  const ctx = createCommandContext({
+    ui: { notify() {}, setStatus: (key, text) => statusWrites.push({ key, text }), theme: { fg: (_c, t) => t } },
+  });
+
+  await events.get("session_start")({ reason: "startup" }, ctx);
+  assert.deepEqual(statusWrites, [], "badge starts hidden");
+
+  await commands.get("ponytail").handler("badge on", ctx);
+  assert.equal(statusWrites.at(-1)?.key, "ponytail");
+  assert.match(statusWrites.at(-1)?.text, /FULL/, "badge must be redrawn immediately");
+}));
+
+test("/ponytail badge on reports when PONYTAIL_HIDE_STATUS overrides it (#618)", async () => withTempConfig(async () => {
+  process.env.PONYTAIL_HIDE_STATUS = "1";
+  const { commands, events } = createPiHarness();
+  const statusWrites = [];
+  const notices = [];
+  const ctx = createCommandContext({
+    ui: { notify: (m) => notices.push(m), setStatus: (key, text) => statusWrites.push({ key, text }), theme: { fg: (_c, t) => t } },
+  });
+
+  await events.get("session_start")({ reason: "startup" }, ctx);
+  await commands.get("ponytail").handler("badge on", ctx);
+
+  assert.deepEqual(statusWrites, [{ key: "ponytail", text: "" }], "env override must keep the badge hidden");
+  assert.match(notices.at(-1), /PONYTAIL_HIDE_STATUS/, "user must learn why the badge stayed hidden");
 }));
 
 test("PONYTAIL_HIDE_STATUS=0 does not hide the indicator", async () => withTempConfig(async () => {

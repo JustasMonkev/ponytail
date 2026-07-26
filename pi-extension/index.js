@@ -11,6 +11,7 @@ const {
   normalizePersistedMode,
   isDeactivationCommand,
   writeDefaultMode,
+  writeHideStatus,
 } = require("../hooks/ponytail-config.js");
 const { getPonytailInstructions, filterSkillBodyForMode } = require("../hooks/ponytail-instructions.js");
 
@@ -19,7 +20,7 @@ export const readDefaultMode = getDefaultMode;
 export const readQuietStartup = getQuietStartup;
 
 const RUNTIME_MODE_LIST = RUNTIME_MODES.join("|");
-const PONYTAIL_COMMAND_DESCRIPTION = `Set mode: ${RUNTIME_MODE_LIST}. Commands: status, default <mode>`;
+const PONYTAIL_COMMAND_DESCRIPTION = `Set mode: ${RUNTIME_MODE_LIST}. Commands: status, default <mode>, badge on|off`;
 
 export function resolveSessionMode(entries, fallbackMode = DEFAULT_MODE) {
   const fallback = normalizePersistedMode(fallbackMode) || DEFAULT_MODE;
@@ -52,6 +53,13 @@ export function parsePonytailCommand(text, defaultMode = DEFAULT_MODE) {
     // ponytail: a default must be a runtime level; review is session-only (#377).
     const mode = normalizeMode(secondary);
     return mode ? { type: "set-default", mode } : { type: "invalid", reason: "invalid-default-mode" };
+  }
+
+  if (primary === "badge") {
+    // ponytail: badge visibility is a persisted preference, not a mode (#618).
+    if (secondary === "on") return { type: "set-badge", hide: false };
+    if (secondary === "off") return { type: "set-badge", hide: true };
+    return { type: "invalid", reason: "invalid-badge-arg" };
   }
 
   const mode = normalizeMode(primary);
@@ -134,6 +142,27 @@ export default function ponytailExtension(pi) {
         } catch (e) {
           ctx?.ui?.notify?.(`Failed to save default mode: ${e.message}`, "error");
         }
+        return;
+      }
+
+      if (parsed.type === "set-badge") {
+        try {
+          writeHideStatus(parsed.hide);
+        } catch (e) {
+          ctx?.ui?.notify?.(`Failed to save badge preference: ${e.message}`, "error");
+          return;
+        }
+        hideStatus = getHideStatus();
+        if (hideStatus) {
+          // syncStatus never draws while hidden, so clear the badge it already drew.
+          try { (ctx || lastCtx)?.ui?.setStatus?.("ponytail", ""); } catch (e) {}
+        } else {
+          syncStatus(ctx);
+        }
+        const message = hideStatus === parsed.hide
+          ? (parsed.hide ? "Ponytail badge hidden; mode stays active." : "Ponytail badge shown.")
+          : `Saved badge preference, but PONYTAIL_HIDE_STATUS keeps it ${hideStatus ? "hidden" : "shown"}.`;
+        ctx?.ui?.notify?.(message, "info");
         return;
       }
 
