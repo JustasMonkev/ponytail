@@ -1718,6 +1718,32 @@ test('revalidate: optional chaining is not a branch', () => {
   assert.equal(r.pass, true);
 });
 
+// --- a defaulted parameter does not hide a function ---
+
+test('lifecycle: a handler with a defaulted parameter is still the handler', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, signal) {\n' +
+    '  return new Promise((resolve, reject) => {\n' +
+    '    if (signal.aborted) return reject(signal.reason);\n' +
+    '    const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+    '    const done = (value = fallback()) => { cleanup(); resolve(value); };\n' +
+    '    const aborted = () => { cleanup(); reject(signal.reason); };\n' +
+    '    emitter.once("download", done); signal.addEventListener("abort", aborted);\n' +
+    '  });\n}\n```');
+  assert.equal(r.pass, true);
+});
+
+test('contracts: a defaulted parameter does not make an uncalled helper run', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) { return { ...current, ...patch }; }\n' +
+    'function unused(seed = compute()) {\n' +
+    '  const result = updateSettings({ theme: "dark", sound: true, label: "x" },\n' +
+    '    { sound: false, volume: 0, label: "" });\n' +
+    '  console.assert(result.sound === false); console.assert(result.volume === 0);\n' +
+    '  console.assert(result.label === ""); console.assert(result.theme === "dark");\n}\n```');
+  assert.equal(r.pass, false);
+});
+
 // --- unknown probe is skipped, not failed ---
 
 test('unknown probe is skipped', () => {

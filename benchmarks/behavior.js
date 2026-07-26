@@ -57,13 +57,32 @@ function codeOf(text) {
   return stripComments(blocks.length ? blocks.map(match => match[1]).join('\n') : t);
 }
 
+// Brace-balanced, so a nested object or block inside the handler does not
+// truncate the body before the cleanup and settlement calls that follow it —
+// and paren-balanced, so a defaulted parameter does not hide the handler.
 function namedFunctionBodies(text) {
-  return [
-    ...[...text.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?(?:\([^)]*\)|\w+)\s*=>\s*\{/gi)],
-    ...[...text.matchAll(/function\s+(\w+)\s*\([^)]*\)\s*\{/gi)],
-    // Brace-balanced, so a nested object or block inside the handler does not
-    // truncate the body before the cleanup and settlement calls that follow it.
-  ].map(match => ({ name: match[1], body: blockAt(text, match.index + match[0].length - 1) }));
+  const bodyAfterParams = (name, from) => {
+    let cursor = from;
+    if (/^\s*\(/.test(text.slice(cursor))) {
+      const paren = parenAt(text, cursor);
+      if (!paren) return null;
+      cursor = paren.close + 1;
+    } else {
+      const word = /^\s*\w+/.exec(text.slice(cursor));
+      if (!word) return null;
+      cursor += word[0].length;
+    }
+    return { name, cursor };
+  };
+  const arrows = [...text.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?/g)]
+    .map(match => bodyAfterParams(match[1], match.index + match[0].length))
+    .filter(entry => entry && /^\s*=>\s*\{/.test(text.slice(entry.cursor)))
+    .map(entry => ({ name: entry.name, body: blockAt(text, entry.cursor) }));
+  const declarations = [...text.matchAll(/function\s+(\w+)\s*/g)]
+    .map(match => bodyAfterParams(match[1], match.index + match[0].length))
+    .filter(entry => entry && /^\s*\{/.test(text.slice(entry.cursor)))
+    .map(entry => ({ name: entry.name, body: blockAt(text, entry.cursor) }));
+  return [...arrows, ...declarations];
 }
 
 // The text with every string literal's contents blanked, preserving length.
@@ -442,14 +461,16 @@ const CHECKS = {
     const name = updater && updater[1];
     // A check parked inside a helper nobody calls never runs. Top level, a test
     // entry point, or a function the answer actually invokes.
-    const runs = index => [...t.matchAll(/(?:function\s*(\w*)\s*\([^)]*\)|=>)\s*\{/g)]
-      .map(match => ({
-        called: match[1] && (t.match(new RegExp(String.raw`\b${match[1]}\s*\(`, 'g')) || []).length > 1,
-        entry: /\b(?:test|it|describe|main)\s*\([\s\S]{0,120}$/.test(t.slice(0, match.index + 1)),
-        open: t.indexOf('{', match.index + match[0].length - 1),
-      }))
-      .every(block => block.called || block.entry
-        || index < block.open || index > block.open + blockAt(t, block.open).length);
+    // Paren-balanced like every other block scan, so a helper cannot hide an
+    // unreachable check behind a defaulted parameter.
+    const runs = index => blockRanges(t, FUNCTIONS).every(range => {
+      const head = t.slice(Math.max(0, range.open - 200), range.open);
+      const declared = /(?:function\s+(\w+)|(?:const|let|var)\s+(\w+)\s*=)[^;{]*$/.exec(head);
+      const naming = declared && (declared[1] || declared[2]);
+      const called = naming && (t.match(new RegExp(String.raw`\b${naming}\s*\(`, 'g')) || []).length > 1;
+      const entry = /\b(?:test|it|describe|main)\s*\([\s\S]{0,160}$/.test(head);
+      return called || entry || index < range.open || index > range.end;
+    });
     // Paren-balanced rather than terminated by `);`, so a semicolonless answer
     // still binds the result whose falsy fields the assertions then inspect.
     const assignedAt = name && new RegExp(String.raw`(?:const|let|var)\s+(\w+)\s*=\s*${name}\s*\(`).exec(t);
