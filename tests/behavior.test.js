@@ -1699,6 +1699,25 @@ test('revalidate: an unbalanced brace in an error message does not truncate', ()
   assert.equal(r.pass, true);
 });
 
+test('revalidate: a catch that rethrows still rejects the invalid URL', () => {
+  const r = check('revalidate',
+    '```javascript\nfunction validateWebhookUrl(candidate) {\n  try {\n' +
+    '    if (candidate.protocol !== "https:") throw new Error("insecure");\n' +
+    '    if (!allowedHosts.has(candidate.hostname)) throw new Error("bad host");\n' +
+    '  } catch (error) { throw new Error("webhook rejected", { cause: error }); }\n}\n' +
+    'const saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\nvalidateWebhookUrl(url);\n' +
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, true);
+});
+
+test('revalidate: optional chaining is not a branch', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved?.webhook);\n' +
+    'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad");\n' +
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, true);
+});
+
 // --- unknown probe is skipped, not failed ---
 
 test('unknown probe is skipped', () => {

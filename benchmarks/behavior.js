@@ -199,9 +199,13 @@ function blockRanges(text, keywords) {
 // True when a throw at `index` actually leaves `text`. One wrapped in a try
 // whose catch swallows it terminates nothing: execution simply carries on.
 function escapesCatch(text, index) {
-  return blockRanges(text, /\btry\b/g)
-    .every(range => index < range.open || index > range.end
-      || !/^\s*catch\b/.test(text.slice(range.end)));
+  return blockRanges(text, /\btry\b/g).every(range => {
+    if (index < range.open || index > range.end) return true;
+    if (!/^\s*catch\b/.test(text.slice(range.end))) return true;
+    // A catch that rethrows is not a swallow: the failure still leaves.
+    const handler = blockAt(text, range.end);
+    return /\bthrow\b|(?<![.\w])reject\s*\(/.test(handler);
+  });
 }
 
 // A call's arguments, split on its own top-level commas.
@@ -264,8 +268,10 @@ function dominates(text, index, target) {
     text.lastIndexOf(';', index), text.lastIndexOf('{', index),
     text.lastIndexOf('}', index), text.lastIndexOf('\n', index),
   ), index);
+  // A ternary can skip the statement; `?.` and `??` cannot — reading them as a
+  // branch would fail ordinary optional-chaining code for its punctuation.
   return inside(blockRanges(text, SKIPPABLE), index, target)
-    && !/\bif\s*\(|\?/.test(statement);
+    && !/\bif\s*\(|(?<!\?)\?(?![.?])/.test(statement);
 }
 
 // True when nothing but a function body containing `target` also contains
