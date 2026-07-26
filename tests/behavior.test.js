@@ -2393,6 +2393,123 @@ test('bounds: a timer cleared in a sibling finally is never cleared here', () =>
   assert.equal(r.pass, false);
 });
 
+// --- round 8: through the helper, across the lines, into the result ---
+
+test('revalidate: a helper handed the webhook must guard its own request', () => {
+  const r = check('revalidate',
+    '```javascript\nfunction sendAgain(target) { return fetch(target, { method: "POST", body }); }\n' +
+  'const saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' + 'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad");\n' +
+  'await fetch(url, { method: "POST", body, redirect: "error" });\nsendAgain(url);\n```');
+  assert.equal(r.pass, false);
+});
+
+test('bounds: a helper declared first does not supply the destination', () => {
+  const r = check('bounds',
+    '```javascript\nfunction format(value, options) { return String(value); }\n' +
+  'async function download(url, destination) {\n' +
+  '  const response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+  '  const file = await open(destination, "w");\n  const reader = response.body.getReader();\n  let received = 0;\n  while (true) {\n' +
+  '    const { done, value } = await reader.read(); if (done) break;\n    received += value.byteLength;\n' +
+  '    if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\n    await file.write(value);\n  }\n}\n```');
+  assert.equal(r.pass, true);
+});
+
+test('hardware: a knob used in a multiline return is still used', () => {
+  const r = check('hardware',
+    '```python\ndef read_temperature(adc, beta=3950):\n    return (\n        _steinhart(adc.read(0), beta)\n    )\n```\nReturns Celsius.');
+  assert.equal(r.pass, true);
+});
+
+test('onecheck: \'if False and True\' is dead', () => {
+  const r = check('onecheck',
+    '```python\ndef to_seconds(s):\n    return 0\n\nif False and True:\n    try:\n        to_seconds("abc")\n    except ValueError:\n        pass\n    else:\n        assert False\n```');
+  assert.equal(r.pass, false);
+});
+
+test('contracts: \'if (!true)\' is as dead as \'if (false)\'', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) { return { ...current, ...patch }; }\n' +
+  'const result = updateSettings({ theme: "dark", sound: true, label: "x" }, { sound: false, volume: 0, label: "" });\n' +
+  'if (!true) {\n  console.assert(result.sound === false); console.assert(result.volume === 0);\n' +
+  '  console.assert(result.label === ""); console.assert(result.theme === "dark");\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: an alias declared alongside others still aliases the URL', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' + 'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad");\n' +
+  'const alias = url, marker = 1;\nalias.protocol = "http:";\n' +
+  'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
+test('contracts: returning current for a real patch discards it', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) {\n  if (patch != null) return current;\n  return { ...current, ...patch };\n}\n' +
+  'const result = updateSettings({ theme: "dark", sound: true, label: "x" }, { sound: false, volume: 0, label: "" });\n' +
+  'console.assert(result.sound === false); console.assert(result.volume === 0);\n' +
+  'console.assert(result.label === ""); console.assert(result.theme === "dark");\n```');
+  assert.equal(r.pass, false);
+});
+
+test('revalidate: a sibling\'s body default does not empty this payload', () => {
+  const r = check('revalidate',
+    '```javascript\nfunction unrelated(body = null) { return body; }\n' +
+  'async function send(text, body) {\n  const saved = JSON.parse(text);\n  const url = new URL(saved.webhook);\n' +
+  '  if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad");\n' +
+  '  await fetch(url, { method: "POST", body, redirect: "error" });\n}\n```');
+  assert.equal(r.pass, true);
+});
+
+test('bounds: a constant expression evaluating to zero is no deadline', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(0 * 1000) });\n' + 'const file = await open(destination, "w");\nconst reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n  if (received > MAX_BYTES) { await reader.cancel(); throw new Error("too large"); }\nawait file.write(value);\n}\n' + '```');
+  assert.equal(r.pass, false);
+});
+
+test('lifecycle: a compound signal expression is not this function\'s signal', () => {
+  const r = check('lifecycle',
+    '```javascript\nconst { once } = require("node:events");\n' +
+  'function waitForDownload(emitter, signal) {\n  return once(emitter, "download", { signal: signal && otherSignal });\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('hardware: a helper mentioned after the return never calibrates', () => {
+  const r = check('hardware',
+    '```python\ndef calibrate(beta=3950):\n    return beta\n\ndef read_temperature(adc):\n    return 25.0\n    calibrate()\n```\nReturns Celsius.');
+  assert.equal(r.pass, false);
+});
+
+test('lifecycle: a guard in an uncalled nested helper guards nothing', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, signal) {\n  return new Promise((resolve, reject) => {\n' +
+  '    const unused = () => { if (signal.aborted) return reject(signal.reason); };\n' +
+  '    const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+  '    const done = value => { cleanup(); resolve(value); };\n' +
+  '    const aborted = () => { cleanup(); reject(signal.reason); };\n' +
+  '    emitter.once("download", done); signal.addEventListener("abort", aborted);\n  });\n}\n```');
+  assert.equal(r.pass, false);
+});
+
+test('contracts: fixtures stored in variables prove the same contract', () => {
+  const r = check('contracts',
+    '```javascript\nfunction updateSettings(current, patch) { return { ...current, ...patch }; }\n' +
+  'const current = { theme: "dark", sound: true, label: "x" };\n' +
+  'const patch = { sound: false, volume: 0, label: "" };\n' +
+  'const result = updateSettings(current, patch);\n' +
+  'console.assert(result.sound === false); console.assert(result.volume === 0);\n' +
+  'console.assert(result.label === ""); console.assert(result.theme === "dark");\n```');
+  assert.equal(r.pass, true);
+});
+
+test('revalidate: \'!url.protocol === "https:"\' lets http through', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+  'if (!url.protocol === "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad");\n' +
+  'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, false);
+});
+
 // --- unknown probe is skipped, not failed ---
 
 test('unknown probe is skipped', () => {

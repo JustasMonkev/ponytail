@@ -411,26 +411,44 @@ const CHECKS = {
       const inReader = readerAt >= 0 && local >= 0 && local < readerBody.length;
       const moduleLevel = code[code.lastIndexOf('\n', binding.index) + 1] === binding[1][0];
       if (!inReader && !moduleLevel) return false;
-      const result = /(?:^|\n)[^\n]*\breturn\b([^\n]*)/.exec(readerBody);
-      if (!result || !new RegExp(String.raw`\b${binding[1]}\b`).test(result[1])) return false;
+      const result = returnedBy(readerBody);
+      if (!result || !new RegExp(String.raw`\b${binding[1]}\b`).test(result.text)) return false;
       return !inReader || dominates(readerBody, local, result.index);
     };
     const onPath = signature => !reader || signature.name === reader.name
-      || new RegExp(String.raw`\b${signature.name}\s*\(`).test(readerBody);
+      || resultTokens(reader.name).has(signature.name);
     // ...and the reading has to use it: `def read_temperature(beta=3950):
     // return 25.0` exposes a parameter that changes nothing.
-    const consumedByResult = (owner, name) => {
+    // The return expression, however it is formatted: `return (` on its own
+    // line still owns everything up to its closing paren.
+    const returnedBy = body => {
+      const at = /\breturn\b/.exec(body);
+      if (!at) return null;
+      let text = '';
+      let depth = 0;
+      for (const line of body.slice(at.index + 'return'.length).split('\n')) {
+        text += `${line}\n`;
+        depth += (line.match(/[([{]/g) || []).length - (line.match(/[)\]}]/g) || []).length;
+        if (depth <= 0) break;
+      }
+      return { text, index: at.index };
+    };
+    // Everything the reading's value actually depends on, followed through
+    // local bindings. A helper mentioned after the return, or one whose result
+    // is discarded, never reaches it.
+    const resultTokens = owner => {
       const body = bodyOfName(owner);
-      const result = /(?:^|\n)[^\n]*\breturn\b([^\n]*)/.exec(body);
-      if (!result) return false;
-      const used = new Set(result[1].match(/[A-Za-z_]\w*/g) || []);
+      const result = returnedBy(body);
+      if (!result) return new Set();
+      const used = new Set(result.text.match(/[A-Za-z_]\w*/g) || []);
       for (let hop = 0; hop < 3; hop += 1) {
         for (const binding of body.matchAll(/\b([A-Za-z_]\w*)\s*=\s*([^\n;]+)/g)) {
           if (used.has(binding[1])) (binding[2].match(/[A-Za-z_]\w*/g) || []).forEach(token => used.add(token));
         }
       }
-      return used.has(name);
+      return used;
     };
+    const consumedByResult = (owner, name) => resultTokens(owner).has(name);
     const tunable = signatures.filter(onPath)
       .flatMap(signature => [...signature.params.matchAll(/(\w+)\s*=/g)]
         .map(parameter => ({ name: parameter[1], owner: signature.name })))
@@ -521,8 +539,8 @@ const CHECKS = {
       const indent = t.slice(lineStart).search(/\S/);
       if (indent <= 0) return true;
       // `if not True`, `if 1 == 0` and `if False or False` are all dead too.
-      const never = condition => condition.split(/\bor\b/)
-        .every(part => /^\s*(?:False|0|None|not\s+True|1\s*==\s*0|0\s*==\s*1)\s*$/.test(part));
+      const never = condition => condition.split(/\bor\b/).every(part => part.split(/\band\b/)
+        .some(operand => /^\s*(?:False|0|None|not\s+True|1\s*==\s*0|0\s*==\s*1)\s*$/.test(operand)));
       const owner = [...t.slice(0, lineStart)
         .matchAll(/^([ \t]*)(?:def\s+(\w+)\s*\(|(?:if|while)\s+([^:\n]+):)/gm)]
         .map(match => (match[3] !== undefined && !never(match[3]) ? null : match))
@@ -582,7 +600,7 @@ const CHECKS = {
         // patch to apply. `if (patch.skip) return current` discards a real
         // patch's every other field, so it drops state just the same.
         const condition = guardOf(body, earlier.index) || '';
-        return !new RegExp(String.raw`^\s*(?:!\s*${match[3]}\b|${match[3]}\s*(?:==|===|!=|!==)\s*(?:null|undefined)|!\s*Object\s*\.\s*keys\s*\(\s*${match[3]}\s*\)\s*\.\s*length|Object\s*\.\s*keys\s*\(\s*${match[3]}\s*\)\s*\.\s*length\s*===?\s*0)\s*$`)
+        return !new RegExp(String.raw`^\s*(?:!\s*${match[3]}\b|${match[3]}\s*(?:==|===)\s*(?:null|undefined)|!\s*Object\s*\.\s*keys\s*\(\s*${match[3]}\s*\)\s*\.\s*length|Object\s*\.\s*keys\s*\(\s*${match[3]}\s*\)\s*\.\s*length\s*===?\s*0)\s*$`)
           .test(condition);
       });
     });
@@ -593,8 +611,13 @@ const CHECKS = {
     // unreachable check behind a defaulted parameter.
     const runs = index => {
       // `if (false) { ... }` never executes, so nothing inside it is evidence.
+      const never = condition => {
+        const text = condition.trim();
+        return /^(?:false|0|!\s*true|!\s*1|1\s*===?\s*0|0\s*===?\s*1)$/.test(text)
+          || (text.includes('&&') && text.split('&&').some(operand => never(operand)));
+      };
       const dead = branches(t)
-        .filter(branch => /^\s*(?:false|0)\s*$/.test(branch.condition))
+        .filter(branch => never(branch.condition))
         .some(branch => index >= branch.start && index <= branch.end);
       if (dead) return false;
       return blockRanges(t, FUNCTIONS).every(range => {
@@ -622,7 +645,17 @@ const CHECKS = {
       || new RegExp(String.raw`expect\s*\(\s*(\w+)\s*(\([\s\S]{0,300}?\))?\s*\)\s*\.\s*to(?:Strict)?Equal\s*\(\s*(\{[\s\S]{0,400}?\})`).exec(t));
     const inlineCall = structural && structural[2] && structural[1] === name;
     const onResult = inlineCall || Boolean(structural && assigned && structural[1] === assigned[1]);
-    const args = inlineCall ? structural[2] : assigned && assigned[2];
+    // A fixture stored in a variable is the same fixture: resolve simple object
+    // bindings so `const patch = {...}; updateSettings(current, patch)` counts.
+    const resolveFixtures = text => splitArgs(String(text || '').replace(/^\(|\)$/g, ''))
+      .map(argument => {
+        if (argument.startsWith('{')) return argument;
+        if (!/^\w+$/.test(argument)) return argument;
+        const binding = new RegExp(String.raw`(?:const|let|var)\s+${argument}\s*=\s*\{`).exec(t);
+        return binding ? blockAt(t, binding.index) : argument;
+      })
+      .join(', ');
+    const args = resolveFixtures(inlineCall ? structural[2] : assigned && assigned[2]);
     // The falsy values have to be in the patch: that is the argument whose
     // explicit false/0/"" must override truthy existing settings.
     const patch = args && (args.match(/,\s*(\{[\s\S]*\})\s*\)?\s*$/) || [])[1];
@@ -716,9 +749,11 @@ const CHECKS = {
     const params = /waitForDownload\s*=?\s*(?:async\s*)?\(?\s*(\w+)\s*,\s*(\w+)/.exec(whole) || [, 'emitter', 'signal'];
     const emitterParam = params[1];
     const signalParam = params[2];
+    // Exactly: `{ signal: signal && other }` starts with the right name and
+    // hands the helper a different signal at runtime.
     const signalOption = signalParam === 'signal'
-      ? String.raw`\bsignal\s*(?:[,}]|:\s*signal\b)`
-      : String.raw`\bsignal\s*:\s*${signalParam}\b`;
+      ? String.raw`\bsignal\s*(?:[,}]|:\s*signal\s*[,}])`
+      : String.raw`\bsignal\s*:\s*${signalParam}\s*[,}]`;
     // ...on every path: `if (useNative) return once(...)` leaves the fallback
     // branch leaking, so the delegation has to be the implementation.
     // ...and the helper's result has to be the function's result: a bare
@@ -766,9 +801,12 @@ const CHECKS = {
     const settlesEveryPath = body => alwaysReaches(body, /\bthrow\b/)
       || alwaysReaches(body, /return\s+Promise\s*\.\s*reject\s*\(|return\s+(?<![.\w])reject\s*\(/)
       || (alwaysReaches(body, /(?<![.\w])reject\s*\(/) && alwaysReaches(body, /(?<![.\w])return\b/));
-    const abortBranch = branches(t).find(branch =>
-      new RegExp(String.raw`^\s*${signalParam}\s*\??\.\s*aborted\s*$`).test(branch.condition));
     const firstListener = /addEventListener\s*\(\s*['"]abort['"]|\.(?:once|on|addListener)\s*\(\s*['"]download['"]/.exec(t);
+    // ...on the executor's own path: a guard inside an uncalled nested helper
+    // never runs, and both listeners are installed anyway.
+    const abortBranch = branches(t).find(branch =>
+      new RegExp(String.raw`^\s*${signalParam}\s*\??\.\s*aborted\s*$`).test(branch.condition)
+      && (!firstListener || sameScope(t, branch.index, firstListener.index)));
     // ...on every path to the listeners: `if (strict) signal.throwIfAborted()`
     // installs both of them whenever `strict` is false.
     const throwsIfAbortedAt = new RegExp(String.raw`${signalParam}\s*\.\s*throwIfAborted\s*\(|throwIfAborted\s*\(\s*${signalParam}`).exec(t);
@@ -875,7 +913,7 @@ const CHECKS = {
     // negated call but inverts it, throwing for exactly the allowed hosts.
     const whole = inner => String.raw`^\s*\(*\s*(?:${inner})\s*\)*\s*$`;
     const policyOf = (clause, name) =>
-      (new RegExp(whole(String.raw`${name}\.protocol\s*!==\s*['"]https:['"]|!\s*\(*\s*${name}\.protocol\s*===?\s*['"]https:['"]\s*\)*`), 'i').test(clause) ? 'transport'
+      (new RegExp(whole(String.raw`${name}\.protocol\s*!==\s*['"]https:['"]|!\s*\(\s*${name}\.protocol\s*===?\s*['"]https:['"]\s*\)`), 'i').test(clause) ? 'transport'
         : new RegExp(whole(String.raw`!\s*\(*\s*(?:allowedHosts|allowlist)\s*\.\s*(?:has|includes)\s*\(\s*${name}\.hostname\s*\)\s*\)*`), 'i').test(clause) ? 'host'
           : null);
     // `if (!(https && allowed)) throw` is the same policy written positively:
@@ -968,9 +1006,28 @@ const CHECKS = {
     // ...but only for requests that cross this boundary. An unrelated
     // `fetch(configUrl)` in a config helper never touches the saved webhook.
     const derived = new Set([url]);
-    for (const built of t.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*new URL\s*\(\s*([^)]*)\)/g)) {
-      if (/headers\s*\.\s*get\s*\(\s*['"]location['"]/i.test(built[2])
-        || derived.has(built[2].split(/[.[]/)[0])) derived.add(built[1]);
+    for (let grew = true; grew;) {
+      grew = false;
+      const add = name => {
+        if (!name || derived.has(name)) return;
+        derived.add(name);
+        grew = true;
+      };
+      for (const built of t.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*new URL\s*\(\s*([^)]*)\)/g)) {
+        if (/headers\s*\.\s*get\s*\(\s*['"]location['"]/i.test(built[2])
+          || derived.has(built[2].split(/[.[]/)[0])) add(built[1]);
+      }
+      // ...and into a helper that takes it: `sendAgain(url)` puts the persisted
+      // destination behind whatever that helper's own request does with it.
+      for (const call of t.matchAll(/\b(\w+)\s*\(([^()]*)\)/g)) {
+        const passed = splitArgs(call[2]).findIndex(argument => derived.has(baseOf(argument)));
+        if (passed < 0) continue;
+        const declared = new RegExp(
+          String.raw`(?:function\s+${call[1]}\s*|(?:const|let|var)\s+${call[1]}\s*=\s*(?:async\s*)?)(?=\()`).exec(t);
+        const signature = declared && parenAt(t, declared.index + declared[0].length);
+        const parameter = signature && splitArgs(signature.inner)[passed];
+        if (parameter && /^\w+$/.test(parameter)) add(parameter);
+      }
     }
     const requests = allCalls.filter(request => derived.has(request.target)
       || new RegExp(String.raw`^${source}\b`).test(String(request.raw || '')));
@@ -980,11 +1037,21 @@ const CHECKS = {
     // whose trust boundary this probe is measuring, and an `x-body` header is
     // not a payload — it has to be a real body option or a write on the request.
     // `body: null` and `body: undefined` send nothing at all.
-    const payload = options => {
+    const payload = (options, at) => {
       const value = (/\bbody\s*:\s*([^,}]+)/.exec(options) || [])[1];
       if (value === undefined) {
-        return /\bbody\s*[,}]/.test(options)
-          && !/\bbody\s*=\s*(?:null|undefined)\b/.test(t);
+        if (!/\bbody\s*[,}]/.test(options)) return false;
+        // Scoped to the sender: an unrelated `function other(body = null)`
+        // says nothing about the payload this request carries.
+        const enclosing = blockRanges(t, FUNCTIONS)
+          .filter(range => at > range.open && at < range.end)
+          .sort((first, second) => (first.end - first.open) - (second.end - second.open))[0];
+        const head = enclosing ? t.slice(Math.max(0, enclosing.open - 200), enclosing.open) : '';
+        const declaredAt = /(?:async\s+)?(?:function\s+\w*|(?:const|let|var)\s+\w+\s*=)[^{]*$/.exec(head);
+        const from = enclosing && declaredAt
+          ? enclosing.open - (head.length - declaredAt.index) : enclosing && enclosing.open;
+        const scope = enclosing ? t.slice(from, enclosing.end) : t;
+        return !/\bbody\s*=\s*(?:null|undefined)\b/.test(scope);
       }
       if (/^\s*(?:null|undefined)\s*$/.test(value)) return false;
       const bound = /^\s*([A-Za-z_$][\w$]*)\s*$/.exec(value);
@@ -992,7 +1059,7 @@ const CHECKS = {
         || !new RegExp(String.raw`\b${bound[1]}\s*=\s*(?:null|undefined)\s*[;\n]`).test(t);
     };
     const fetchCall = urlRequests.find(request => /method\s*:\s*['"]POST['"]/i.test(request.options)
-      && (payload(request.options)
+      && (payload(request.options, request.index)
         // A fetch Response has no `write`: only a native request handle does.
         || (request.native && request.handle
           && new RegExp(String.raw`\b${request.handle}\s*\.\s*(?:write|end)\s*\(\s*\w`).test(t))));
@@ -1034,7 +1101,7 @@ const CHECKS = {
     const aliases = new Set([url]);
     for (let grew = true; grew;) {
       grew = false;
-      for (const binding of t.matchAll(/(?:(?:const|let|var)\s+)?(\w+)\s*=\s*(\w+)\s*[;\n]/g)) {
+      for (const binding of t.matchAll(/(?:(?:const|let|var)\s+)?(\w+)\s*=\s*(\w+)\s*[;,\n]/g)) {
         if (aliases.has(binding[2]) && !aliases.has(binding[1])) {
           aliases.add(binding[1]);
           grew = true;
@@ -1069,7 +1136,13 @@ const CHECKS = {
       if (!text) return false;
       if (/Infinity|Number\s*\.\s*MAX/.test(text)) return false;
       // `AbortSignal.timeout(-1)` and `timeout(0)` throw or expire immediately.
-      if (/^-/.test(text) || Number(text.replace(/_/g, '')) <= 0) return false;
+      if (/^-/.test(text)) return false;
+      // `AbortSignal.timeout(0 * 1000)` is `timeout(0)` written longhand.
+      if (/^[\d_\s*+()]+$/.test(text)) {
+        const evaluated = Function(`"use strict";return (${text.replace(/_/g, '')})`)();
+        return Number.isFinite(evaluated) && evaluated > 0;
+      }
+      if (/^[\d.]+$/.test(text) && Number(text) <= 0) return false;
       // ...and a constant bound to one of those is the same value by another
       // name, so resolve simple bindings and ask again.
       if (/^[A-Za-z_$][\w$]*$/.test(text)) {
@@ -1086,7 +1159,12 @@ const CHECKS = {
     const named = blockRanges(t, FUNCTIONS).map(range => {
       const head = t.slice(Math.max(0, range.open - 200), range.open);
       const declared = /(?:function\s+(\w+)|(?:const|let|var)\s+(\w+)\s*=)[^;{]*$/.exec(head);
-      return { ...range, name: declared && (declared[1] || declared[2]) };
+      const signature = /\(([^()]*)\)[^()]*$/.exec(head);
+      return {
+        ...range,
+        name: declared && (declared[1] || declared[2]),
+        params: signature ? splitArgs(signature[1]) : [],
+      };
     });
     const downloadFn = named.find(range => range.name && /download|report|save|copy|fetchTo/i.test(range.name));
     const consumer = streamConsumer(t, downloadFn);
@@ -1270,10 +1348,9 @@ const CHECKS = {
     // an unrelated log write past the branch is not the destination write.
     // ...to the destination the task named. `audit.write(chunk)` after the
     // guard is not the report landing in the file it was asked for.
-    const signatureAt = /(?:async\s+)?function\s+\w+\s*(?=\()/.exec(t);
-    const parameters = signatureAt
-      ? splitArgs((parenAt(t, signatureAt.index + signatureAt[0].length) || { inner: '' }).inner)
-      : [];
+    // ...from the download the probe selected, not from whichever helper the
+    // answer happens to declare first.
+    const parameters = downloadFn ? downloadFn.params : [];
     // The task hands the destination in as its second argument; the handle is
     // whatever was opened on it. Every destination-shaped name is not enough —
     // `download(url, destination, auditOutput)` would re-open the escape hatch.
