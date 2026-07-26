@@ -1667,6 +1667,38 @@ test('contracts: asserting falsy fields the patch never supplied proves nothing'
   assert.equal(r.pass, false);
 });
 
+// --- a brace inside a message is not a brace ---
+
+test('lifecycle: an unbalanced brace in an error message does not truncate', () => {
+  const r = check('lifecycle',
+    '```javascript\nfunction waitForDownload(emitter, signal) {\n' +
+    '  return new Promise((resolve, reject) => {\n' +
+    '    if (signal.aborted) return reject(signal.reason);\n' +
+    '    const cleanup = () => { emitter.off("download", done); signal.removeEventListener("abort", aborted); };\n' +
+    '    const done = value => { cleanup(); resolve(value); };\n' +
+    '    const aborted = () => { cleanup(); reject(new Error("aborted {")); };\n' +
+    '    emitter.once("download", done); signal.addEventListener("abort", aborted);\n' +
+    '  });\n}\n```');
+  assert.equal(r.pass, true);
+});
+
+test('bounds: an unbalanced brace in an error message does not truncate', () => {
+  const r = check('bounds',
+    '```javascript\nconst response = await fetch(url, { signal: AbortSignal.timeout(10000) });\n' +
+    'const reader = response.body.getReader();\nlet received = 0;\nwhile (true) {\n' +
+    '  const { done, value } = await reader.read(); if (done) break;\nreceived += value.byteLength;\n' +
+    '  if (received > MAX_BYTES) throw new Error("too large {");\nawait file.write(value);\n}\n```');
+  assert.equal(r.pass, true);
+});
+
+test('revalidate: an unbalanced brace in an error message does not truncate', () => {
+  const r = check('revalidate',
+    '```javascript\nconst saved = JSON.parse(text);\nconst url = new URL(saved.webhook);\n' +
+    'if (url.protocol !== "https:" || !allowedHosts.has(url.hostname)) throw new Error("bad {");\n' +
+    'await fetch(url, { method: "POST", body, redirect: "error" });\n```');
+  assert.equal(r.pass, true);
+});
+
 // --- unknown probe is skipped, not failed ---
 
 test('unknown probe is skipped', () => {

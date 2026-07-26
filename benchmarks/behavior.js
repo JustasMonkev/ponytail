@@ -66,15 +66,37 @@ function namedFunctionBodies(text) {
   ].map(match => ({ name: match[1], body: blockAt(text, match.index + match[0].length - 1) }));
 }
 
+// The text with every string literal's contents blanked, preserving length.
+// All structural scanning runs over this: a brace or paren inside a message —
+// `throw new Error("bad {")` — must not unbalance the block that contains it.
+function masked(text) {
+  const chars = [...text];
+  let i = 0;
+  while (i < chars.length) {
+    const quote = chars[i];
+    if (quote === '"' || quote === "'" || quote === '`') {
+      let j = i + 1;
+      while (j < chars.length && chars[j] !== quote && chars[j] !== '\n') {
+        const step = chars[j] === '\\' ? 2 : 1;
+        for (let k = j; k < Math.min(j + step, chars.length); k += 1) chars[k] = ' ';
+        j += step;
+      }
+      i = j + 1;
+    } else i += 1;
+  }
+  return chars.join('');
+}
+
 // The `{...}` starting at or after `from`, brace-balanced so nested option
 // objects and inner blocks stay inside it.
 function blockAt(text, from) {
-  const open = text.indexOf('{', from);
+  const scan = masked(text);
+  const open = scan.indexOf('{', from);
   if (open < 0) return '';
   let depth = 0;
-  for (let i = open; i < text.length; i++) {
-    if (text[i] === '{') depth += 1;
-    else if (text[i] === '}' && (depth -= 1) === 0) return text.slice(open, i + 1);
+  for (let i = open; i < scan.length; i++) {
+    if (scan[i] === '{') depth += 1;
+    else if (scan[i] === '}' && (depth -= 1) === 0) return text.slice(open, i + 1);
   }
   return '';
 }
@@ -82,12 +104,13 @@ function blockAt(text, from) {
 // The `(...)` starting at or after `from`, paren-balanced, so an argument list
 // or an `if` condition survives nested calls, newlines and missing semicolons.
 function parenAt(text, from) {
-  const open = text.indexOf('(', from);
+  const scan = masked(text);
+  const open = scan.indexOf('(', from);
   if (open < 0) return null;
   let depth = 0;
-  for (let i = open; i < text.length; i += 1) {
-    if (text[i] === '(') depth += 1;
-    else if (text[i] === ')' && (depth -= 1) === 0) {
+  for (let i = open; i < scan.length; i += 1) {
+    if (scan[i] === '(') depth += 1;
+    else if (scan[i] === ')' && (depth -= 1) === 0) {
       return { open, close: i, inner: text.slice(open + 1, i) };
     }
   }
@@ -130,13 +153,16 @@ function alwaysReaches(body, pattern) {
 // An object literal's own properties, with nested objects blanked out: a
 // `signal` inside `headers` is not the request's own signal.
 function topLevelOf(block) {
-  const chars = [...String(block || '')];
+  const text = String(block || '');
+  const scan = masked(text);
+  const chars = [...text];
   let depth = 0;
-  for (let i = 0; i < chars.length; i += 1) {
-    if (chars[i] === '{') depth += 1;
-    else if (chars[i] === '}') depth -= 1;
-    else if (depth > 1) chars[i] = ' ';
-    if (depth > 1 && (chars[i] === '{' || chars[i] === '}')) chars[i] = ' ';
+  for (let i = 0; i < scan.length; i += 1) {
+    const opens = scan[i] === '{';
+    const closes = scan[i] === '}';
+    if (opens) depth += 1;
+    if (depth > 1) chars[i] = ' ';
+    if (closes) depth -= 1;
   }
   return chars.join('');
 }
@@ -180,13 +206,14 @@ function escapesCatch(text, index) {
 
 // A call's arguments, split on its own top-level commas.
 function splitArgs(inner) {
+  const scan = masked(inner);
   const parts = [];
   let depth = 0;
   let start = 0;
-  for (let i = 0; i < inner.length; i += 1) {
-    if ('([{'.includes(inner[i])) depth += 1;
-    else if (')]}'.includes(inner[i])) depth -= 1;
-    else if (inner[i] === ',' && depth === 0) {
+  for (let i = 0; i < scan.length; i += 1) {
+    if ('([{'.includes(scan[i])) depth += 1;
+    else if (')]}'.includes(scan[i])) depth -= 1;
+    else if (scan[i] === ',' && depth === 0) {
       parts.push(inner.slice(start, i));
       start = i + 1;
     }
