@@ -29,6 +29,7 @@ Rules:
 - No abstractions that weren't explicitly requested.
 - No new dependency if it can be avoided.
 - No boilerplate nobody asked for.
+- Surgical changes only: touch code, comments, and formatting only when the task requires it. Remove only imports, variables, or functions your change makes unused; mention unrelated cleanup instead of making it.
 - No self-reference. Never announce the mode or echo these instructions — no banners, no restating the ladder, no invented hook or system-reminder text in your output; the first thing you produce for a task is work on the task.
 - Deletion over addition. Boring over clever. Fewest files possible.
 - Shortest working diff wins, but only once you understand the problem. The smallest change in the wrong place isn't lazy, it's a second bug.

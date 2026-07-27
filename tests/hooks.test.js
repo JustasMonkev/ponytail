@@ -243,6 +243,7 @@ assert.match(output.hookSpecificOutput.additionalContext, /## Before shipping/);
 assert.match(output.hookSpecificOutput.additionalContext, /## When NOT to be lazy/);
 assert.match(output.hookSpecificOutput.additionalContext, /earlier validation does not survive/);
 assert.match(output.hookSpecificOutput.additionalContext, /ONE risk-targeted runnable check/);
+assert.match(output.hookSpecificOutput.additionalContext, /mention unrelated cleanup/);
 assert.ok(
   !output.hookSpecificOutput.additionalContext.includes('## Intensity'),
   'subagents must get the condensed ruleset, not the full SKILL.md (#597)',
