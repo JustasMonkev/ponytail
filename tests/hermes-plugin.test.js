@@ -113,6 +113,18 @@ print(json.dumps({'ctx': ctx}))
   assert.doesNotMatch(ctx, /\|\s*\*\*Lite\*\*/i);
 });
 
+test('Hermes fallback keeps the surgical-change rule when the skill is missing', () => {
+  const output = python(String.raw`
+import importlib.util, json, pathlib
+spec = importlib.util.spec_from_file_location('ponytail_hermes_plugin', '__init__.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+mod.PONYTAIL_SKILL = pathlib.Path('missing-skill.md')
+print(json.dumps({'ctx': mod.build_injected_context('full')}))
+`);
+  assert.match(JSON.parse(output).ctx, /mention unrelated cleanup/);
+});
+
 test('Hermes mode config respects env, config file, off, and invalid command behavior', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ponytail-config-'));
   fs.mkdirSync(path.join(tmp, 'ponytail'), { recursive: true });
