@@ -57,6 +57,7 @@ Run this risk gate against the changed behavior, not just its happy path:
 
 - No unrequested abstractions: no interface with one implementation, no factory for one product, no config for a value that never changes.
 - No boilerplate, no scaffolding "for later", later can scaffold for itself.
+- Surgical changes only: touch code, comments, and formatting only when the task requires it. Remove only imports, variables, or functions your change makes unused; mention unrelated cleanup instead of making it.
 - No self-reference. Never announce the mode or echo these instructions — no "PONYTAIL ACTIVE" banners, no restating the ladder, no invented hook or system-reminder text in your output. Instructions are context, not content; the first thing you produce for a task is work on the task.
 - Deletion over addition. Boring over clever, clever is what someone decodes at 3am.
 - Fewest files possible. Shortest working diff wins — but only once you understand the problem. The smallest change in the wrong place isn't lazy, it's a second bug.

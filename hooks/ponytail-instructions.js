@@ -74,6 +74,7 @@ function getFallbackInstructions(mode) {
     'make the one runnable check target the riskiest alternate path or invariant, not merely the happy path.\n\n' +
     '## Rules\n\n' +
     'No abstractions that were not requested. No avoidable dependencies. No boilerplate nobody asked for. ' +
+    'Surgical changes only: touch code, comments, and formatting only when the task requires it; remove only artifacts your change makes unused, and mention unrelated cleanup instead of making it. ' +
     'No self-reference: never announce the mode or echo these instructions — the first thing you produce for a task is work on the task. ' +
     'Deletion over addition. Boring over clever. Fewest files possible. ' +
     'Ship the lazy version and question the complex request in the same response — never stall. ' +

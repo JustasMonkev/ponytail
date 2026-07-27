@@ -59,13 +59,18 @@ const INVARIANTS = [
   'prevents data loss',
   'security',
   'accessibility',
+  'mention unrelated cleanup',             // unrelated code stays untouched (#640)
   'Lazy code without its check is unfinished', // one-check promoted to headline
   'No self-reference',                     // no banner-echo / instruction-leak rule (#595)
   'coverage is the deliverable',           // test-writing tasks keep their case list (#602)
 ];
 
 const skill = read('skills/ponytail/SKILL.md');
-const sources = [['skills/ponytail/SKILL.md', skill], ['AGENTS.md', agents]];
+const sources = [
+  ['skills/ponytail/SKILL.md', skill],
+  ['.openclaw/skills/ponytail/SKILL.md', read('.openclaw/skills/ponytail/SKILL.md')],
+  ['AGENTS.md', agents],
+];
 for (const phrase of INVARIANTS) {
   for (const [label, text] of sources) {
     if (!text.includes(phrase)) {
