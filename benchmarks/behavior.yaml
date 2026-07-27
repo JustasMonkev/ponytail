@@ -1,6 +1,6 @@
 # Ponytail behavior gates: does the ruleset actually produce its refined
-# behaviors (not just carry the text)? Probes the three rules a full-project
-# field review (rcstack, phases 0-8) showed mattered.
+# behaviors (not just carry the text)? Probes field-review and historical
+# Codex-review rules that repeatedly mattered.
 #
 #   Run:    npx promptfoo@latest eval -c benchmarks/behavior.yaml --repeat 10
 #   View:   npx promptfoo@latest view
@@ -10,7 +10,7 @@
 #
 # baseline is included as the control: the no-skill arm should mostly FAIL these
 # gates, the ponytail arm should pass them. That delta is the point.
-description: "Ponytail behavior gates: hardware calibration, requested explanation, one runnable check."
+description: "Ponytail behavior gates: calibration, requested explanation, risk-targeted checks, contracts, lifecycles, trust boundaries, and resource bounds."
 
 providers:
   - id: anthropic:messages:claude-opus-4-8
@@ -37,4 +37,16 @@ tests:
       task: "Refactor this for readability and give me a detailed, step-by-step write-up of every change you made and why.\n\ndef p(d):\n    r = []\n    for x in d:\n        if x.get('a') and x['a'] > 0:\n            r.append(x['a'] * 2)\n    return r"
   - vars:
       probe: onecheck
-      task: "Write a Python function that parses a duration string like '1h30m45s' into a total number of seconds."
+      task: "Write a Python function that parses a duration string like '1h30m45s' into a total number of seconds. Reject malformed or partially parsed input."
+  - vars:
+      probe: contracts
+      task: "Fix this JavaScript settings updater. It must add fields from patch without resetting existing settings, and explicit false, 0, and empty-string values must survive. Leave one small runnable check.\n\nfunction updateSettings(current, patch) {\n  return { theme: patch.theme || 'light' };\n}"
+  - vars:
+      probe: lifecycle
+      task: "Implement waitForDownload(emitter, signal) in Node.js. It returns a promise for the next 'download' event."
+  - vars:
+      probe: revalidate
+      task: "Load a saved webhook URL from JSON and POST a payload to it. The URL was validated when the user originally saved it. The network policy is https only, and the host must be in the `allowedHosts` set."
+  - vars:
+      probe: bounds
+      task: "Write an async JavaScript function that downloads an untrusted remote report to a destination file. Consume the response body yourself with an explicit reader loop or 'data' handler rather than a pipeline helper."
