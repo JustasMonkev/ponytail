@@ -41,7 +41,11 @@ to touch: callbacks, retries, reload/restore, attach, redirects, persisted
 state, and concurrent calls. The lazy fix IS the root-cause fix: one guard in
 the shared function is a smaller diff than a guard in every caller — and
 patching only the path the ticket names leaves every sibling caller still
-broken. Fix it once, where all paths route through.
+broken. Fix it once, where all paths route through. Inputs have siblings too:
+the report names one bad shape; run its neighbors (shorter, longer, empty,
+zero, one digit where two are expected) through the fixed line before
+shipping. Each must produce the correct value or an explicit rejection — a
+silently wrong result is worse than the crash you were sent to fix.
 
 ## Before shipping
 
@@ -50,7 +54,7 @@ Run this risk gate against the changed behavior, not just its happy path:
 - **Preserve contracts.** Keep existing defaults, explicit false/zero/empty values, user state and intent, history, metadata, error semantics, generated files, lockfiles, and platform behavior unless the task changes them.
 - **Own lifecycles.** For timers, listeners, tasks, and awaits that can outlive their caller or wait on external state, define timeout/cancellation when applicable, cleanup after success, failure, and partial setup, and protection from stale completion or double claim.
 - **Revalidate transformed input.** Parsing, persistence, deserialization, redirects, replay, normalization, and privilege changes create new trust boundaries; earlier validation does not survive them.
-- **Bound external work.** Cap time, bytes, items, retries, memory, path lengths, and name collisions. Refetches must preserve required request semantics while reapplying security policy.
+- **Bound external work.** Cap time, bytes, items, retries, memory, path lengths, and name collisions. Cap or evict state keyed by client-controlled values (IPs, ids, names); cleanup that only runs when the same key returns never shrinks the map. Refetches must preserve required request semantics while reapplying security policy.
 - **Exercise the skipped path.** Make the one runnable check target the riskiest alternate path or invariant, not merely repeat the happy path.
 
 ## Rules
@@ -111,8 +115,9 @@ loop, a parser, a money/security path) leaves ONE risk-targeted runnable check
 behind, the smallest thing that fails if the riskiest alternate path or
 invariant breaks: boundary, cancellation, partial failure, replay/round-trip,
 or explicit false/zero/empty state. Use an `assert`-based
-`demo()`/`__main__` self-check or one small `test_*.py`. No frameworks, no
-fixtures, no per-function suites unless asked. Trivial one-liners need no test,
+`demo()`/`__main__` self-check or one small `test_*.py` with a single test
+function. One check means one — no frameworks, no fixtures, no per-function
+suites unless asked. Trivial one-liners need no test,
 YAGNI applies to tests too.
 
 When the task itself is writing tests, coverage is the deliverable, not a
