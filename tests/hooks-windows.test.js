@@ -8,8 +8,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 
 const root = path.join(__dirname, '..');
 const HOOKS_JSON = 'hooks/claude-codex-hooks.json';
@@ -71,6 +72,72 @@ test('shared hook commands are shell-agnostic (no bash-only exec prefix)', () =>
     assert.doesNotMatch(cmd, /(^|\s)exec\s/, `command must not use the bash-only 'exec' builtin (breaks under PowerShell): ${cmd}`);
     assert.match(cmd, /^node\s+/, `command must invoke node directly so it runs in both bash and PowerShell: ${cmd}`);
     assert.doesNotMatch(cmd, /;\s*exit 0$/, `command must not leave a shell wrapper waiting on node: ${cmd}`);
+  }
+});
+
+// [command, root-variable] pairs for every POSIX hook entry point.
+function posixHookCommands() {
+  const copilot = JSON.parse(fs.readFileSync(path.join(root, 'hooks/copilot-hooks.json'), 'utf8'));
+  return [
+    ...commandHooks().map((hook) => [hook.command, 'CLAUDE_PLUGIN_ROOT']),
+    ...Object.values(copilot.hooks).flat().map((hook) => [hook.bash, 'PLUGIN_ROOT']),
+  ];
+}
+
+// State-routing variables inherited from a real plugin shell (CLAUDE_CONFIG_DIR,
+// PLUGIN_DATA, ...) redirect the spawned hook's writes into the developer's live
+// plugin state — a passing test must not flip their mode or nudge flags.
+const STATE_ENV_VARS = [
+  'CLAUDE_CONFIG_DIR',
+  'PLUGIN_DATA',
+  'COPILOT_PLUGIN_DATA',
+  'QODER_SESSION_ID',
+  'XDG_CONFIG_HOME',
+  'APPDATA',
+];
+
+function runHookCommand(command, home, variable, pluginRoot) {
+  const env = { ...process.env, HOME: home, USERPROFILE: home, [variable]: pluginRoot };
+  for (const key of STATE_ENV_VARS) delete env[key];
+  return spawnSync(command, { shell: '/bin/sh', env, input: '', encoding: 'utf8' });
+}
+
+test('POSIX hook commands normalize backslashed plugin roots', { skip: process.platform === 'win32' }, () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ponytail-hook-root-'));
+  const backslashedRoot = root.replaceAll('/', '\\');
+
+  try {
+    for (const [command, variable] of posixHookCommands()) {
+      const result = runHookCommand(command, home, variable, backslashedRoot);
+      assert.equal(result.status, 0, result.stderr);
+    }
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// A backslash is a legal filename character on POSIX; a root that contains one
+// and exists must be used as-is, not rewritten to a different path.
+test('POSIX hook commands preserve roots with literal backslashes', { skip: process.platform === 'win32' }, () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ponytail-hook-bsroot-'));
+  const literalRoot = path.join(home, 'plugin\\cache');
+  fs.symlinkSync(root, literalRoot);
+
+  try {
+    for (const [command, variable] of posixHookCommands()) {
+      const result = runHookCommand(command, home, variable, literalRoot);
+      assert.equal(result.status, 0, result.stderr);
+    }
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// README only requires `node` on PATH; replaceAll needs Node 15+, so the inline
+// commands must stick to older-compatible syntax.
+test('POSIX hook commands avoid String.prototype.replaceAll (Node 14 compat)', () => {
+  for (const [command] of posixHookCommands()) {
+    assert.doesNotMatch(command, /replaceAll/, `replaceAll is undefined before Node 15: ${command}`);
   }
 });
 
