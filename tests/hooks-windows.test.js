@@ -8,8 +8,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 
 const root = path.join(__dirname, '..');
 const HOOKS_JSON = 'hooks/claude-codex-hooks.json';
@@ -71,6 +72,30 @@ test('shared hook commands are shell-agnostic (no bash-only exec prefix)', () =>
     assert.doesNotMatch(cmd, /(^|\s)exec\s/, `command must not use the bash-only 'exec' builtin (breaks under PowerShell): ${cmd}`);
     assert.match(cmd, /^node\s+/, `command must invoke node directly so it runs in both bash and PowerShell: ${cmd}`);
     assert.doesNotMatch(cmd, /;\s*exit 0$/, `command must not leave a shell wrapper waiting on node: ${cmd}`);
+  }
+});
+
+test('POSIX hook commands normalize backslashed plugin roots', { skip: process.platform === 'win32' }, () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ponytail-hook-root-'));
+  const backslashedRoot = root.replaceAll('/', '\\');
+  const copilot = JSON.parse(fs.readFileSync(path.join(root, 'hooks/copilot-hooks.json'), 'utf8'));
+  const commands = [
+    ...commandHooks().map((hook) => [hook.command, 'CLAUDE_PLUGIN_ROOT']),
+    ...Object.values(copilot.hooks).flat().map((hook) => [hook.bash, 'PLUGIN_ROOT']),
+  ];
+
+  try {
+    for (const [command, variable] of commands) {
+      const result = spawnSync(command, {
+        shell: '/bin/sh',
+        env: { ...process.env, HOME: home, USERPROFILE: home, [variable]: backslashedRoot },
+        input: '',
+        encoding: 'utf8',
+      });
+      assert.equal(result.status, 0, result.stderr);
+    }
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
   }
 });
 
