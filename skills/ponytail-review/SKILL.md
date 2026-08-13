@@ -13,6 +13,19 @@ description: >
 Review diffs for unnecessary complexity. One line per finding: location, what
 to cut, what replaces it. The diff's best outcome is getting shorter.
 
+## Target
+
+Default review target: the current diff, including both staged and
+unstaged tracked changes (`git diff HEAD`).
+
+Whole-branch review: when the request says "branch" (e.g. "review this
+branch", `/ponytail-review branch`), review the full diff from the branch's
+merge-base with its base. Base choice (in order): a user-named base branch;
+else the remote default branch from `origin/HEAD`; else `main`. A feature
+branch often tracks `origin/<same-branch>`, whose merge-base with HEAD is
+empty — so never use the branch's own tracked upstream as base. Diff as
+`git diff <base>...HEAD`: exactly what this branch added, nothing inherited.
+
 ## Format
 
 `L<line>: <tag> <what>. <replacement>.`, or `<file>:L<line>: ...` for
