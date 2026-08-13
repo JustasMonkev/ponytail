@@ -82,6 +82,10 @@ test('the commands and skills the adapter reuses are present', () => {
   }
 });
 
+test('the review command prompt forwards {{args}}', () => {
+  assert.match(read('commands/ponytail-review.toml'), /^prompt = .*\{\{args\}\}/m);
+});
+
 test('Gemini cannot auto-discover Claude/Codex hook events', () => {
   assert.equal(
     fs.existsSync(path.join(root, GEMINI_AUTO_HOOKS)),

@@ -177,7 +177,7 @@ export default function ponytailExtension(pi) {
 
   pi.registerCommand("ponytail-review", {
     description: "Run /skill:ponytail-review",
-    handler: (_args, ctx) => sendAlias("/skill:ponytail-review", "", ctx),
+    handler: (args, ctx) => sendAlias("/skill:ponytail-review", args, ctx),
   });
 
   pi.registerCommand("ponytail-audit", {

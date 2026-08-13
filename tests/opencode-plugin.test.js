@@ -84,6 +84,13 @@ test('unrelated commands do not touch the flag', async () => {
   assert.equal(fs.existsSync(statePath), false);
 });
 
+test('the registered /ponytail-review template forwards $ARGUMENTS', async () => {
+  const hooks = await loadPlugin({});
+  const config = {};
+  await hooks.config(config);
+  assert.match(config.command['ponytail-review'].template, /\$ARGUMENTS/);
+});
+
 test('parseCommandFile reads frontmatter description + body, LF and CRLF', () => {
   const lf = path.join(tmp, 'cmd-lf.md');
   fs.writeFileSync(lf, '---\ndescription: do a thing\n---\n\nthe template body\n');

@@ -139,6 +139,17 @@ test("skill alias commands delegate to Pi skill commands", async () => {
   ]);
 });
 
+test("/ponytail-review forwards its args to the skill command", async () => {
+  const { commands, sentUserMessages } = createPiHarness();
+  const ctx = createCommandContext();
+
+  await commands.get("ponytail-review").handler("branch origin/main", ctx);
+
+  assert.deepEqual(sentUserMessages.map((entry) => entry.text), [
+    "/skill:ponytail-review branch origin/main",
+  ]);
+});
+
 test("normal mode disables persistent instructions", async () => withTempConfig(async () => {
   const { commands, events } = createPiHarness();
   const ctx = createCommandContext();
