@@ -106,6 +106,20 @@ assert.equal(
   'malformed settings.json must be left unchanged',
 );
 
+// BOM preservation: a UTF-8 BOM on settings.json must survive the rewrite
+// when ponytail removes its own statusLine segment (regression for the
+// strip-on-read-but-not-write bug).
+const BOM = '﻿';
+fs.writeFileSync(settingsPath, BOM + JSON.stringify({
+  statusLine: { type: 'command', command: 'bash /p/ponytail-statusline.sh' },
+}));
+
+result = runUninstall(env);
+assert.equal(result.status, 0, result.stderr);
+const rewritten = fs.readFileSync(settingsPath, 'utf8');
+assert.equal(rewritten.startsWith(BOM), true, 'BOM must be preserved across rewrite');
+assert.equal(JSON.parse(rewritten.slice(BOM.length)).statusLine, undefined, 'ponytail entry still removed');
+
 // Running on an already-clean machine must not throw.
 result = runUninstall({ HOME: path.join(temp, 'home-empty'), USERPROFILE: path.join(temp, 'home-empty') });
 assert.equal(result.status, 0, result.stderr);

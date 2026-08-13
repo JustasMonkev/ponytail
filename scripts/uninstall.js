@@ -25,8 +25,9 @@ removeIfExists(getConfigPath(), 'config file');
 
 const settingsPath = path.join(getClaudeDir(), 'settings.json');
 try {
-  const raw = fs.readFileSync(settingsPath, 'utf8').replace(/^\uFEFF/, '');
-  const settings = JSON.parse(raw);
+  const raw = fs.readFileSync(settingsPath, 'utf8');
+  const bom = raw.startsWith('\uFEFF') ? '\uFEFF' : '';
+  const settings = JSON.parse(bom ? raw.slice(1) : raw);
   const cmd = settings.statusLine && settings.statusLine.command;
   // Only remove the parts ponytail owns. If the user combined statuslines
   // (e.g. caveman && ponytail), keep the other plugin's command intact.
@@ -40,11 +41,11 @@ try {
     const others = parts.filter((s) => !s.includes(STATUSLINE_SCRIPT));
     if (others.length === 0) {
       delete settings.statusLine;
-      fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), 'utf8');
+      fs.writeFileSync(settingsPath, bom + JSON.stringify(settings, null, 2), 'utf8');
       console.log(`Removed ponytail statusLine entry from ${settingsPath}`);
     } else {
       settings.statusLine.command = others.join(' && ');
-      fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), 'utf8');
+      fs.writeFileSync(settingsPath, bom + JSON.stringify(settings, null, 2), 'utf8');
       console.log(`Removed ponytail statusLine segment from ${settingsPath}`);
     }
   }
