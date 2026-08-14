@@ -1,0 +1,7 @@
+Add a third event kind, "trace", to Keep in seed.go.
+
+A trace survives the same filters a log does (debug level is dropped unless minLevel
+is debug, blocked sources are dropped, an empty Body is dropped) and additionally
+requires a non-empty Source.
+
+seed_test.go already covers the new behaviour. Do not edit seed_test.go.

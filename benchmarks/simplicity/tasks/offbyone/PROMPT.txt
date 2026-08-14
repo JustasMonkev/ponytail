@@ -1,0 +1,3 @@
+Window in seed.go returns one item too many. Fix it.
+
+seed_test.go covers the expected behaviour. Do not edit seed_test.go.

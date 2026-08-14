@@ -1,0 +1,7 @@
+Add two more setting kinds to Parse in seed.go: "float" (parsed as a float64) and
+"duration" (an integer number of seconds, stored as an int).
+
+Both report a wrapped error naming the setting when the raw value does not parse,
+exactly as "int" and "bool" already do. An unknown kind must still error.
+
+seed_test.go already covers the new behaviour. Do not edit seed_test.go.
