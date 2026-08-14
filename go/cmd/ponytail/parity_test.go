@@ -123,6 +123,82 @@ func TestInstructionsMatchNode(t *testing.T) {
 	}
 }
 
+// awkwardSkill is the SKILL.md the checkout does not contain: the frontmatter
+// is CRLF and trailed by a non-breaking space, a bare `---` rule follows, and the
+// mode-shaped lines sit on both sides of every filter boundary — a table row
+// without bold, a bullet whose colon comes after its quote, a bullet with no
+// quote at all, and a 200-character prose bullet. The filter's fast paths decide
+// which lines the mode regexes ever see, so the lines they must skip are the
+// ones worth diffing against Node.
+//
+// Three of these earn their place by mutation testing rather than by taste: a
+// bullet with no space after its colon, a final line ending in a lone CR, and an
+// unterminated `---`. Narrowing a prefilter to require `: "`, or dropping the
+// trailing-CR trim, leaves every other test in the suite green.
+const awkwardSkill = "---\r\nname: awkward\r\n--- \r\n" + `# Awkward
+
+---
+
+| Level | What |
+| lite | no bold, never a label |
+|  **ULTRA**  | bold and padded |
+| **full** | plain |
+
+-  lite : "padded label"
+- ultra: no quote, so this is prose
+- full: "kept for full only"
+- say "hi": not a worked example
+- lite:"no space after the colon"
+- Preserve contracts. Keep existing defaults, explicit false/zero/empty values, user state and intent, history, metadata, error semantics, generated files, lockfiles and platform behavior intact
+
+------
+
+--- not a fence, just a rule with trailing text
+| **lite** | second lite row |
+` + "a body line ending in CRLF\r\nand a final line ending in a lone carriage return\r"
+
+// TestFilterSkillBodyMatchesNodeOnAwkwardBody runs the Node filter over a body
+// the real SKILL.md never exercises. Node reads the skill from the root it is
+// given, so a temp root with the real hooks linked in gets both implementations
+// onto the same bytes.
+func TestFilterSkillBodyMatchesNodeOnAwkwardBody(t *testing.T) {
+	root := repoRoot(t)
+	node := nodeBinary(t)
+
+	fakeRoot := t.TempDir()
+	if err := os.Symlink(filepath.Join(root, "hooks"), filepath.Join(fakeRoot, "hooks")); err != nil {
+		t.Fatal(err)
+	}
+	skillDir := filepath.Join(fakeRoot, "skills", "ponytail")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(awkwardSkill), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, mode := range []string{"lite", "full", "ultra"} {
+		t.Run("mode="+mode, func(t *testing.T) {
+			env, _ := parityEnv(t)
+			cmd := exec.Command(node, filepath.Join(root, "go", "testdata", "dump-instructions.js"), fakeRoot, mode)
+			cmd.Env = env
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			raw, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("node harness failed: %v\n%s", err, stderr.String())
+			}
+			var want nodePayload
+			if err := json.Unmarshal(raw, &want); err != nil {
+				t.Fatalf("harness output: %v", err)
+			}
+			if got := instructions.FilterSkillBodyForMode(awkwardSkill, mode); got != want.Filtered {
+				t.Errorf("FilterSkillBodyForMode(%q) diverges from Node:\n%s", mode, firstDiff(got, want.Filtered))
+			}
+		})
+	}
+}
+
 // goBinary builds the port once per run so hook parity is tested through the
 // real executable, stdin and stdout included.
 func goBinary(t *testing.T) string {

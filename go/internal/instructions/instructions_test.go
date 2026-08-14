@@ -100,6 +100,15 @@ func TestFilterSkillBodyNormalizesCRLF(t *testing.T) {
 	}
 }
 
+// The frontmatter strip and the two per-line label checks each start with a
+// cheap character test; a body that trips none of them must survive untouched.
+func TestFilterSkillBodyWithoutFrontmatterIsUntouched(t *testing.T) {
+	body := "# Heading\n\n- a bullet: a colon but no quoted value\n| **unclosed row\n"
+	if got := FilterSkillBodyForMode(body, "lite"); got != body {
+		t.Errorf("body was altered:\ngot  %q\nwant %q", got, body)
+	}
+}
+
 func TestGetPonytailInstructionsUsesSkillFile(t *testing.T) {
 	withSkill(t, sampleSkill)
 	got := GetPonytailInstructions("ultra")

@@ -95,7 +95,7 @@ func Serve(ctx context.Context, stdin io.Reader, stdout io.Writer, version strin
 			return nil
 		}
 		line, err := reader.ReadBytes('\n')
-		if len(strings.TrimSpace(string(line))) > 0 {
+		if len(bytes.TrimSpace(line)) > 0 {
 			if payload := handleLine(line, version); payload != nil {
 				if writeErr := encoder.Encode(payload); writeErr != nil {
 					return writeErr

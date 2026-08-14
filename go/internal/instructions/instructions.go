@@ -32,15 +32,84 @@ const skillRelPath = "skills/ponytail/SKILL.md"
 // and `.` here let another mode's intensity row survive into the payload when
 // SKILL.md contains a non-breaking space — a routine copy-paste artifact.
 var (
-	js       = strings.NewReplacer(`\s`, "["+config.JSSpaceClass+"]", `\S`, "[^"+config.JSSpaceClass+"]")
-	jsDot    = `[^\n\r\x{2028}\x{2029}]`
-	jsAnyDot = `(?s).`
+	js    = strings.NewReplacer(`\s`, "["+config.JSSpaceClass+"]", `\S`, "[^"+config.JSSpaceClass+"]")
+	jsDot = `[^\n\r\x{2028}\x{2029}]`
 
-	frontmatterRe = regexp.MustCompile(js.Replace(`^---` + jsAnyDot + `*?---\s*`))
-	tableLabelRe  = regexp.MustCompile(js.Replace(`^\|\s*\*\*(` + jsDot + `+?)\*\*\s*\|`))
-	exampleRe     = regexp.MustCompile(js.Replace(`^-\s*([^:]+):\s*"`))
-	lineSplitRe   = regexp.MustCompile(`\r?\n`)
+	tableLabelRe = regexp.MustCompile(js.Replace(`^\|\s*\*\*(` + jsDot + `+?)\*\*\s*\|`))
+	exampleRe    = regexp.MustCompile(js.Replace(`^-\s*([^:]+):\s*"`))
 )
+
+// stripFrontmatter removes a leading `---` … `---` block and the whitespace
+// after it: the JS /^---[\s\S]*?---\s*/ without the engine.
+//
+// The pattern is anchored, its `[\s\S]*?` is lazy and its trailing `\s*` always
+// matches, so the whole pattern reduces to "if the body opens with ---, cut
+// through the next --- and the JS whitespace behind it". IsJSSpace is the same
+// character set the ported `\s` expands to, so the trim is the same trim.
+func stripFrontmatter(body string) string {
+	const fence = "---"
+	if !strings.HasPrefix(body, fence) {
+		return body
+	}
+	closing := strings.Index(body[len(fence):], fence)
+	if closing < 0 {
+		return body
+	}
+	return strings.TrimLeftFunc(body[2*len(fence)+closing:], config.IsJSSpace)
+}
+
+// splitLines splits on the JS /\r?\n/ without paying the regexp engine, which
+// profiled as more than half the cost of every tools/call. `\r?\n` always
+// consumes the \n and at most the single \r directly before it, so splitting on
+// \n and dropping one trailing \r is the same split, character for character.
+func splitLines(s string) []string {
+	lines := make([]string, 0, strings.Count(s, "\n")+1)
+	for {
+		i := strings.IndexByte(s, '\n')
+		if i < 0 {
+			return append(lines, s)
+		}
+		line := s[:i]
+		if len(line) > 0 && line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+		}
+		lines = append(lines, line)
+		s = s[i+1:]
+	}
+}
+
+// modeLabel returns the mode a line is keyed to, or "" when the line is not a
+// mode-specific intensity row or worked example and so belongs in every mode.
+//
+// Both patterns are anchored at ^ and neither is multiline, so a line can only
+// match if its first byte is the literal the pattern opens with. The byte test
+// is a prefilter, not an extra rule: it decides exactly what the regex would
+// have decided, and skips the engine for the ~90% of lines that are prose.
+func modeLabel(line string) string {
+	if line == "" {
+		return ""
+	}
+	if line[0] == '|' {
+		if label := tableLabelRe.FindStringSubmatch(line); label != nil {
+			return config.NormalizeMode(strings.TrimSpace(label[1]))
+		}
+	}
+	// A worked example needs a quoted value: every one of them is
+	// `- lite: "..."`. Without that requirement an ordinary rule bullet that
+	// happens to start with a mode word (e.g. "- Full: ...") is silently dropped
+	// in every other mode — it looks like a worked example but is really prose
+	// meant to survive verbatim. The colon and the quote are literals of the
+	// pattern, so scanning for them first keeps the engine off the long prose
+	// bullets, which is where it spent nearly all of its time.
+	if line[0] == '-' {
+		if colon := strings.IndexByte(line, ':'); colon >= 0 && strings.IndexByte(line[colon+1:], '"') >= 0 {
+			if label := exampleRe.FindStringSubmatch(line); label != nil {
+				return config.NormalizeMode(strings.TrimSpace(label[1]))
+			}
+		}
+	}
+	return ""
+}
 
 // Root locates the ponytail checkout so the runtime ruleset (SKILL.md) and the
 // package version can be read.
@@ -120,35 +189,18 @@ func FilterSkillBodyForMode(body, mode string) string {
 	if effectiveMode == "" {
 		effectiveMode = config.DefaultMode
 	}
-	withoutFrontmatter := frontmatterRe.ReplaceAllString(body, "")
+	withoutFrontmatter := stripFrontmatter(body)
 
-	lines := lineSplitRe.Split(withoutFrontmatter, -1)
-	kept := lines[:0:0]
+	lines := splitLines(withoutFrontmatter)
+	// Filtering in place: the write index never passes the read index, and
+	// splitLines returns a fresh slice nothing else holds. Both halves matter —
+	// if splitLines ever returns a pooled or cached slice this silently corrupts
+	// its caller.
+	kept := lines[:0]
 	for _, line := range lines {
-		if label := tableLabelRe.FindStringSubmatch(line); label != nil {
-			if labelMode := config.NormalizeMode(strings.TrimSpace(label[1])); labelMode != "" {
-				if labelMode != effectiveMode {
-					continue
-				}
-				kept = append(kept, line)
-				continue
-			}
+		if label := modeLabel(line); label != "" && label != effectiveMode {
+			continue
 		}
-
-		// Require a quoted value: every worked example is `- lite: "..."`. Without
-		// this, an ordinary rule bullet that happens to start with a mode word
-		// (e.g. "- Full: ...") is silently dropped in every other mode — it looks
-		// like a worked example but is really prose meant to survive verbatim.
-		if label := exampleRe.FindStringSubmatch(line); label != nil {
-			if labelMode := config.NormalizeMode(strings.TrimSpace(label[1])); labelMode != "" {
-				if labelMode != effectiveMode {
-					continue
-				}
-				kept = append(kept, line)
-				continue
-			}
-		}
-
 		kept = append(kept, line)
 	}
 	return strings.Join(kept, "\n")
