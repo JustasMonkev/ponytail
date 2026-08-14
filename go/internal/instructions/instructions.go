@@ -91,7 +91,7 @@ func modeLabel(line string) string {
 	}
 	if line[0] == '|' {
 		if label := tableLabelRe.FindStringSubmatch(line); label != nil {
-			return config.NormalizeMode(strings.TrimSpace(label[1]))
+			return config.NormalizeMode(config.TrimJS(label[1]))
 		}
 	}
 	// A worked example needs a quoted value: every one of them is
@@ -104,7 +104,7 @@ func modeLabel(line string) string {
 	if line[0] == '-' {
 		if colon := strings.IndexByte(line, ':'); colon >= 0 && strings.IndexByte(line[colon+1:], '"') >= 0 {
 			if label := exampleRe.FindStringSubmatch(line); label != nil {
-				return config.NormalizeMode(strings.TrimSpace(label[1]))
+				return config.NormalizeMode(config.TrimJS(label[1]))
 			}
 		}
 	}

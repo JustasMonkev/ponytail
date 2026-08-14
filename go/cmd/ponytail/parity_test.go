@@ -135,6 +135,11 @@ func TestInstructionsMatchNode(t *testing.T) {
 // bullet with no space after its colon, a final line ending in a lone CR, and an
 // unterminated `---`. Narrowing a prefilter to require `: "`, or dropping the
 // trailing-CR trim, leaves every other test in the suite green.
+//
+// The two U+0085 labels pin a divergence this file caught for real: Go's
+// unicode.IsSpace counts NEL and JavaScript's trim() does not, so trimming a
+// label with strings.TrimSpace turns "lite<NEL>" into the mode lite here and
+// leaves it a non-mode there — dropping a row Node keeps.
 const awkwardSkill = "---\r\nname: awkward\r\n--- \r\n" + `# Awkward
 
 ---
@@ -155,7 +160,9 @@ const awkwardSkill = "---\r\nname: awkward\r\n--- \r\n" + `# Awkward
 
 --- not a fence, just a rule with trailing text
 | **lite** | second lite row |
-` + "a body line ending in CRLF\r\nand a final line ending in a lone carriage return\r"
+` + "| **lite\u0085** | NEL keeps this row out of every mode in JS |\n" +
+	"- lite\u0085: \"NEL is whitespace to Go and not to JavaScript\"\n" +
+	"a body line ending in CRLF\r\nand a final line ending in a lone carriage return\r"
 
 // TestFilterSkillBodyMatchesNodeOnAwkwardBody runs the Node filter over a body
 // the real SKILL.md never exercises. Node reads the skill from the root it is
