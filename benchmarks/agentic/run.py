@@ -38,6 +38,12 @@ ARMS = {
     "caveman":        lambda: _skill("benchmarks/arms/caveman-SKILL.md"),
     "yagni":          lambda: "Follow YAGNI principles.",
     "yagni-oneliner": lambda: "Follow YAGNI principles, and prefer one-liner solutions.",
+    # v1/v2 are the simplicity-eval A/B pair. v1 is the SAME text as the "ponytail" arm
+    # but delivered as an appended prompt rather than a plugin, so the comparison against
+    # v2 varies the wording only -- pairing plugin-delivered v1 against prompt-delivered
+    # v2 would confound the rewrite with the delivery mechanism.
+    "ponytail-v1":    lambda: _skill("skills/ponytail/SKILL.md"),
+    "ponytail-v2":    lambda: _skill("benchmarks/arms/ponytail-v2-SKILL.md"),
 }
 MODELS = {"haiku": "claude-haiku-4-5-20251001", "sonnet": "claude-sonnet-4-6", "opus": "claude-opus-4-8"}
 
