@@ -14,7 +14,7 @@ func TestKeep(t *testing.T) {
 		{"log needs body", Event{"log", "info", "api", ""}, false},
 		{"debug dropped", Event{"log", "debug", "api", "hi"}, false},
 		{"blocked source", Event{"metric", "info", "noisy", ""}, false},
-		{"unknown kind", Event{"trace", "info", "api", "hi"}, false},
+		{"unknown kind", Event{"span", "info", "api", "hi"}, false},
 		// New requirement: traces behave like logs but additionally require a source.
 		{"trace passes", Event{"trace", "info", "api", "hi"}, true},
 		{"trace needs body", Event{"trace", "info", "api", ""}, false},
