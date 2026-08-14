@@ -1,6 +1,7 @@
 package jsonorder
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -111,14 +112,65 @@ func TestObjectGetSetDelete(t *testing.T) {
 	}
 }
 
-func TestDuplicateKeysKeepBothEntries(t *testing.T) {
-	// ponytail: duplicate keys are pathological JSON; the contract here is only
-	// that parsing does not lose data or panic.
-	parsed, err := Unmarshal([]byte(`{"a":1,"a":2}`))
+// A repeated key must collapse the way JSON.parse collapses it: last value
+// wins, first position kept. Keeping both would make Get return a value the
+// host never honours — which is how uninstall came to skip a ponytail
+// statusLine that was live, and delete one that was not.
+func TestDuplicateKeysCollapseLastWins(t *testing.T) {
+	parsed, err := Unmarshal([]byte(`{"a":1,"b":2,"a":3}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := len(parsed.(*Object).Members); got != 2 {
-		t.Errorf("expected both members retained, got %d", got)
+	obj := parsed.(*Object)
+	if got := len(obj.Members); got != 2 {
+		t.Fatalf("expected 2 members, got %d", got)
+	}
+	value, _ := obj.Get("a")
+	if got, _ := AsString(value); got != "" {
+		t.Errorf("unexpected string decode: %q", got)
+	}
+	if string(value.(json.RawMessage)) != "3" {
+		t.Errorf("Get(a) = %s, want the last value 3", value)
+	}
+	out, err := Marshal(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != "{\n  \"a\": 3,\n  \"b\": 2\n}" {
+		t.Errorf("re-emit must not carry duplicates forward:\n%s", out)
+	}
+}
+
+// Scalars are re-emitted byte-for-byte, so untouched values survive exactly.
+func TestUntouchedScalarsSurviveVerbatim(t *testing.T) {
+	// A lone surrogate and U+2028 are both rewritten by an encoding/json
+	// round-trip: the first becomes U+FFFD, the second gets escaped.
+	input := "{\"a\":\"\\ud800\",\"b\":\"x\\u2028y\",\"c\":1.50,\"d\":1e3}"
+	parsed, err := Unmarshal([]byte(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj := parsed.(*Object)
+	obj.Set("e", "added")
+	out, err := Marshal(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, literal := range []string{`"\ud800"`, `"x\u2028y"`, "1.50", "1e3", `"added"`} {
+		if !strings.Contains(string(out), literal) {
+			t.Errorf("literal %s was rewritten:\n%s", literal, out)
+		}
+	}
+}
+
+// Hostile nesting must be rejected rather than recursed into.
+func TestUnmarshalRejectsExcessiveNesting(t *testing.T) {
+	deep := strings.Repeat("[", maxDepth+10) + strings.Repeat("]", maxDepth+10)
+	if _, err := Unmarshal([]byte(deep)); err == nil {
+		t.Error("nesting past the depth cap must fail rather than recurse")
+	}
+	shallow := strings.Repeat("[", 100) + strings.Repeat("]", 100)
+	if _, err := Unmarshal([]byte(shallow)); err != nil {
+		t.Errorf("ordinary nesting must still parse: %v", err)
 	}
 }

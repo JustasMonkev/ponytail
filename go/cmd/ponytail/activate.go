@@ -53,21 +53,40 @@ func runActivate(stdout io.Writer) {
 	host.WriteHookOutput(stdout, "SessionStart", output)
 }
 
+// isTruthyJSON reports JavaScript truthiness for a decoded JSON value: null,
+// false, 0 and "" are falsy, every object and non-empty value is truthy.
+func isTruthyJSON(value any) bool {
+	switch v := value.(type) {
+	case nil:
+		return false
+	case bool:
+		return v
+	case float64:
+		return v != 0
+	case string:
+		return v != ""
+	default:
+		return true
+	}
+}
+
 // statuslineNudge returns the setup hint, or "" when the statusline is already
 // configured or the user has already been nudged once.
 func statuslineNudge(claudeDir, settingsPath string) string {
-	hasStatusline := false
 	if raw, err := os.ReadFile(settingsPath); err == nil {
 		var settings map[string]any
 		// Strip the UTF-8 BOM some editors prepend on Windows (breaks the parse).
-		if err := json.Unmarshal(config.StripBOM(raw), &settings); err == nil {
-			if _, ok := settings["statusLine"]; ok {
-				hasStatusline = true
-			}
+		if err := json.Unmarshal(config.StripBOM(raw), &settings); err != nil {
+			// A settings.json that exists but won't parse aborts the whole check in
+			// the JS, nudge included. Nudging anyway would tell the agent to add a
+			// second statusLine to a file that may already have one.
+			return ""
 		}
-	}
-	if hasStatusline {
-		return ""
+		// JS tests `settings.statusLine` for truthiness, so null/false/""/0 count
+		// as unconfigured — a key-presence test would silently skip the nudge.
+		if isTruthyJSON(settings["statusLine"]) {
+			return ""
+		}
 	}
 
 	// Nudge at most once — the flag file marks that the user has already seen
@@ -77,12 +96,9 @@ func statuslineNudge(claudeDir, settingsPath string) string {
 	if _, err := os.Stat(nudgeFlagPath); err == nil {
 		return ""
 	}
-	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
-		return "" // can't record the nudge, so don't start nagging every session
-	}
-	if err := os.WriteFile(nudgeFlagPath, nil, 0o644); err != nil {
-		return ""
-	}
+	// Recording the nudge is best-effort, exactly as in the JS: if the directory
+	// can't be written the hint is still worth emitting, it just repeats.
+	_ = os.WriteFile(nudgeFlagPath, nil, 0o644)
 
 	exe, err := os.Executable()
 	if err != nil {

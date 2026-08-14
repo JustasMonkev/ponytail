@@ -64,11 +64,7 @@ func Detect() Host {
 		}
 	}
 	if h.IsQoder {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			home = ""
-		}
-		h.StateDir = filepath.Join(home, ".qoder")
+		h.StateDir = filepath.Join(config.HomeDir(), ".qoder")
 	}
 	return h
 }
@@ -112,8 +108,13 @@ type copilotOutput struct {
 	AdditionalContext string `json:"additionalContext,omitempty"`
 }
 
+// lineSeparatorEscapes are the two characters Go's encoder escapes even with
+// SetEscapeHTML(false), and JSON.stringify does not.
+var lineSeparatorEscapes = strings.NewReplacer(`\u2028`, "\u2028", `\u2029`, "\u2029")
+
 // encode mirrors JSON.stringify: no HTML escaping, so the ruleset keeps its
-// literal <input type="date"> rather than <input ...>.
+// literal <input type="date"> rather than <input ...>, and no \u2028/\u2029
+// escaping either, so a hook payload is byte-identical to the Node one.
 func encode(value any) []byte {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
@@ -121,7 +122,7 @@ func encode(value any) []byte {
 	if err := enc.Encode(value); err != nil {
 		return []byte("{}")
 	}
-	return bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
+	return []byte(lineSeparatorEscapes.Replace(string(bytes.TrimSuffix(buf.Bytes(), []byte("\n")))))
 }
 
 // WriteHookOutput emits the hook payload in the shape the detected host reads.

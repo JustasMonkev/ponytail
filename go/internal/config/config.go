@@ -14,11 +14,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
 	"unicode"
+
+	"github.com/DietrichGebert/ponytail/go/internal/jsonorder"
 )
 
 const DefaultMode = "full"
@@ -39,9 +42,39 @@ func contains(list []string, v string) bool {
 	return false
 }
 
+// IsJSSpace reports whether r is whitespace to JavaScript's String.prototype.trim
+// and its regex \s: the Unicode space set plus U+FEFF, minus U+0085 (NEL), which
+// Go's unicode.IsSpace counts and JS does not. Mode strings reach us from config
+// files, env vars and MCP arguments, so a BOM-prefixed value must normalize the
+// same way in both implementations or two hosts serve different rulesets.
+func IsJSSpace(r rune) bool {
+	return (unicode.IsSpace(r) && r != '\u0085') || r == '\ufeff'
+}
+
+// JSSpaceClass is IsJSSpace as a RE2 character-class body, for regexes ported
+// from JavaScript. Go's own \s is only [\t\n\f\r ].
+const JSSpaceClass = `\t\n\v\f\r\x{feff}\x{2028}\x{2029}\p{Zs}`
+
+// TrimJS trims exactly what JavaScript's String.prototype.trim() trims.
+func TrimJS(s string) string {
+	return strings.TrimFunc(s, IsJSSpace)
+}
+
+// LowerJS lowercases the way JavaScript's toLowerCase() does.
+//
+// ponytail: Go's strings.ToLower is the simple case mapping, so U+0130 (İ) folds
+// to "i" where JS's full mapping gives "i̇" — enough to make "LİTE" a valid mode
+// in one implementation and not the other. Only that character can produce a
+// spurious ASCII mode name, so it is the only special case handled; other
+// full-mapping differences (final sigma, ligatures) cannot spell off/lite/full/
+// ultra/review. Reach for golang.org/x/text/cases if that ever stops being true.
+func LowerJS(s string) string {
+	return strings.ToLower(strings.ReplaceAll(s, "\u0130", "i\u0307"))
+}
+
 // NormalizeMode returns the runtime level, or "" when mode is not one.
 func NormalizeMode(mode string) string {
-	normalized := strings.ToLower(strings.TrimSpace(mode))
+	normalized := LowerJS(TrimJS(mode))
 	if contains(RuntimeModes, normalized) {
 		return normalized
 	}
@@ -50,7 +83,7 @@ func NormalizeMode(mode string) string {
 
 // NormalizeConfigMode also accepts review.
 func NormalizeConfigMode(mode string) string {
-	normalized := strings.ToLower(strings.TrimSpace(mode))
+	normalized := LowerJS(TrimJS(mode))
 	if contains(ValidModes, normalized) {
 		return normalized
 	}
@@ -69,9 +102,9 @@ func NormalizePersistedMode(mode string) string {
 // mid-task for ordinary requests like "add a normal mode toggle", so require the
 // whole message to be the command, ignoring case and trailing punctuation.
 func IsDeactivationCommand(text string) bool {
-	t := strings.ToLower(strings.TrimSpace(text))
+	t := LowerJS(TrimJS(text))
 	t = strings.TrimRightFunc(t, func(r rune) bool {
-		return r == '.' || r == '!' || r == '?' || unicode.IsSpace(r)
+		return r == '.' || r == '!' || r == '?' || IsJSSpace(r)
 	})
 	return t == "stop ponytail" || t == "normal mode"
 }
@@ -89,12 +122,20 @@ func IsShellSafe(p string) bool {
 	return shellSafeRe.MatchString(p)
 }
 
-func homeDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
+// HomeDir resolves the user's home directory.
+//
+// os.UserHomeDir only reads $HOME on Unix, and on failure returns "" — which
+// would make filepath.Join(HomeDir(), ".claude") a RELATIVE path and scatter
+// ponytail's state into whatever directory the hook happened to run from. Node's
+// os.homedir() falls back to the passwd entry, so do the same before giving up.
+func HomeDir() string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return home
 	}
-	return home
+	if current, err := user.Current(); err == nil && current.HomeDir != "" {
+		return current.HomeDir
+	}
+	return ""
 }
 
 func ConfigDir() string {
@@ -104,11 +145,11 @@ func ConfigDir() string {
 	if runtime.GOOS == "windows" {
 		appData := os.Getenv("APPDATA")
 		if appData == "" {
-			appData = filepath.Join(homeDir(), "AppData", "Roaming")
+			appData = filepath.Join(HomeDir(), "AppData", "Roaming")
 		}
 		return filepath.Join(appData, "ponytail")
 	}
-	return filepath.Join(homeDir(), ".config", "ponytail")
+	return filepath.Join(HomeDir(), ".config", "ponytail")
 }
 
 func ConfigPath() string {
@@ -120,7 +161,7 @@ func ClaudeDir() string {
 	if dir := os.Getenv("CLAUDE_CONFIG_DIR"); dir != "" {
 		return dir
 	}
-	return filepath.Join(homeDir(), ".claude")
+	return filepath.Join(HomeDir(), ".claude")
 }
 
 // ReadJSONFile parses a JSON object, stripping the UTF-8 BOM Windows editors
@@ -170,14 +211,14 @@ func GetDefaultMode() string {
 	// ponytail: a default must be a runtime level (off/lite/full/ultra); review is
 	// a session-only mode, never a valid default (#377).
 	if env := os.Getenv("PONYTAIL_DEFAULT_MODE"); env != "" {
-		if lowered := strings.ToLower(env); contains(RuntimeModes, lowered) {
+		if lowered := LowerJS(env); contains(RuntimeModes, lowered) {
 			return lowered
 		}
 	}
 
 	// 2. Config file.
 	if mode := configString(ReadJSONFile(ConfigPath()), "defaultMode"); mode != "" {
-		if lowered := strings.ToLower(mode); contains(RuntimeModes, lowered) {
+		if lowered := LowerJS(mode); contains(RuntimeModes, lowered) {
 			return lowered
 		}
 	}
@@ -193,7 +234,7 @@ func envFlag(name string) (bool, bool) {
 	if !ok {
 		return false, false
 	}
-	v := strings.ToLower(strings.TrimSpace(raw))
+	v := LowerJS(TrimJS(raw))
 	return v != "" && v != "0" && v != "false" && v != "no", true
 }
 
@@ -224,18 +265,24 @@ func GetHideStatus() bool {
 }
 
 // writeConfigField merges one key into the config file, preserving every other
-// key and creating the directory when missing.
+// key — and their order — and creating the directory when missing.
 func writeConfigField(key string, value any) error {
 	path := ConfigPath()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	cfg := ReadJSONFile(path)
-	if cfg == nil {
-		cfg = map[string]any{}
+
+	cfg := &jsonorder.Object{}
+	if raw, err := os.ReadFile(path); err == nil {
+		if parsed, err := jsonorder.Unmarshal(StripBOM(raw)); err == nil {
+			if existing, ok := parsed.(*jsonorder.Object); ok {
+				cfg = existing
+			}
+		}
 	}
-	cfg[key] = value
-	encoded, err := MarshalIndent(cfg)
+	cfg.Set(key, value)
+
+	encoded, err := jsonorder.Marshal(cfg)
 	if err != nil {
 		return err
 	}

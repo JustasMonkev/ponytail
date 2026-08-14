@@ -13,27 +13,33 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/DietrichGebert/ponytail/go/internal/config"
 	"github.com/DietrichGebert/ponytail/go/internal/jsonorder"
 )
 
-// statuslineMarker identifies a ponytail statusline command. The shell scripts
-// are gone in the Go port, but an installation made by an older Node release
-// still points at them, so match both.
-var statuslineMarkers = []string{"ponytail-statusline", "ponytail\" statusline", "ponytail statusline"}
+// statuslineScript is the marker the Node installation used: a path ending in
+// ponytail-statusline.sh / .ps1.
+const statuslineScript = "ponytail-statusline"
+
+// goStatuslineRe matches this port's own registration, `"<path>/ponytail" statusline`
+// (quoted or not). The `ponytail` token must start the command or follow a path
+// separator, and `statusline` must be the whole next word — a bare substring test
+// would claim a user's own `bash ~/my-ponytail statusline-widget.sh` and delete it.
+var goStatuslineRe = regexp.MustCompile(`(?:^|[/\\])ponytail"?[ \t]+statusline(?:[ \t]|$)`)
 
 func isPonytailStatusline(command string) bool {
-	for _, marker := range statuslineMarkers {
-		if strings.Contains(command, marker) {
-			return true
-		}
-	}
-	return false
+	return strings.Contains(command, statuslineScript) || goStatuslineRe.MatchString(command)
 }
 
 func removeIfExists(stdout io.Writer, path, label string) error {
+	// os.Remove deletes an empty directory too. Node's unlink refuses, and a
+	// directory where ponytail expects a file is the user's, not ours.
+	if info, err := os.Lstat(path); err == nil && info.IsDir() {
+		return fmt.Errorf("%s is a directory, not a %s: %s", path, label, path)
+	}
 	err := os.Remove(path)
 	if err == nil {
 		fmt.Fprintf(stdout, "Removed %s: %s\n", label, path)
@@ -93,7 +99,7 @@ func runUninstall(stdout, stderr io.Writer) error {
 	if !ok {
 		return nil
 	}
-	command, ok := commandValue.(string)
+	command, ok := jsonorder.AsString(commandValue)
 	if !ok || !isPonytailStatusline(command) {
 		return nil
 	}

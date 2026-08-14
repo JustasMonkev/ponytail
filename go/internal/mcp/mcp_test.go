@@ -212,15 +212,134 @@ func TestToolsCallReturnsTextAndStructuredContent(t *testing.T) {
 	}
 }
 
-// An out-of-range mode is not an error: the ruleset falls back to the default,
-// matching the Node server's optional enum.
-func TestToolsCallFallsBackForUnknownMode(t *testing.T) {
+// The declared inputSchema is an enum, and the Node original enforced it with
+// zod — a mode outside the enum is rejected, not quietly reinterpreted.
+func TestToolsCallRejectsOutOfEnumMode(t *testing.T) {
 	isolate(t)
-	responses := exchange(t,
-		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ponytail_instructions","arguments":{"mode":"off"}}}`)
-	structured := responses[0]["result"].(map[string]any)["structuredContent"].(map[string]any)
-	if structured["mode"] != "full" {
-		t.Errorf("mode = %v, want full", structured["mode"])
+	for _, arg := range []string{`"off"`, `"review"`, `"banana"`, `""`, `"  LITE  "`, `null`, `5`, `["lite"]`} {
+		responses := exchange(t,
+			`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ponytail_instructions","arguments":{"mode":`+arg+`}}}`)
+		rpcErr, ok := responses[0]["error"].(map[string]any)
+		if !ok {
+			t.Errorf("mode=%s must be rejected, got %v", arg, responses[0])
+			continue
+		}
+		if rpcErr["code"] != float64(codeInvalidParams) {
+			t.Errorf("mode=%s: code = %v, want %d", arg, rpcErr["code"], codeInvalidParams)
+		}
+	}
+}
+
+// An omitted mode is the one allowed absence: it falls back to the default.
+func TestToolsCallOmittedModeUsesDefault(t *testing.T) {
+	isolate(t)
+	t.Setenv("PONYTAIL_DEFAULT_MODE", "ultra")
+	for _, params := range []string{
+		`{"name":"ponytail_instructions","arguments":{}}`,
+		`{"name":"ponytail_instructions"}`,
+	} {
+		responses := exchange(t, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":`+params+`}`)
+		result, ok := responses[0]["result"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s must succeed, got %v", params, responses[0])
+		}
+		if got := result["structuredContent"].(map[string]any)["mode"]; got != "ultra" {
+			t.Errorf("%s: mode = %v, want ultra", params, got)
+		}
+	}
+}
+
+// prompts/get and tools/call must agree: name is required by both.
+func TestPromptsGetRequiresName(t *testing.T) {
+	isolate(t)
+	for _, params := range []string{`{}`, `{"name":""}`, `null`} {
+		responses := exchange(t, `{"jsonrpc":"2.0","id":1,"method":"prompts/get","params":`+params+`}`)
+		if _, ok := responses[0]["error"]; !ok {
+			t.Errorf("params %s must be rejected, got %v", params, responses[0])
+		}
+	}
+	// No params at all is the same missing name.
+	responses := exchange(t, `{"jsonrpc":"2.0","id":1,"method":"prompts/get"}`)
+	if _, ok := responses[0]["error"]; !ok {
+		t.Errorf("missing params must be rejected, got %v", responses[0])
+	}
+}
+
+// A batch must be answered as an array. Dropping it silently leaves the client
+// waiting forever on ids it will never see again.
+func TestBatchRequestsAreAnswered(t *testing.T) {
+	isolate(t)
+	var out bytes.Buffer
+	input := `[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","method":"notifications/initialized"},{"jsonrpc":"2.0","id":2,"method":"tools/list"}]` + "\n"
+	if err := Serve(context.Background(), strings.NewReader(input), &out, "1.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	var batch []map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out.String())), &batch); err != nil {
+		t.Fatalf("batch reply must be a JSON array: %v (%q)", err, out.String())
+	}
+	// Two requests, one notification — the notification is owed nothing.
+	if len(batch) != 2 {
+		t.Fatalf("expected 2 responses, got %d: %v", len(batch), batch)
+	}
+	if batch[0]["id"] != float64(1) || batch[1]["id"] != float64(2) {
+		t.Errorf("ids must be echoed in order: %v", batch)
+	}
+}
+
+func TestBatchOfNotificationsIsSilent(t *testing.T) {
+	isolate(t)
+	var out bytes.Buffer
+	input := `[{"jsonrpc":"2.0","method":"notifications/initialized"},{"jsonrpc":"2.0","method":"notifications/progress"}]` + "\n"
+	if err := Serve(context.Background(), strings.NewReader(input), &out, "1.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	if out.Len() != 0 {
+		t.Errorf("a batch of notifications is owed nothing, got %q", out.String())
+	}
+}
+
+func TestEmptyBatchIsInvalidRequest(t *testing.T) {
+	isolate(t)
+	responses := exchange(t, `[]`)
+	rpcErr := responses[0]["error"].(map[string]any)
+	if rpcErr["code"] != float64(codeInvalidRequest) {
+		t.Errorf("code = %v, want %d", rpcErr["code"], codeInvalidRequest)
+	}
+}
+
+// A message whose envelope has a wrong-typed field still carries an id the
+// client is blocked on — answer it instead of leaving the call hanging.
+func TestWrongTypedEnvelopeWithIDGetsAnError(t *testing.T) {
+	isolate(t)
+	responses := exchange(t, `{"jsonrpc":"2.0","id":1,"method":5}`)
+	if len(responses) != 1 {
+		t.Fatalf("expected an answer, got %v", responses)
+	}
+	rpcErr := responses[0]["error"].(map[string]any)
+	if rpcErr["code"] != float64(codeInvalidRequest) {
+		t.Errorf("code = %v, want %d", rpcErr["code"], codeInvalidRequest)
+	}
+
+	// Without an id there is nothing to answer, so silence is still correct.
+	var out bytes.Buffer
+	if err := Serve(context.Background(), strings.NewReader(`{"jsonrpc":"2.0","method":5}`+"\n"), &out, "1.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	if out.Len() != 0 {
+		t.Errorf("no id means no reply, got %q", out.String())
+	}
+}
+
+func TestCapabilitiesDeclareListChanged(t *testing.T) {
+	isolate(t)
+	responses := exchange(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+	caps := responses[0]["result"].(map[string]any)["capabilities"].(map[string]any)
+	for _, name := range []string{"prompts", "tools"} {
+		capability, ok := caps[name].(map[string]any)
+		if !ok || capability["listChanged"] != true {
+			t.Errorf("%s capability = %v, want listChanged:true", name, caps[name])
+		}
 	}
 }
 

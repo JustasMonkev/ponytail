@@ -27,10 +27,18 @@ var Intensity = map[string]string{
 
 const skillRelPath = "skills/ponytail/SKILL.md"
 
+// These are transcribed from the JS, where \s covers the Unicode space set and
+// `.` excludes CR and the line separators as well as LF. Using Go's narrower \s
+// and `.` here let another mode's intensity row survive into the payload when
+// SKILL.md contains a non-breaking space — a routine copy-paste artifact.
 var (
-	frontmatterRe = regexp.MustCompile(`(?s)^---.*?---[\t\n\f\r ]*`)
-	tableLabelRe  = regexp.MustCompile(`^\|\s*\*\*(.+?)\*\*\s*\|`)
-	exampleRe     = regexp.MustCompile(`^-\s*([^:]+):\s*"`)
+	js       = strings.NewReplacer(`\s`, "["+config.JSSpaceClass+"]", `\S`, "[^"+config.JSSpaceClass+"]")
+	jsDot    = `[^\n\r\x{2028}\x{2029}]`
+	jsAnyDot = `(?s).`
+
+	frontmatterRe = regexp.MustCompile(js.Replace(`^---` + jsAnyDot + `*?---\s*`))
+	tableLabelRe  = regexp.MustCompile(js.Replace(`^\|\s*\*\*(` + jsDot + `+?)\*\*\s*\|`))
+	exampleRe     = regexp.MustCompile(js.Replace(`^-\s*([^:]+):\s*"`))
 	lineSplitRe   = regexp.MustCompile(`\r?\n`)
 )
 
@@ -39,9 +47,14 @@ var (
 //
 // The JS hooks resolve these relative to __dirname; a compiled binary has no
 // source directory, so look at the plugin-root env vars each host sets, then walk
-// up from the executable and the working directory. Nothing found is not an
-// error: callers fall back to the embedded ruleset, exactly as the JS falls back
-// when the read throws.
+// up from the executable. Nothing found is not an error: callers fall back to the
+// condensed ruleset, exactly as the JS falls back when the read throws.
+//
+// The working directory is deliberately NOT searched. SKILL.md becomes system
+// instructions for the agent, and the working directory is the repository under
+// edit — untrusted content. A checked-in skills/ponytail/SKILL.md would otherwise
+// replace ponytail's rules with whatever that repo says. The Node hooks always
+// read their own __dirname and are not reachable this way; neither is this.
 func Root() string {
 	if explicit := os.Getenv("PONYTAIL_ROOT"); explicit != "" {
 		return explicit
@@ -52,12 +65,10 @@ func Root() string {
 		}
 	}
 	if exe, err := os.Executable(); err == nil {
-		if root := walkUp(filepath.Dir(exe)); root != "" {
-			return root
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+			exe = resolved
 		}
-	}
-	if cwd, err := os.Getwd(); err == nil {
-		if root := walkUp(cwd); root != "" {
+		if root := walkUp(filepath.Dir(exe)); root != "" {
 			return root
 		}
 	}

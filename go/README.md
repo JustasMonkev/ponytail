@@ -87,8 +87,36 @@ stdout and identical on-disk state, across every mode, every host (Claude,
 Codex, Copilot, Qoder) and the malformed-input cases. They skip themselves if
 `node` isn't installed.
 
-One deliberate difference is excluded from the comparison: the statusline setup
-nudge names `ponytail statusline` where Node named a shell script.
+## Deliberate differences from the Node implementation
+
+Everything else is held byte-identical. These are the exceptions, each a
+considered choice rather than an oversight:
+
+- **The statusline nudge** registers `"<path>/ponytail" statusline` where Node
+  registered a shell script. `uninstall` recognises both.
+- **The ruleset is never loaded from the working directory.** `SKILL.md` becomes
+  system instructions and the working directory is the repository under edit, so
+  a checked-in `skills/ponytail/SKILL.md` would replace ponytail's rules with
+  whatever that repo says. Node resolves `__dirname` and is not reachable this
+  way; neither is this. Set `PONYTAIL_ROOT` if the binary lives outside the
+  checkout.
+- **`PONYTAIL_SUBAGENT_MATCHER` is RE2, not JavaScript's regex engine.** A
+  pattern using lookahead or `\p{…}` compiles in Node and not here, and a
+  pattern that fails to compile is treated as "no matcher" (inject). RE2 buys
+  guaranteed linear matching on a user-supplied pattern; matching JS exactly
+  would mean a regex dependency and backtracking.
+- **Untouched JSON scalars are re-emitted verbatim.** Node round-trips
+  `settings.json` through `JSON.parse`/`stringify`, which rewrites `1.0` to `1`,
+  truncates large integers, and replaces lone surrogates with U+FFFD. The port
+  preserves the original bytes, so a value it did not edit is a value it did not
+  change.
+- **`uninstall` refuses to delete a directory** standing where the mode flag or
+  config file belongs, and reports it. Node's `unlink` errors; Go's `os.Remove`
+  would have removed an empty one.
+- **A settings.json that is literal `null`** is handled quietly; Node throws a
+  `TypeError` and exits non-zero mid-cleanup.
+- **Nesting past 10,000 levels** in `settings.json` is treated as malformed (file
+  left intact) rather than recursed into.
 
 `internal/instructions/fallback_gen.go` is generated from
 `hooks/ponytail-instructions.js` by `scripts/gen-go-fallback.js` (`go generate

@@ -16,7 +16,7 @@ import (
 	"io"
 	"os"
 	"regexp"
-	"strings"
+	"strconv"
 
 	"github.com/DietrichGebert/ponytail/go/internal/config"
 	"github.com/DietrichGebert/ponytail/go/internal/hostruntime"
@@ -39,6 +39,12 @@ func runSubagent(stdin io.Reader, stdout io.Writer) {
 	}
 
 	// A bad regex must never crash the hook; treat it as "no matcher" and inject.
+	//
+	// ponytail: RE2, not JavaScript's engine. A pattern using lookahead or \p{…}
+	// compiles in Node and not here, so an exclusion like "gen(?!eral)" degrades
+	// to "no matcher" and injects where Node would skip. RE2 buys guaranteed
+	// linear matching on a user-supplied pattern; a JS-compatible engine would
+	// mean a regex dependency and backtracking. Document, don't emulate.
 	var matcher *regexp.Regexp
 	if pattern := os.Getenv("PONYTAIL_SUBAGENT_MATCHER"); pattern != "" {
 		if compiled, err := regexp.Compile("(?i)" + pattern); err == nil {
@@ -58,15 +64,40 @@ func runSubagent(stdin io.Reader, stdout io.Writer) {
 	// Matcher set → read agent_type from stdin and skip only on a definite
 	// mismatch. A missing/unparseable agent_type, a stdin error, or the timeout
 	// all fail open (inject), so scoping never silently drops the persona.
-	var payload struct {
-		AgentType string `json:"agent_type"`
-	}
-	agentType := ""
-	if err := json.Unmarshal(config.StripBOM(readWithTimeout(stdin, stdinTimeout)), &payload); err == nil {
-		agentType = strings.TrimSpace(payload.AgentType)
-	}
+	agentType := config.TrimJS(agentTypeOf(config.StripBOM(readWithTimeout(stdin, stdinTimeout))))
 	if agentType != "" && !matcher.MatchString(agentType) {
 		return
 	}
 	inject()
+}
+
+// agentTypeOf reads agent_type the way the JS does: String(payload.agent_type || ”).
+// A typed string field would instead reject a numeric or object agent_type
+// outright, and the caller reads "" as "unknown, fail open" — so a non-string
+// value would bypass the user's scoping rather than fail to match it.
+func agentTypeOf(payload []byte) string {
+	var parsed map[string]any
+	if err := json.Unmarshal(payload, &parsed); err != nil {
+		return ""
+	}
+	switch value := parsed["agent_type"].(type) {
+	case string:
+		return value
+	case nil:
+		return ""
+	case bool:
+		if !value {
+			return "" // falsy, so `|| ''` substitutes the empty string
+		}
+		return "true"
+	case float64:
+		if value == 0 {
+			return ""
+		}
+		return strconv.FormatFloat(value, 'f', -1, 64)
+	case []any:
+		return "" // String([...]) joins with commas; no matcher use for it
+	default:
+		return "[object Object]"
+	}
 }

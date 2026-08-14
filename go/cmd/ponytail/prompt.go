@@ -8,12 +8,16 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/DietrichGebert/ponytail/go/internal/config"
 	"github.com/DietrichGebert/ponytail/go/internal/hostruntime"
 	"github.com/DietrichGebert/ponytail/go/internal/instructions"
 )
+
+// jsSpace is JavaScript's \s, which these regexes were transcribed from.
+const jsSpace = config.JSSpaceClass
 
 var (
 	// Claude Code dispatches /ponytail as a skill: the prompt then carries the
@@ -23,10 +27,10 @@ var (
 	// with the platform's dispatch envelope. The prompt is untrusted text; tags
 	// merely pasted or discussed mid-message must stay inert, same reason the
 	// anchors exist at all.
-	commandNameRe = regexp.MustCompile(`^(?:<command-message>[^<]*</command-message>\s*)?<command-name>\s*/?([^<\n]*?)\s*</command-name>`)
-	commandArgsRe = regexp.MustCompile(`<command-args>\s*([^<\n]*?)\s*</command-args>`)
+	commandNameRe = regexp.MustCompile(`^(?:<command-message>[^<]*</command-message>[` + jsSpace + `]*)?<command-name>[` + jsSpace + `]*/?([^<\n]*?)[` + jsSpace + `]*</command-name>`)
+	commandArgsRe = regexp.MustCompile(`<command-args>[` + jsSpace + `]*([^<\n]*?)[` + jsSpace + `]*</command-args>`)
 	ponytailCmdRe = regexp.MustCompile(`^[/@$]ponytail`)
-	whitespaceRe  = regexp.MustCompile(`\s+`)
+	whitespaceRe  = regexp.MustCompile(`[` + config.JSSpaceClass + `]+`)
 )
 
 // stdinTimeout bounds the wait for the piped prompt JSON.
@@ -40,40 +44,101 @@ var (
 const stdinTimeout = time.Second
 
 // readWithTimeout returns whatever arrived on r before EOF or the deadline.
+//
+// The bytes buffered so far are what the timeout path exists to recover: the
+// PowerShell wrapper delivers the whole prompt JSON and then never closes the
+// pipe, so discarding the buffer on timeout would leave the hook doing nothing
+// on exactly the host it was written for. The reader appends under a mutex and
+// the deadline path takes the same lock, so the snapshot is race-free.
 func readWithTimeout(r io.Reader, timeout time.Duration) []byte {
-	type result struct{ data []byte }
-	done := make(chan result, 1)
+	var (
+		mu       sync.Mutex
+		buffered []byte
+	)
+	done := make(chan struct{})
+
 	go func() {
-		data, _ := io.ReadAll(r)
-		done <- result{data}
+		defer close(done)
+		chunk := make([]byte, 4096)
+		for {
+			n, err := r.Read(chunk)
+			if n > 0 {
+				mu.Lock()
+				buffered = append(buffered, chunk[:n]...)
+				mu.Unlock()
+			}
+			if err != nil {
+				return
+			}
+		}
 	}()
+
 	select {
-	case res := <-done:
-		return res.data
+	case <-done:
 	case <-time.After(timeout):
-		return nil
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	return append([]byte(nil), buffered...)
+}
+
+// decodePrompt extracts the prompt text from a hook payload, reporting false
+// when the payload is one the JS aborts on rather than one it reads as empty.
+//
+// JS reads `(data.prompt || ”).trim().toLowerCase()`. Property access on an
+// array, number, string or boolean yields undefined, so those become an empty
+// prompt; only `null` throws and aborts the turn. A typed Go struct would reject
+// all of them alike, which under Qoder is the difference between injecting the
+// whole ruleset and injecting nothing.
+func decodePrompt(payload []byte) (string, bool) {
+	var parsed any
+	if err := json.Unmarshal(payload, &parsed); err != nil {
+		return "", false
+	}
+	object, ok := parsed.(map[string]any)
+	if !ok {
+		if parsed == nil {
+			return "", false // JSON null: `null.prompt` throws in JS
+		}
+		return "", true // array/number/string/bool: `.prompt` is undefined
+	}
+	switch value := object["prompt"].(type) {
+	case string:
+		return value, true
+	case nil, bool:
+		// undefined/null/false are falsy and become ''. `true` is truthy and
+		// would reach .trim(), which throws.
+		if truthy, isBool := value.(bool); isBool && truthy {
+			return "", false
+		}
+		return "", true
+	case float64:
+		if value == 0 {
+			return "", true // 0 is falsy, so JS substitutes ''
+		}
+		return "", false // a non-zero number reaches .trim() and throws
+	default:
+		return "", false // object/array reaches .trim() and throws
 	}
 }
 
 func runPrompt(stdin io.Reader, stdout io.Writer) {
 	host := hostruntime.Detect()
 
-	var data struct {
-		Prompt string `json:"prompt"`
-	}
-	// Silent fail on a malformed payload, matching the JS try/catch: an
+	// Silent fail on a payload the JS aborts on, matching its try/catch: an
 	// unparseable prompt must never break the turn.
-	if err := json.Unmarshal(config.StripBOM(readWithTimeout(stdin, stdinTimeout)), &data); err != nil {
+	raw, ok := decodePrompt(config.StripBOM(readWithTimeout(stdin, stdinTimeout)))
+	if !ok {
 		return
 	}
 
-	prompt := strings.ToLower(strings.TrimSpace(data.Prompt))
+	prompt := config.LowerJS(config.TrimJS(raw))
 	if name := commandNameRe.FindStringSubmatch(prompt); name != nil && name[1] != "" {
 		args := ""
 		if match := commandArgsRe.FindStringSubmatch(prompt); match != nil {
 			args = match[1]
 		}
-		prompt = strings.TrimSpace("/" + name[1] + " " + args)
+		prompt = config.TrimJS("/" + name[1] + " " + args)
 	}
 
 	modeSwitched, deactivated := false, false
@@ -132,7 +197,9 @@ func runPrompt(stdin io.Reader, stdout io.Writer) {
 		case isReportOnly:
 			host.WriteHookOutput(stdout, "UserPromptSubmit", "PONYTAIL MODE ACTIVE — level: "+mode)
 		case mode != "" && mode != "off":
-			_ = host.SetMode(mode)
+			if err := host.SetMode(mode); err != nil {
+				return // nothing was persisted, so don't claim the mode changed
+			}
 			modeSwitched = true
 			// ponytail: Qoder needs the full ruleset every turn, so when a mode
 			// switch happens we fold the confirmation into the ruleset output
@@ -165,7 +232,9 @@ func runPrompt(stdin io.Reader, stdout io.Writer) {
 			// First prompt in session — initialize from config/env default.
 			currentMode = config.GetDefaultMode()
 			if currentMode != "off" {
-				_ = host.SetMode(currentMode)
+				if err := host.SetMode(currentMode); err != nil {
+					return
+				}
 			}
 		}
 		if currentMode != "" && currentMode != "off" {

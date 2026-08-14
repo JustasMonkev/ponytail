@@ -53,6 +53,11 @@ func parityEnv(t *testing.T, extra ...string) (env []string, home string) {
 		"USERPROFILE=" + home,
 		"XDG_CONFIG_HOME=" + filepath.Join(home, "xdg"),
 		"PATH=" + os.Getenv("PATH"),
+		// The port is built into a temp dir for these tests, so it cannot find
+		// the checkout by walking up from the executable the way an installed
+		// binary does — and it deliberately refuses to look in the working
+		// directory. Point it at the checkout Node reads via __dirname.
+		"PONYTAIL_ROOT=" + repoRoot(t),
 	}
 	return append(env, extra...), home
 }

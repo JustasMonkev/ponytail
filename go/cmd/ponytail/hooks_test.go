@@ -496,10 +496,10 @@ func TestSubagentMatcherFailsOpen(t *testing.T) {
 	runPromptWith(t, "/ponytail full")
 
 	cases := map[string]string{
-		"unparseable payload":  `not json`,
-		"missing agent_type":   `{}`,
-		"empty agent_type":     `{"agent_type":"   "}`,
-		"non-string agentType": `{"agent_type":42}`,
+		"unparseable payload": `not json`,
+		"missing agent_type":  `{}`,
+		"empty agent_type":    `{"agent_type":"   "}`,
+		"null agent_type":     `{"agent_type":null}`,
 	}
 	t.Setenv("PONYTAIL_SUBAGENT_MATCHER", "^nothing-matches-this$")
 	for name, payload := range cases {
@@ -516,6 +516,35 @@ func TestSubagentMatcherFailsOpen(t *testing.T) {
 	runSubagent(strings.NewReader(`{"agent_type":"anything"}`), &out)
 	if out.Len() == 0 {
 		t.Error("an invalid matcher must fall back to injecting")
+	}
+}
+
+// A non-string agent_type must be coerced the way JS coerces it, not treated as
+// absent: reading it as "unknown" would fail open and inject into a subagent the
+// user explicitly scoped out.
+func TestSubagentMatcherCoercesNonStringAgentType(t *testing.T) {
+	sandbox(t)
+	runPromptWith(t, "/ponytail full")
+	t.Setenv("PONYTAIL_SUBAGENT_MATCHER", "^explore$")
+
+	for name, payload := range map[string]string{
+		"number": `{"agent_type":42}`,
+		"object": `{"agent_type":{"a":1}}`,
+		"true":   `{"agent_type":true}`,
+	} {
+		var out bytes.Buffer
+		runSubagent(strings.NewReader(payload), &out)
+		if out.Len() != 0 {
+			t.Errorf("%s: must be scoped out, not injected into", name)
+		}
+	}
+
+	// The coerced value still matches when the matcher covers it.
+	t.Setenv("PONYTAIL_SUBAGENT_MATCHER", "^42$")
+	var out bytes.Buffer
+	runSubagent(strings.NewReader(`{"agent_type":42}`), &out)
+	if out.Len() == 0 {
+		t.Error("a numeric agent_type must match its own string form")
 	}
 }
 

@@ -2,17 +2,34 @@
 // order, so editing one field of a user's settings.json doesn't reshuffle the
 // rest of their file the way a map[string]any round-trip would.
 //
-// ponytail: covers exactly what the uninstall cleanup needs — read, tweak one
-// key, write back in JSON.stringify(value, null, 2) shape. Not a general JSON
-// library; reach for a real one if anything beyond that shows up.
+// Scalars are kept as their original bytes and re-emitted verbatim, so values
+// the caller never touches survive exactly — including number formatting, lone
+// surrogates, and U+2028/U+2029, all of which a decode/encode round-trip through
+// encoding/json would rewrite or destroy.
+//
+// ponytail: covers exactly what the config and uninstall writers need — read,
+// tweak one key, write back in JSON.stringify(value, null, 2) shape. Values
+// passed to Set should be scalars (string, bool, number) or jsonorder values;
+// a map or slice is emitted compactly rather than pretty-printed. Reach for a
+// real JSON library if anything beyond that shows up.
 package jsonorder
 
 import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"io"
 	"strings"
+)
+
+// maxDepth bounds recursion so a hostile or generated settings.json can't drive
+// the parser into a stack overflow. Real config files are a handful deep; past
+// this the document is treated as malformed and the caller leaves it untouched.
+const maxDepth = 10000
+
+var (
+	errTooDeep      = errors.New("jsonorder: nesting too deep")
+	errNonStringKey = errors.New("jsonorder: non-string object key")
+	errInvalidJSON  = errors.New("jsonorder: invalid JSON")
 )
 
 // Member is one key/value pair of an Object, in source order.
@@ -55,37 +72,48 @@ func (o *Object) Delete(key string) {
 	}
 }
 
-// Unmarshal parses JSON into *Object, []any, json.Number, string, bool or nil.
+// AsString returns the string a decoded scalar holds. Anything that is not a
+// JSON string reports false.
+func AsString(value any) (string, bool) {
+	raw, ok := value.(json.RawMessage)
+	if !ok {
+		if s, isString := value.(string); isString {
+			return s, true
+		}
+		return "", false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", false
+	}
+	return s, true
+}
+
+// Unmarshal parses JSON into *Object, []any, or json.RawMessage for scalars.
 func Unmarshal(data []byte) (any, error) {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.UseNumber()
-	value, err := decodeValue(dec)
-	if err != nil {
-		return nil, err
+	// json.Valid rejects malformed input and trailing garbage the way JSON.parse
+	// does, so the walk below only ever sees well-formed bytes.
+	if !json.Valid(data) {
+		return nil, errInvalidJSON
 	}
-	// Reject trailing garbage the way JSON.parse does.
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return nil, errors.New("jsonorder: unexpected trailing data")
-	}
-	return value, nil
+	return parseValue(data, 0)
 }
 
-func decodeValue(dec *json.Decoder) (any, error) {
-	token, err := dec.Token()
-	if err != nil {
-		return nil, err
+func parseValue(raw []byte, depth int) (any, error) {
+	if depth > maxDepth {
+		return nil, errTooDeep
 	}
-	return decodeFrom(dec, token)
-}
-
-func decodeFrom(dec *json.Decoder, token json.Token) (any, error) {
-	delim, isDelim := token.(json.Delim)
-	if !isDelim {
-		return token, nil
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil, errInvalidJSON
 	}
 
-	switch delim {
+	switch trimmed[0] {
 	case '{':
+		dec := json.NewDecoder(bytes.NewReader(trimmed))
+		if _, err := dec.Token(); err != nil { // consume '{'
+			return nil, err
+		}
 		obj := &Object{}
 		for dec.More() {
 			keyToken, err := dec.Token()
@@ -94,13 +122,20 @@ func decodeFrom(dec *json.Decoder, token json.Token) (any, error) {
 			}
 			key, ok := keyToken.(string)
 			if !ok {
-				return nil, errors.New("jsonorder: non-string object key")
+				return nil, errNonStringKey
 			}
-			value, err := decodeValue(dec)
+			var member json.RawMessage
+			if err := dec.Decode(&member); err != nil {
+				return nil, err
+			}
+			value, err := parseValue(member, depth+1)
 			if err != nil {
 				return nil, err
 			}
-			obj.Members = append(obj.Members, Member{Key: key, Value: value})
+			// JSON and JS agree that a repeated key overwrites: the last value
+			// wins and the key keeps its first position. Appending both instead
+			// would let a lookup return a value the host never sees.
+			obj.Set(key, value)
 		}
 		if _, err := dec.Token(); err != nil { // consume '}'
 			return nil, err
@@ -108,9 +143,17 @@ func decodeFrom(dec *json.Decoder, token json.Token) (any, error) {
 		return obj, nil
 
 	case '[':
+		dec := json.NewDecoder(bytes.NewReader(trimmed))
+		if _, err := dec.Token(); err != nil { // consume '['
+			return nil, err
+		}
 		items := []any{}
 		for dec.More() {
-			item, err := decodeValue(dec)
+			var element json.RawMessage
+			if err := dec.Decode(&element); err != nil {
+				return nil, err
+			}
+			item, err := parseValue(element, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -120,8 +163,10 @@ func decodeFrom(dec *json.Decoder, token json.Token) (any, error) {
 			return nil, err
 		}
 		return items, nil
+
+	default:
+		return json.RawMessage(trimmed), nil
 	}
-	return nil, errors.New("jsonorder: unexpected delimiter")
 }
 
 // Marshal renders a value the way JSON.stringify(value, null, 2) does: two-space
@@ -186,8 +231,10 @@ func write(buf *bytes.Buffer, value any, indent string) error {
 }
 
 func writeScalar(buf *bytes.Buffer, value any) error {
-	if num, ok := value.(json.Number); ok {
-		buf.WriteString(num.String())
+	// A scalar that came from Unmarshal is re-emitted byte-for-byte, so untouched
+	// values keep their exact literal form.
+	if raw, ok := value.(json.RawMessage); ok {
+		buf.Write(raw)
 		return nil
 	}
 	var encoded bytes.Buffer

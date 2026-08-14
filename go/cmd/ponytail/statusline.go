@@ -17,14 +17,27 @@ import (
 func runStatusline(stdout io.Writer) {
 	// CLAUDE_CONFIG_DIR overrides ~/.claude, matching where the hooks write the
 	// flag (#34).
-	raw, err := os.ReadFile(filepath.Join(config.ClaudeDir(), ".ponytail-active"))
+	path := filepath.Join(config.ClaudeDir(), ".ponytail-active")
+
+	// The shell script guards with `[ -f ]`. Without the same check a FIFO left
+	// at this path blocks the read forever and a symlink to /dev/zero reads
+	// without bound — and the statusline runs on every prompt render.
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return
+	}
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return
 	}
 
 	firstLine, _, _ := strings.Cut(string(raw), "\n")
+	// `tr -d '[:space:]'` in the C locale strips ASCII whitespace only, and bash
+	// drops NUL from command substitution. Stripping every unicode space instead
+	// would turn a non-breaking-space-padded flag into a recognised mode here and
+	// not there — including the colour it picks.
 	mode := strings.Map(func(r rune) rune {
-		if unicode.IsSpace(r) {
+		if r <= unicode.MaxASCII && (unicode.IsSpace(r) || r == 0) {
 			return -1
 		}
 		return r

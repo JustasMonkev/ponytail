@@ -30,6 +30,8 @@ Usage: ponytail <command>
 `
 
 func main() {
+	ignoreSIGPIPE()
+
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)

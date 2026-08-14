@@ -11,10 +11,12 @@ package mcp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"slices"
 	"strings"
 
 	"github.com/DietrichGebert/ponytail/go/internal/config"
@@ -74,9 +76,12 @@ type rpcError struct {
 }
 
 const (
+	codeInvalidRequest = -32600
 	codeMethodNotFound = -32601
 	codeInvalidParams  = -32602
 )
+
+var nullID = json.RawMessage("null")
 
 // Serve runs the MCP server over the given streams until the input closes or the
 // context is cancelled.
@@ -91,8 +96,8 @@ func Serve(ctx context.Context, stdin io.Reader, stdout io.Writer, version strin
 		}
 		line, err := reader.ReadBytes('\n')
 		if len(strings.TrimSpace(string(line))) > 0 {
-			if resp := handleLine(line, version); resp != nil {
-				if writeErr := encoder.Encode(resp); writeErr != nil {
+			if payload := handleLine(line, version); payload != nil {
+				if writeErr := encoder.Encode(payload); writeErr != nil {
 					return writeErr
 				}
 			}
@@ -106,12 +111,55 @@ func Serve(ctx context.Context, stdin io.Reader, stdout io.Writer, version strin
 	}
 }
 
-// handleLine returns the response to send, or nil for notifications and
-// unparseable input (a malformed line must not kill the session).
-func handleLine(line []byte, version string) *response {
+// handleLine returns what to write for one input line: a single response, an
+// array of responses for a batch, or nil when nothing is owed (notifications,
+// an all-notification batch, or input too broken to answer).
+func handleLine(line []byte, version string) any {
+	// A batch is a JSON array of requests and/or notifications. Batching was
+	// removed in protocol 2025-06-18 but is part of 2024-11-05 and 2025-03-26,
+	// which this server still negotiates — dropping a batch silently leaves the
+	// client waiting on responses that never come.
+	if trimmed := bytes.TrimLeft(line, " \t\r\n"); len(trimmed) > 0 && trimmed[0] == '[' {
+		var batch []json.RawMessage
+		if err := json.Unmarshal(line, &batch); err != nil {
+			return nil
+		}
+		if len(batch) == 0 {
+			return &response{JSONRPC: "2.0", ID: nullID, Error: &rpcError{Code: codeInvalidRequest, Message: "Invalid Request: empty batch"}}
+		}
+		responses := []*response{}
+		for _, member := range batch {
+			if resp := handleOne(member, version); resp != nil {
+				responses = append(responses, resp)
+			}
+		}
+		if len(responses) == 0 {
+			return nil // a batch of notifications is answered with silence
+		}
+		return responses
+	}
+
+	if resp := handleOne(line, version); resp != nil {
+		return resp
+	}
+	return nil
+}
+
+// handleOne answers a single JSON-RPC message, or returns nil when none is owed.
+func handleOne(message []byte, version string) *response {
 	var req request
-	if err := json.Unmarshal(line, &req); err != nil {
-		return nil
+	if err := json.Unmarshal(message, &req); err != nil {
+		// The envelope has a field of the wrong type — e.g. a numeric "method".
+		// If it still carries an id, the client is waiting on that id, so answer
+		// it rather than letting the call hang. Input that isn't even an object
+		// gives us no id to answer with, so it stays silent.
+		var envelope struct {
+			ID json.RawMessage `json:"id"`
+		}
+		if json.Unmarshal(message, &envelope) != nil || len(envelope.ID) == 0 || string(envelope.ID) == "null" {
+			return nil
+		}
+		return &response{JSONRPC: "2.0", ID: envelope.ID, Error: &rpcError{Code: codeInvalidRequest, Message: "Invalid Request"}}
 	}
 	// Notifications carry no id and get no reply.
 	if len(req.ID) == 0 || string(req.ID) == "null" {
@@ -152,8 +200,8 @@ func initializeResult(params json.RawMessage, version string) any {
 	return map[string]any{
 		"protocolVersion": protocol,
 		"capabilities": map[string]any{
-			"prompts": map[string]any{},
-			"tools":   map[string]any{},
+			"prompts": map[string]any{"listChanged": true},
+			"tools":   map[string]any{"listChanged": true},
 		},
 		"serverInfo": map[string]any{"name": "ponytail", "version": version},
 	}
@@ -192,10 +240,15 @@ func promptsList() any {
 type callParams struct {
 	Name      string `json:"name"`
 	Arguments struct {
-		Mode string `json:"mode"`
+		Mode json.RawMessage `json:"mode"`
 	} `json:"arguments"`
+	mode string // the validated intensity, "" when the caller omitted it
 }
 
+// parseCall decodes the params and enforces the declared inputSchema. The Node
+// server got this from zod (`z.enum(MODES).optional()`), which rejects anything
+// outside the enum rather than falling back — and the spec requires a server to
+// validate its own tool inputs. Only an omitted mode is allowed through.
 func parseCall(params json.RawMessage) (callParams, *rpcError) {
 	var parsed callParams
 	if len(params) > 0 {
@@ -203,8 +256,18 @@ func parseCall(params json.RawMessage) (callParams, *rpcError) {
 			return parsed, &rpcError{Code: codeInvalidParams, Message: "Invalid params"}
 		}
 	}
-	// An unknown mode is not an error: the ruleset falls back to the configured
-	// default, same as the Node server's optional enum.
+	raw := parsed.Arguments.Mode
+	if len(raw) == 0 {
+		return parsed, nil
+	}
+	var mode string
+	if err := json.Unmarshal(raw, &mode); err != nil || !slices.Contains(Modes, mode) {
+		return parsed, &rpcError{
+			Code:    codeInvalidParams,
+			Message: "Invalid params: mode must be one of " + strings.Join(Modes, ", "),
+		}
+	}
+	parsed.mode = mode
 	return parsed, nil
 }
 
@@ -213,7 +276,9 @@ func promptsGet(params json.RawMessage) (any, *rpcError) {
 	if rpcErr != nil {
 		return nil, rpcErr
 	}
-	if parsed.Name != "" && parsed.Name != "ponytail" {
+	// name is a required field of GetPromptRequest — tools/call already rejects a
+	// missing name, and the two paths must not disagree.
+	if parsed.Name != "ponytail" {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "Unknown prompt: " + parsed.Name}
 	}
 	return map[string]any{
@@ -221,7 +286,7 @@ func promptsGet(params json.RawMessage) (any, *rpcError) {
 		"messages": []any{
 			map[string]any{
 				"role":    "user",
-				"content": map[string]any{"type": "text", "text": BuildInstructions(parsed.Arguments.Mode)},
+				"content": map[string]any{"type": "text", "text": BuildInstructions(parsed.mode)},
 			},
 		},
 	}, nil
@@ -258,7 +323,7 @@ func toolsCall(params json.RawMessage) (any, *rpcError) {
 	if parsed.Name != "ponytail_instructions" {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "Unknown tool: " + parsed.Name}
 	}
-	mode := ResolveMode(parsed.Arguments.Mode)
+	mode := ResolveMode(parsed.mode)
 	text := instructions.GetPonytailInstructions(mode)
 	return map[string]any{
 		"content":           []any{map[string]any{"type": "text", "text": text}},
