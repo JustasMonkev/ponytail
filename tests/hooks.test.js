@@ -306,16 +306,16 @@ assert.match(
   'an ultra subagent must receive ultra\'s definition, not just the label',
 );
 
-// review is an independent mode: subagents get the pointer line, not a
-// lazy-dev ruleset mislabeled "review".
+// Upgrade recovery: an old persisted review flag falls back to the real default.
 fs.writeFileSync(subFlag, 'review');
 result = run('ponytail-subagent.js', subEnv);
 assert.equal(result.status, 0, result.stderr);
 output = JSON.parse(result.stdout);
 assert.match(
   output.hookSpecificOutput.additionalContext,
-  /Behavior defined by \/ponytail-review skill/,
+  /PONYTAIL MODE ACTIVE — level: full/,
 );
+assert.equal(fs.readFileSync(subFlag, 'utf8'), 'full');
 fs.writeFileSync(subFlag, 'full');
 
 // No flag → ponytail off → inject nothing (empty stdout, no failure).
@@ -450,6 +450,17 @@ assert.match(
   /PONYTAIL MODE CHANGED — level: ultra/,
 );
 
+// One-shot review keeps Qoder's active level and emits one valid hook payload.
+result = run(
+  'ponytail-mode-tracker.js',
+  qoderEnv,
+  JSON.stringify({ prompt: '/ponytail-review' }),
+);
+assert.equal(result.status, 0, result.stderr);
+assert.equal(fs.readFileSync(qoderState, 'utf8'), 'ultra');
+output = JSON.parse(result.stdout);
+assert.match(output.hookSpecificOutput.additionalContext, /level: review/);
+
 // "stop ponytail": deactivates, clears flag, no ruleset output.
 result = run(
   'ponytail-mode-tracker.js',
@@ -510,6 +521,24 @@ result = run('ponytail-mode-tracker.js', defEnv, JSON.stringify({ prompt: '/pony
 assert.equal(result.status, 0, result.stderr);
 assert.equal(fs.readFileSync(defFlag, 'utf8'), 'ultra', 'plain switch must set the session mode');
 assert.equal(JSON.parse(fs.readFileSync(defConfig, 'utf8')).defaultMode, 'lite', 'plain switch must not persist the default');
+
+// /ponytail-review is one-shot: it must not replace or create session state.
+for (const prompt of ['/ponytail-review', '/ponytail:ponytail-review']) {
+  for (const activeMode of ['lite', 'full', 'ultra']) {
+    fs.writeFileSync(defFlag, activeMode);
+    result = run('ponytail-mode-tracker.js', defEnv, JSON.stringify({ prompt }));
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.readFileSync(defFlag, 'utf8'), activeMode, 'review must leave the active mode unchanged');
+  }
+}
+fs.writeFileSync(defFlag, 'full');
+result = run('ponytail-subagent.js', defEnv);
+assert.equal(result.status, 0, result.stderr);
+assert.match(JSON.parse(result.stdout).hookSpecificOutput.additionalContext, /lazy senior developer/);
+fs.unlinkSync(defFlag);
+result = run('ponytail-mode-tracker.js', defEnv, JSON.stringify({ prompt: '/ponytail-review' }));
+assert.equal(result.status, 0, result.stderr);
+assert.equal(fs.existsSync(defFlag), false, 'review must not create a session flag');
 
 // review is not a valid default (#377) — the command is ignored, config unchanged.
 result = run('ponytail-mode-tracker.js', defEnv, JSON.stringify({ prompt: '/ponytail default review' }));

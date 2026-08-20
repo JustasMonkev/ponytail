@@ -8,7 +8,6 @@ const {
   getQuietStartup,
   getHideStatus,
   normalizeMode,
-  normalizePersistedMode,
   isDeactivationCommand,
   writeDefaultMode,
   writeHideStatus,
@@ -23,14 +22,14 @@ const RUNTIME_MODE_LIST = RUNTIME_MODES.join("|");
 const PONYTAIL_COMMAND_DESCRIPTION = `Set mode: ${RUNTIME_MODE_LIST}. Commands: status, default <mode>, badge on|off`;
 
 export function resolveSessionMode(entries, fallbackMode = DEFAULT_MODE) {
-  const fallback = normalizePersistedMode(fallbackMode) || DEFAULT_MODE;
+  const fallback = normalizeMode(fallbackMode) || DEFAULT_MODE;
   if (!Array.isArray(entries)) return fallback;
 
   for (let i = entries.length - 1; i >= 0; i -= 1) {
     const entry = entries[i];
     if (entry?.type !== "custom" || entry?.customType !== "ponytail-mode") continue;
 
-    const mode = normalizePersistedMode(entry?.data?.mode);
+    const mode = normalizeMode(entry?.data?.mode);
     if (mode) return mode;
   }
 
@@ -38,7 +37,7 @@ export function resolveSessionMode(entries, fallbackMode = DEFAULT_MODE) {
 }
 
 export function parsePonytailCommand(text, defaultMode = DEFAULT_MODE) {
-  const fallback = normalizePersistedMode(defaultMode) || DEFAULT_MODE;
+  const fallback = normalizeMode(defaultMode) || DEFAULT_MODE;
   const normalizedText = String(text || "").trim().toLowerCase();
 
   if (!normalizedText) {
@@ -50,7 +49,7 @@ export function parsePonytailCommand(text, defaultMode = DEFAULT_MODE) {
   if (primary === "status") return { type: "status" };
 
   if (primary === "default") {
-    // ponytail: a default must be a runtime level; review is session-only (#377).
+    // ponytail: a default must be a runtime level; review is one-shot (#377).
     const mode = normalizeMode(secondary);
     return mode ? { type: "set-default", mode } : { type: "invalid", reason: "invalid-default-mode" };
   }
@@ -97,7 +96,7 @@ export default function ponytailExtension(pi) {
   }
 
   const setMode = (mode, ctx) => {
-    const normalized = normalizePersistedMode(mode);
+    const normalized = normalizeMode(mode);
     if (!normalized) return;
 
     currentMode = normalized;

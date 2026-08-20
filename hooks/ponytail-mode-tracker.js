@@ -42,7 +42,12 @@ function finish() {
       let isReportOnly = false;
 
       if (cmd === '/ponytail-review' || cmd === '/ponytail:ponytail-review') {
-        mode = 'review';
+        writeHookOutput(
+          'UserPromptSubmit',
+          'review',
+          'PONYTAIL MODE ACTIVE — level: review. Behavior defined by /ponytail-review skill.',
+        );
+        return;
       } else if (cmd === '/ponytail' || cmd === '/ponytail:ponytail') {
         // `/ponytail default <mode>` persists the default to config (survives
         // restarts). Plain switches stay session-scoped ("sticks until session
