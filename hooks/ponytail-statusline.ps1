@@ -11,6 +11,17 @@ try {
 } catch {
     exit 0
 }
+if ($Mode -eq "review") {
+    try {
+        $Runtime = Join-Path $PSScriptRoot "ponytail-runtime.js"
+        $Mode = (& node -e 'const { readMode } = require(require("path").resolve(process.argv[1])); process.stdout.write(readMode() || "");' $Runtime 2>$null).Trim()
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrEmpty($Mode) -or $Mode -eq "off") {
+            exit 0
+        }
+    } catch {
+        exit 0
+    }
+}
 
 $Esc = [char]27
 # ultra is the high-intensity mode; flag it amber so it stands out from the
