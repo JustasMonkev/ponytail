@@ -4,6 +4,11 @@ flag="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.ponytail-active"
 [ -f "$flag" ] || exit 0
 
 mode=$(head -n1 "$flag" | tr -d '[:space:]')
+if [ "$mode" = "review" ]; then
+    runtime="$(dirname "$0")/ponytail-runtime.js"
+    mode=$(node -e 'const { readMode } = require(require("path").resolve(process.argv[1])); process.stdout.write(readMode() || "");' "$runtime" 2>/dev/null) || exit 0
+    [ -n "$mode" ] && [ "$mode" != "off" ] || exit 0
+fi
 
 # ultra is the high-intensity mode; flag it amber so it stands out from the
 # default green at a glance. The level is still in the text, so color is a

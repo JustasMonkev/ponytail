@@ -52,6 +52,20 @@ test('command.execute.before persists /ponytail ultra, transform follows it', as
   assert.match(system[0], /PONYTAIL MODE ACTIVE — level: ultra/);
 });
 
+test('/ponytail review is one-shot and does not replace the active mode', async () => {
+  const hooks = await loadPlugin({});
+  fs.writeFileSync(statePath, 'ultra');
+  await hooks['command.execute.before']({ command: 'ponytail', arguments: 'review', sessionID: 's' });
+  assert.equal(fs.readFileSync(statePath, 'utf8'), 'ultra');
+  fs.unlinkSync(statePath);
+  await hooks['command.execute.before']({ command: 'ponytail', arguments: 'review', sessionID: 's' });
+  assert.equal(fs.existsSync(statePath), false);
+  fs.writeFileSync(statePath, 'review');
+  const system = await transform(hooks);
+  assert.match(system[0], /PONYTAIL MODE ACTIVE — level: full/);
+  assert.equal(fs.readFileSync(statePath, 'utf8'), 'full');
+});
+
 test('/ponytail off persists off and transform injects nothing', async () => {
   const hooks = await loadPlugin({});
   await hooks['command.execute.before']({ command: 'ponytail', arguments: 'off', sessionID: 's' });

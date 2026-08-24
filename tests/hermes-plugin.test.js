@@ -161,6 +161,27 @@ print(json.dumps({
   assert.match(data.status_after, /Ponytail mode: ultra/);
 });
 
+test('Hermes refuses review as an always-on default', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ponytail-config-'));
+  fs.mkdirSync(path.join(tmp, 'ponytail'), { recursive: true });
+  fs.writeFileSync(path.join(tmp, 'ponytail', 'config.json'), JSON.stringify({ defaultMode: 'review' }));
+  const output = python(String.raw`
+import importlib.util, json, os
+spec = importlib.util.spec_from_file_location('ponytail_hermes_plugin', '__init__.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+os.environ.pop('PONYTAIL_DEFAULT_MODE', None)
+file_default = mod._pre_llm_call()['context']
+os.environ['PONYTAIL_DEFAULT_MODE'] = 'review'
+env_default = mod._pre_llm_call()['context']
+print(json.dumps({'file': file_default, 'env': env_default, 'explicit': mod.build_injected_context('review')}))
+`, { XDG_CONFIG_HOME: tmp });
+  const data = JSON.parse(output);
+  assert.match(data.file, /level: full/);
+  assert.match(data.env, /level: full/);
+  assert.match(data.explicit, /level: review/);
+});
+
 test('Hermes plugin review mode injects the real review skill body', () => {
   const output = python(String.raw`
 import importlib.util, json

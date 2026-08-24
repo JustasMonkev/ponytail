@@ -142,6 +142,32 @@ test('POSIX hook commands avoid String.prototype.replaceAll (Node 14 compat)', (
   }
 });
 
+test('statusline scripts repair stale review state through the shared runtime', () => {
+  for (const file of ['ponytail-statusline.sh', 'ponytail-statusline.ps1']) {
+    const source = fs.readFileSync(path.join(root, 'hooks', file), 'utf8');
+    assert.match(source, /ponytail-runtime\.js/, `${file} must reuse the runtime mode migration`);
+    assert.match(source, /readMode/, `${file} must migrate stale review state`);
+  }
+});
+
+test('POSIX statusline migrates stale review state to the configured level', { skip: process.platform === 'win32' }, () => {
+  const claudeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ponytail-statusline-'));
+  const state = path.join(claudeDir, '.ponytail-active');
+  fs.writeFileSync(state, 'review');
+
+  try {
+    const result = spawnSync('bash', [path.join(root, 'hooks', 'ponytail-statusline.sh')], {
+      env: { ...process.env, CLAUDE_CONFIG_DIR: claudeDir, PONYTAIL_DEFAULT_MODE: 'ultra' },
+      encoding: 'utf8',
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /\[PONYTAIL:ULTRA\]/);
+    assert.equal(fs.readFileSync(state, 'utf8'), 'ultra');
+  } finally {
+    fs.rmSync(claudeDir, { recursive: true, force: true });
+  }
+});
+
 test('every hook command points at a script that ships in hooks/', () => {
   for (const hook of commandHooks()) {
     const cmd = hook.command;

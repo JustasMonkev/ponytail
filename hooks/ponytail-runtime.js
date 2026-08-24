@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { getClaudeDir, getConfigDir } = require('./ponytail-config');
+const { getClaudeDir, getConfigDir, getDefaultMode, normalizeMode } = require('./ponytail-config');
 
 const STATE_FILE = '.ponytail-active';
 
@@ -42,7 +42,13 @@ function clearMode() {
 // Live mode written by activate/mode-tracker. Absent flag = ponytail off.
 function readMode() {
   try {
-    return fs.readFileSync(statePath, 'utf8').trim() || null;
+    const mode = fs.readFileSync(statePath, 'utf8').trim().toLowerCase();
+    if (mode === 'review') {
+      const fallback = getDefaultMode();
+      try { fallback === 'off' ? clearMode() : setMode(fallback); } catch (e) {}
+      return fallback;
+    }
+    return normalizeMode(mode);
   } catch (e) {
     return null;
   }
